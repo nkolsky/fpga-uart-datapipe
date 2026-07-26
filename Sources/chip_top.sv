@@ -394,6 +394,34 @@ logic [23:0] rx_pixel_q;
 
 logic        rx_parity_err_pulse;
 
+// -----------------------------------------------------------------------------
+// Stage 2A: variable-length framing signals
+// -----------------------------------------------------------------------------
+// The receive path is now count-based rather than fixed-16. rx_msg_decode
+// is combinational and is the single source of opcode truth; rx_mac holds
+// no protocol knowledge and simply counts to expected_len.
+//
+// The loop rx_mac -> rx_msg_decode -> rx_mac closes through registers
+// (msg_buf / byte_idx), so it is a combinational PATH, not a combinational
+// loop. Depth is a handful of byte comparators feeding a 5-bit compare.
+// -----------------------------------------------------------------------------
+logic [rx_msg_pkg::BYTE_CNT_W-1:0] rx_expected_len;
+rx_msg_pkg::msg_kind_t             rx_msg_kind_prov;   // provisional - rx_mac only
+logic                              rx_kind_known;      // observability / TB use
+logic [127:0]                      rx_frame_buf;       // LIVE buffer tap
+logic [rx_msg_pkg::BYTE_CNT_W-1:0] rx_byte_cnt;        // LIVE byte count
+rx_msg_pkg::msg_kind_t             rx_msg_kind_q;      // FINAL, latched
+
+logic        rx_pw_parse_valid;
+logic        rx_pw_parse_error;
+logic [23:0] rx_pw_addr;
+logic [23:0] rx_pw_pixel;
+
+logic        rx_cmd_valid;
+logic [23:0] rx_cmd_addr;
+logic [23:0] rx_cmd_pixel;
+logic        rx_bypass_active;
+
 rx_phy u_rx_phy (
     .clk              (pll_clk_out),
     .rst_n            (sync_pll_rst_n),
@@ -404,17 +432,35 @@ rx_phy u_rx_phy (
     .rx_busy          (rx_phy_busy)
 );
 
-rx_mac u_rx_mac (
-    .clk        (pll_clk_out),
-    .rst_n      (sync_pll_rst_n),
-    .byte_valid (rx_byte_valid),
-    .rx_byte    (rx_byte_val),
-    .par_val_rst(rx_parity_err_pulse),
-    .msg_valid  (rx_mac_msg_valid),
-    .msg_data   (rx_mac_msg_data),
-    .mac_busy   (rx_mac_busy)
+// Combinational frame-length / kind decoder. bypass_active comes from
+// rx_classifier and is hardwired inactive for the whole of Stage 2A.
+rx_msg_decode u_rx_msg_decode (
+    .frame_buf     (rx_frame_buf),
+    .byte_cnt      (rx_byte_cnt),
+    .bypass_active (rx_bypass_active),
+    .expected_len  (rx_expected_len),
+    .msg_kind_prov (rx_msg_kind_prov),
+    .kind_known    (rx_kind_known)
 );
 
+rx_mac u_rx_mac (
+    .clk           (pll_clk_out),
+    .rst_n         (sync_pll_rst_n),
+    .byte_valid    (rx_byte_valid),
+    .rx_byte       (rx_byte_val),
+    .par_val_rst   (rx_parity_err_pulse),
+    .expected_len  (rx_expected_len),
+    .msg_kind_prov (rx_msg_kind_prov),
+    .frame_buf     (rx_frame_buf),
+    .byte_cnt      (rx_byte_cnt),
+    .msg_valid     (rx_mac_msg_valid),
+    .msg_data      (rx_mac_msg_data),
+    .msg_kind_q    (rx_msg_kind_q),
+    .mac_busy      (rx_mac_busy)
+);
+
+// Legacy {Rnnn,Cnnn,Vnnn} parser -- UNCHANGED. Still the active
+// register-control path for the whole of Stage 2A.
 rx_parser u_rx_parser (
     .msg_in      (rx_mac_msg_data),
     .parse_valid (rx_parse_valid),
@@ -424,21 +470,58 @@ rx_parser u_rx_parser (
     .pixel       (rx_pixel)
 );
 
+// New Single Pixel Write parser, running in parallel on the same frame.
+rx_pixel_wr_parser u_rx_pixel_wr_parser (
+    .msg_in         (rx_mac_msg_data),
+    .pw_parse_valid (rx_pw_parse_valid),
+    .pw_parse_error (rx_pw_parse_error),
+    .pw_addr        (rx_pw_addr),
+    .pw_pixel       (rx_pw_pixel)
+);
+
 rx_classifier u_rx_classifier (
     .clk              (pll_clk_out),
     .rst_n            (sync_pll_rst_n),
     .msg_valid        (rx_mac_msg_valid),
+    .msg_kind         (rx_msg_kind_q),
     .parse_valid      (rx_parse_valid),
     .parse_error      (rx_parse_error),
     .row              (rx_row),
     .col              (rx_col),
     .pixel            (rx_pixel),
+    .pw_parse_valid   (rx_pw_parse_valid),
+    .pw_parse_error   (rx_pw_parse_error),
+    .pw_addr          (rx_pw_addr),
+    .pw_pixel         (rx_pw_pixel),
     .classifier_valid (rx_classifier_valid),
     .classifier_error (rx_classifier_error),
     .row_q            (rx_row_q),
     .col_q            (rx_col_q),
-    .pixel_q          (rx_pixel_q)
+    .pixel_q          (rx_pixel_q),
+    .cmd_valid        (rx_cmd_valid),
+    .cmd_addr         (rx_cmd_addr),
+    .cmd_pixel        (rx_cmd_pixel),
+    .bypass_active    (rx_bypass_active)
 );
+
+// -----------------------------------------------------------------------------
+// TEMPORARY STAGE 2A OBSERVABILITY -- REMOVE IN STAGE 2B
+// -----------------------------------------------------------------------------
+// Stage 2A stops at the classifier: there is no command FIFO, no write
+// controller and no SRAM write logic yet, so rx_cmd_addr / rx_cmd_pixel
+// have no consumer. This sticky flag gives the milestone a single
+// hardware-observable endpoint: it sets on the first correctly framed
+// Single Pixel Write and stays set until reset.
+//
+// Once the command FIFO exists in Stage 2B this flag and its LED
+// assignment below should be deleted.
+// -----------------------------------------------------------------------------
+logic pix_wr_seen_sticky;
+
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n) pix_wr_seen_sticky <= 1'b0;
+    else if (rx_cmd_valid) pix_wr_seen_sticky <= 1'b1;
+end
 
 // -----------------------------------------------------------------------------
 // Config RGF + dispatcher
@@ -543,7 +626,10 @@ assign UART_CTS = ~(rom_seq_busy || tx_seq_busy || rx_mac_busy);
 // -----------------------------------------------------------------------------
 // LEDs: tie off unused for now
 // -----------------------------------------------------------------------------
-assign LED[15:13] = '0;
+assign LED[14:13] = '0;
+// TEMPORARY Stage 2A observability -- see pix_wr_seen_sticky above.
+// Remove together with the sticky flag when the Stage 2B command FIFO lands.
+assign LED[15] = pix_wr_seen_sticky;
 assign LED[12] = counter_heartbeat_cnt[26];
 assign LED[11] = clk_sel;
 assign LED[10] = UART_RTS;
