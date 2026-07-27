@@ -566,9 +566,65 @@ logic        rgf_status_wen;
 logic [7:0]  rgf_status_addr;
 logic [31:0] rgf_status_wdata;
 
-assign rgf_pc_wen   = rx_classifier_valid && !rx_col_q[0];  // col even = write
-assign rgf_pc_addr  = rx_classifier_valid ? {2'b00, rx_row_q[5:0], 2'b00} : 8'hFF;
-assign rgf_pc_wdata = {8'b0, rx_pixel_q};
+// -----------------------------------------------------------------------------
+// CHANGE A: legacy RGF command crossing, 130 MHz -> 100 MHz
+// -----------------------------------------------------------------------------
+// Previously these three signals were driven combinationally straight from
+// rx_classifier's 130 MHz outputs and sampled by rgf on CLK100MHZ:
+//
+//   assign rgf_pc_wen   = rx_classifier_valid && !rx_col_q[0];
+//   assign rgf_pc_addr  = rx_classifier_valid ? {2'b00,rx_row_q[5:0],2'b00} : 8'hFF;
+//   assign rgf_pc_wdata = {8'b0, rx_pixel_q};
+//
+// Two defects. First, rx_classifier_valid is a single 130 MHz cycle -- 7.69 ns
+// against a 10 ns sampling period -- so the command could be missed outright.
+// Second, rgf_pc_addr was QUALIFIED BY that pulse, which made the address bus
+// itself a 7.69 ns transient; a 100 MHz edge landing mid-transition could
+// capture a mixture of old and new bits.
+//
+// That is what made the IMG_TX_MON read-to-clear unreliable: rgf implements
+// it as a level-sensitive decode (!pc_wen && pc_addr == IMG_TX_MON_ADDR), so a
+// missed address transient means complete is never cleared and the following
+// start stays blocked by the interlock -- the Stage 4 failure observed on
+// hardware.
+//
+// cdc_cmd_sync captures {is_write, addr, wdata} atomically in the 130 MHz
+// domain and delivers them with a single clean 100 MHz strobe. The IDLE_ADDR
+// behaviour lives inside that module, so the address is 8'hFF on every cycle
+// except the one valid cycle and the read-to-clear fires exactly once.
+//
+// The source-side expressions are unchanged from the originals above; they
+// simply move from combinational assigns into the module's source port.
+// rx_classifier_valid needs no extra qualification -- Stage 2A already gates
+// it to msg_kind == MSG_LEGACY_RGF.
+// -----------------------------------------------------------------------------
+logic        rgf_cmd_valid_100;
+logic        rgf_cmd_is_write_100;
+logic [7:0]  rgf_cmd_addr_100;
+logic [31:0] rgf_cmd_wdata_100;
+
+cdc_cmd_sync #(
+    .ADDR_W    (8),
+    .DATA_W    (32),
+    .IDLE_ADDR (8'hFF)     // decodes to none of 0x00/04/08/0C/10/14
+) u_cdc_rgf_cmd (
+    .src_clk      (pll_clk_out),
+    .src_rst_n    (sync_pll_rst_n),
+    .src_valid    (rx_classifier_valid),
+    .src_is_write (!rx_col_q[0]),                        // col even = write
+    .src_addr     ({2'b00, rx_row_q[5:0], 2'b00}),       // register index * 4
+    .src_wdata    ({8'b0, rx_pixel_q}),
+    .dst_valid    (rgf_cmd_valid_100),
+    .dst_is_write (rgf_cmd_is_write_100),
+    .dst_addr     (rgf_cmd_addr_100),
+    .dst_wdata    (rgf_cmd_wdata_100),
+    .dst_clk      (CLK100MHZ),
+    .dst_rst_n    (sync_rst_n)
+);
+
+assign rgf_pc_wen   = rgf_cmd_valid_100 && rgf_cmd_is_write_100;
+assign rgf_pc_addr  = rgf_cmd_addr_100;   // IDLE_ADDR (8'hFF) while !dst_valid
+assign rgf_pc_wdata = rgf_cmd_wdata_100;
 
 // -----------------------------------------------------------------------------
 // CHANGE B: 130 MHz -> 100 MHz pulse clock-domain crossings
