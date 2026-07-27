@@ -159,7 +159,7 @@ module tb_rx_burst_ctrl;
 
     // Deterministic, easily-read pixel values: 0x100000 + index.
     function automatic logic [23:0] exp_pix(input int idx);
-        return BURST_PIX_W'(24'h10_0000 + idx);
+        return BURST_PIX_W'(24'h10_0000) + BURST_PIX_W'(idx);
     endfunction
 
     // -----------------------------------------------------------------
