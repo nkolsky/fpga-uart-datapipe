@@ -571,6 +571,49 @@ assign rgf_pc_addr  = rx_classifier_valid ? {2'b00, rx_row_q[5:0], 2'b00} : 8'hF
 assign rgf_pc_wdata = {8'b0, rx_pixel_q};
 
 // -----------------------------------------------------------------------------
+// CHANGE B: 130 MHz -> 100 MHz pulse clock-domain crossings
+// -----------------------------------------------------------------------------
+// tx_img_done and rx_parity_err_pulse are both single-cycle pulses
+// generated on pll_clk_out (130 MHz, 7.69 ns) and consumed by rgf on
+// CLK100MHZ (10 ns). A 7.69 ns pulse is narrower than the destination
+// sampling period, so a direct connection can miss it entirely.
+//
+// Because both clocks come from the same MMCM their phase relationship is
+// fixed rather than random, which is why the direct connection worked at
+// all -- but it is fixed only for a given placement, and shifts with any
+// re-place-and-route. That is what made the legacy RGF interlock path
+// unreliable: a missed tx_img_done leaves IMG_TX_MON.complete clear, so
+// the PC's completion poll times out.
+//
+// cdc_pulse_sync converts each pulse to a toggle, synchronises the toggle
+// with two flops, and regenerates a clean one-cycle pulse in the 100 MHz
+// domain. A level change cannot be missed regardless of clock ratio.
+//
+// Neither source module is modified: tx_sequencer and rx_phy still emit
+// exactly the pulses they always did.
+// -----------------------------------------------------------------------------
+logic tx_img_done_100;      // tx_img_done, recovered on CLK100MHZ
+logic rx_parity_err_100;    // rx_parity_err_pulse, recovered on CLK100MHZ
+
+cdc_pulse_sync u_cdc_tx_img_done (
+    .src_clk   (pll_clk_out),
+    .src_rst_n (sync_pll_rst_n),
+    .src_pulse (tx_img_done),
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_pulse (tx_img_done_100)
+);
+
+cdc_pulse_sync u_cdc_parity_err (
+    .src_clk   (pll_clk_out),
+    .src_rst_n (sync_pll_rst_n),
+    .src_pulse (rx_parity_err_pulse),
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_pulse (rx_parity_err_100)
+);
+
+// -----------------------------------------------------------------------------
 // IMG_TX_MON status write: fires once, exactly when a transfer finishes.
 // tx_img_done is a clean single-cycle pulse (registered off tx_sequencer's
 // DONE state); tx_row/tx_col hold the last pixel's coordinates (255,255)
@@ -579,8 +622,16 @@ assign rgf_pc_wdata = {8'b0, rx_pixel_q};
 // loop: after this write, IMG_TX_MON.complete=1 blocks a new start until
 // the PC reads IMG_TX_MON (read-to-clear), same as rgf's own testbench
 // already proved in isolation.
+//
+// CHANGE B: the enable is now the synchronised pulse rather than the raw
+// 130 MHz one. rgf_status_wdata still crosses unsynchronised, which is
+// safe here and NOT changed by this milestone: tx_row/tx_col are held
+// from the moment tx_img_done fires until the next transfer's WAIT_DATA,
+// which cannot occur until the PC issues a fresh start command tens of
+// microseconds later. They are therefore stable for far longer than the
+// ~3-cycle synchroniser latency added below.
 // -----------------------------------------------------------------------------
-assign rgf_status_wen   = tx_img_done;
+assign rgf_status_wen   = tx_img_done_100;
 assign rgf_status_addr  = IMG_TX_MON_ADDR;
 assign rgf_status_wdata = {10'b0, 1'b0 /*error*/, 1'b1 /*complete*/, tx_col, tx_row};
 
@@ -599,7 +650,7 @@ rgf u_rgf (
     .img_ready_in       (1'b1),    // ROM contents are static, always "ready"
     .start_img_read_out (rgf_start_img_read),
     .clk_sel_out        (clk_sel),
-    .parity_fault_incr  (rx_parity_err_pulse),
+    .parity_fault_incr  (rx_parity_err_100),  // CHANGE B: was rx_parity_err_pulse (130 MHz)
     .fifo_full          (fifo_full),
     .fifo_empty         (fifo_empty),
     .fifo_almost_full   (almost_full),
