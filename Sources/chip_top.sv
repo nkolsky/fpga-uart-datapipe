@@ -180,17 +180,44 @@ reset_synch u_pll_reset_synch (
 logic start_pulse;
 
 // -----------------------------------------------------------------------------
-// RGB BRAM SRAMs (Stage 1: read-only)
+// STAGE 2C: shared SRAM write bus
 // -----------------------------------------------------------------------------
-// Stage 1 of the final project: the three `rom` instances that used to
-// live here are now rgb_sram instances. The read interface is
-// intentionally bit- and cycle-identical to the ROM's -- same 1-cycle
+// One address, one byte enable and one write enable drive all three channel
+// SRAMs on the same 100 MHz cycle; only the data differs per channel. Declared
+// here so the instantiations below can reference them.
+// -----------------------------------------------------------------------------
+logic                                    sram_wr_en;
+logic [memory_pkg::SRAM_DATA_WIDTH/8-1:0] sram_wr_be;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0]   sram_wr_addr;
+logic [memory_pkg::SRAM_DATA_WIDTH-1:0]   sram_wr_data_r;
+logic [memory_pkg::SRAM_DATA_WIDTH-1:0]   sram_wr_data_g;
+logic [memory_pkg::SRAM_DATA_WIDTH-1:0]   sram_wr_data_b;
+
+// Arbitration between the image-read path and the write path.
+logic sram_wr_allowed;
+logic sram_wr_busy;
+logic read_go;
+
+// tx_img_done recovered onto CLK100MHZ by the Change B toggle synchroniser.
+// Declared here rather than beside its cdc_pulse_sync instance because
+// mem_interlock (below) consumes it, and that instantiation comes first.
+logic tx_img_done_100;
+
+// -----------------------------------------------------------------------------
+// RGB BRAM SRAMs (read/write as of Stage 2C)
+// -----------------------------------------------------------------------------
+// Stage 1 replaced the three `rom` instances with rgb_sram. The read
+// interface is bit- and cycle-identical to the ROM's -- same 1-cycle
 // registered latency, same hold-last-value behaviour when the enable is
 // low, same widths, depth and contents -- so rom_sequencer.sv below is
 // UNCHANGED and sees no difference at all.
 //
-// Each instance's write port is tied inactive here. Stage 2 is what
-// drives it; nothing on the receive side writes memory yet.
+// STAGE 2C: the write ports are now LIVE. All three instances share one
+// write enable, address and byte enable driven by sram_wr_ctrl; only the
+// data bus differs per channel. mem_interlock keeps the write port and
+// rom_sequencer's read port mutually exclusive, so wr_en and rom_rd_en are
+// never asserted in the same cycle -- which is what makes the same-address
+// collision assertion inside rgb_sram unreachable.
 //
 // Geometry comes from memory_pkg (SRAM_DATA_WIDTH / SRAM_DEPTH). The
 // per-channel initialisation filenames are deliberately NOT in that
@@ -217,10 +244,10 @@ rgb_sram #(
     .rd_en   (rom_rd_en),
     .rd_addr (rom_addr),
     .rd_data (red_data),
-    .wr_en   (1'b0),
-    .wr_be   ('0),
-    .wr_addr ('0),
-    .wr_data ('0)
+    .wr_en   (sram_wr_en),
+    .wr_be   (sram_wr_be),
+    .wr_addr (sram_wr_addr),
+    .wr_data (sram_wr_data_r)
 );
 
 // Green channel SRAM
@@ -233,10 +260,10 @@ rgb_sram #(
     .rd_en   (rom_rd_en),
     .rd_addr (rom_addr),
     .rd_data (green_data),
-    .wr_en   (1'b0),
-    .wr_be   ('0),
-    .wr_addr ('0),
-    .wr_data ('0)
+    .wr_en   (sram_wr_en),
+    .wr_be   (sram_wr_be),
+    .wr_addr (sram_wr_addr),
+    .wr_data (sram_wr_data_g)
 );
 
 // Blue channel SRAM
@@ -249,10 +276,10 @@ rgb_sram #(
     .rd_en   (rom_rd_en),
     .rd_addr (rom_addr),
     .rd_data (blue_data),
-    .wr_en   (1'b0),
-    .wr_be   ('0),
-    .wr_addr ('0),
-    .wr_data ('0)
+    .wr_en   (sram_wr_en),
+    .wr_be   (sram_wr_be),
+    .wr_addr (sram_wr_addr),
+    .wr_data (sram_wr_data_b)
 );
 
 // -----------------------------------------------------------------------------
@@ -276,7 +303,7 @@ logic        rom_seq_busy;      // rom_sequencer → LEDs
 rom_sequencer u_rom_sequencer (
     .clk         (CLK100MHZ),
     .rst_n       (sync_rst_n),
-    .start       (start_pulse),
+    .start       (read_go),        // Stage 2C: gated by mem_interlock
     .almost_full (almost_full),
     .almost_empty(almost_empty),
     .red_data    (red_data),
@@ -309,6 +336,33 @@ async_fifo u_async_fifo (
     .empty       (fifo_empty),
     .almost_empty(almost_empty)
 );
+
+// -----------------------------------------------------------------------------
+// TEMPORARY DIAGNOSTIC -- image FIFO overflow detector. REMOVE AFTER ANALYSIS.
+// -----------------------------------------------------------------------------
+// async_fifo drops a write silently when full:
+//
+//     if (wr_en && !full) fifo_mem[...] <= wr_data;   // async_fifo.sv
+//
+// so a lost pixel leaves no trace anywhere. This flag is the only way to
+// observe it.
+//
+// It answers one question: did rom_sequencer ever attempt a push that the
+// FIFO refused? If it lights, pixels were dropped, tx_sequencer never
+// received its 65536th pixel, never reached DONE, and tx_img_done never
+// fired -- which is exactly the stall the clear-then-start test implied.
+//
+// Purely observational: it reads fifo_wr_en and fifo_full and drives nothing
+// back into the datapath, so it cannot perturb FIFO behaviour. Both signals
+// are native to the write domain (CLK100MHZ / sync_rst_n), so there is no
+// clock crossing here.
+// -----------------------------------------------------------------------------
+logic img_fifo_ovf_sticky;
+
+always_ff @(posedge CLK100MHZ or negedge sync_rst_n) begin
+    if (!sync_rst_n)                 img_fifo_ovf_sticky <= 1'b0;
+    else if (fifo_wr_en && fifo_full) img_fifo_ovf_sticky <= 1'b1;
+end
 // -----------------------------------------------------------------------------
 // TX Sequencer (includes msg_composer internally)
 // -----------------------------------------------------------------------------
@@ -335,6 +389,41 @@ tx_sequencer u_tx_sequencer (
     .row_cnt_out (tx_row),
     .col_cnt_out (tx_col)
 );
+
+// -----------------------------------------------------------------------------
+// TEMPORARY DIAGNOSTIC -- did tx_sequencer reach DONE? REMOVE AFTER ANALYSIS.
+// -----------------------------------------------------------------------------
+// tx_img_done is a one-cycle pulse registered off tx_sequencer's DONE state.
+// Reaching DONE requires NEXT to have been entered 65536 times, and NEXT is
+// reachable only from WAIT_DONE on !mac_busy -- i.e. after a full mac_busy
+// rise-and-fall for that message. mac_busy in turn only falls once the MAC has
+// reached MAC_DONE, which requires byte_idx == 15 and phy_ready, and phy_ready
+// only asserts after the PHY has returned to PHY_IDLE from PHY_STOP_BIT on
+// baud_tick.
+//
+// So one counter increment corresponds to one COMPLETELY TRANSMITTED 16-byte
+// message, stop bit included. The counters cannot run ahead of the wire, and
+// this flag therefore answers the outstanding question directly:
+//
+//   LIT  after a short capture -> all 65536 messages physically left
+//                                 UART_RXD_OUT; the loss is downstream of the
+//                                 FPGA pin.
+//   DARK after a short capture -> tx_sequencer never reached DONE; the stall
+//                                 is on the FPGA side and the rest of the LED
+//                                 map localises it.
+//
+// Unlike the protocol-level retry tests, this cannot be confounded by cts, by
+// img_in_flight, or by anything on the host.
+//
+// Clocked on pll_clk_out / sync_pll_rst_n to match tx_sequencer's domain --
+// tx_img_done is sampled where it is generated, with no crossing.
+// -----------------------------------------------------------------------------
+logic tx_done_sticky;
+
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n)  tx_done_sticky <= 1'b0;
+    else if (tx_img_done) tx_done_sticky <= 1'b1;
+end
 
 // -----------------------------------------------------------------------------
 // TX MAC
@@ -558,8 +647,8 @@ logic                  cmd_fifo_rd_en;
 logic [CMD_FIFO_W-1:0] cmd_fifo_rd_data;
 logic                  cmd_fifo_empty;
 
-logic                  cmd_seen_100;
-logic [CMD_FIFO_W-1:0] cmd_last_100;
+logic                  sram_wr_seen;      // sticky: a pixel was written
+logic                  sram_wr_rejected;  // sticky: a command was discarded
 
 assign cmd_fifo_wr_en   = rx_cmd_valid;
 assign cmd_fifo_wr_data = {rx_cmd_addr, rx_cmd_pixel};
@@ -586,20 +675,55 @@ async_fifo #(
     .almost_empty ()                   // unused
 );
 
-// TEMPORARY Stage 2B consumer -- delete in Stage 2C along with LED[14].
-cmd_monitor #(
+// -----------------------------------------------------------------------------
+// STAGE 2C: single-pixel SRAM write path
+// -----------------------------------------------------------------------------
+// cmd_monitor is gone -- sram_wr_ctrl is the real consumer of the command FIFO
+// now. It pops one command per clock when permitted, maps the raw 24-bit pixel
+// index onto a word address and byte lane, and drives all three channel SRAMs
+// on the same cycle.
+//
+// mem_interlock keeps the SRAM read and write ports mutually exclusive. It is
+// not the full arbiter -- no drain barrier, no CTS hold-off -- just the
+// smallest structure that makes exclusion structural rather than a consequence
+// of UART pacing. See mem_interlock.sv for why gating on rom_seq_busy alone is
+// insufficient.
+// -----------------------------------------------------------------------------
+sram_wr_ctrl #(
     .CMD_W (CMD_FIFO_W)
-) u_cmd_monitor (
+) u_sram_wr_ctrl (
     .clk         (CLK100MHZ),
     .rst_n       (sync_rst_n),
     .cmd_empty   (cmd_fifo_empty),
     .cmd_rd_data (cmd_fifo_rd_data),
     .cmd_rd_en   (cmd_fifo_rd_en),
-    .cmd_seen    (cmd_seen_100),
-    .cmd_last    (cmd_last_100)
+    .wr_allowed  (sram_wr_allowed),
+    .wr_busy     (sram_wr_busy),
+    .wr_en       (sram_wr_en),
+    .wr_be       (sram_wr_be),
+    .wr_addr     (sram_wr_addr),
+    .wr_data_r   (sram_wr_data_r),
+    .wr_data_g   (sram_wr_data_g),
+    .wr_data_b   (sram_wr_data_b),
+    .wr_seen     (sram_wr_seen),
+    .wr_rejected (sram_wr_rejected)
 );
 
-// Overflow detector, 130 MHz write domain. Sticky, and must stay clear.
+mem_interlock u_mem_interlock (
+    .clk          (CLK100MHZ),
+    .rst_n        (sync_rst_n),
+    .start_req    (start_pulse),       // raw RGF request
+    .rom_seq_busy (rom_seq_busy),
+    .img_done     (tx_img_done_100),   // full-transmission completion
+    .read_go      (read_go),           // -> rom_sequencer.start
+    .cmd_empty    (cmd_fifo_empty),
+    .wr_busy      (sram_wr_busy),
+    .wr_allowed   (sram_wr_allowed)
+);
+
+// Command FIFO overflow detector, 130 MHz write domain. Sticky, and must stay
+// clear: the write path drains at one command per clock against a producer
+// limited to roughly one command per 15 us.
 logic cmd_ovf_sticky;
 
 always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
@@ -732,7 +856,6 @@ assign rgf_pc_wdata = rgf_cmd_wdata_100;
 // Neither source module is modified: tx_sequencer and rx_phy still emit
 // exactly the pulses they always did.
 // -----------------------------------------------------------------------------
-logic tx_img_done_100;      // tx_img_done, recovered on CLK100MHZ
 logic rx_parity_err_100;    // rx_parity_err_pulse, recovered on CLK100MHZ
 
 cdc_pulse_sync u_cdc_tx_img_done (
@@ -817,15 +940,26 @@ assign UART_CTS = ~(rom_seq_busy || tx_seq_busy || rx_mac_busy);
 // -----------------------------------------------------------------------------
 // LEDs: tie off unused for now
 // -----------------------------------------------------------------------------
-// TEMPORARY Stage 2B observability -- remove with cmd_monitor in Stage 2C.
-// LED[14]: a command completed the 130 -> 100 MHz crossing and was captured.
-// LED[13]: command FIFO overflow. Must remain dark; if it ever lights, a
-//          pixel-write command was silently discarded.
-assign LED[14] = cmd_seen_100;
-assign LED[13] = cmd_ovf_sticky;
+// TEMPORARY Stage 2C observability.
+// LED[14]: at least one pixel has been written into the SRAMs.
+// LED[13]: a command was discarded -- FIFO overflow or out-of-range address.
+//          Must remain dark for well-formed, in-range traffic.
+// TEMPORARY DIAGNOSTIC OVERRIDE -- restore to sram_wr_seen afterwards.
+// The stall investigation sends no Single Pixel Write commands, so
+// sram_wr_seen is guaranteed dark and carries no information.
+assign LED[14] = tx_done_sticky;
+// Either rejection cause. Separable by construction: run in-range traffic
+// only and this must stay dark; then send a deliberately out-of-range
+// command and it must light.
+assign LED[13] = cmd_ovf_sticky || sram_wr_rejected;
 // TEMPORARY Stage 2A observability -- see pix_wr_seen_sticky above.
 // Remove together with the sticky flag when the Stage 2B command FIFO lands.
-assign LED[15] = pix_wr_seen_sticky;
+// TEMPORARY DIAGNOSTIC OVERRIDE -- restore to pix_wr_seen_sticky afterwards.
+// LED[15] normally reports the Stage 2A pixel-write parser. The stall
+// investigation sends no Single Pixel Write commands, so that flag is
+// guaranteed dark and carries no information; the image FIFO overflow flag is
+// the signal we actually need to see.
+assign LED[15] = img_fifo_ovf_sticky;
 assign LED[12] = counter_heartbeat_cnt[26];
 assign LED[11] = clk_sel;
 assign LED[10] = UART_RTS;
