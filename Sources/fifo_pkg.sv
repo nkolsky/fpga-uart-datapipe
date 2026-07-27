@@ -34,7 +34,7 @@ package fifo_pkg;
     // -----------------------------------------------------------------
     // FIFO sizing parameters
     // -----------------------------------------------------------------
-    localparam int DATA_WIDTH = 24;            // R0,G0,B0 packed pixel
+    localparam int FIFO_DATA_WIDTH = 24;            // R0,G0,B0 packed pixel
     localparam int DEPTH      = 64;            // number of entries
     localparam int ADDR_WIDTH = $clog2(DEPTH); // 6 bits for depth=64
 

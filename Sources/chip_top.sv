@@ -524,6 +524,83 @@ always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
 end
 
 // -----------------------------------------------------------------------------
+// STAGE 2B: pixel-command clock-domain crossing
+// -----------------------------------------------------------------------------
+// Carries the RAW protocol values across from the 130 MHz RX domain to the
+// 100 MHz memory domain, unchanged:
+//
+//     cmd_fifo_wr_data[47:24] = cmd_addr [23:0]
+//     cmd_fifo_wr_data[23: 0] = cmd_pixel[23:0] = {R,G,B}
+//
+// No SRAM word address or byte lane is derived here -- that mapping belongs
+// to Stage 2C, together with the write controller and arbitration.
+//
+// A FIFO rather than a cdc_cmd_sync handshake because Stage 2C's consumer can
+// be stalled for the whole duration of an image transmission by the arbiter,
+// during which commands must queue rather than be dropped. In Stage 2B the
+// monitor drains at one command per clock against a producer limited to about
+// one per 15 us, so occupancy never exceeds one.
+//
+// FULL HANDLING: async_fifo's own "if (wr_en && !full)" gate prevents pointer
+// corruption but drops the write silently, so cmd_ovf_sticky below detects
+// exactly that. It must never light in Stage 2B -- the FIFO cannot fill at
+// these rates. The almost_full -> UART_CTS backpressure path is deliberately
+// deferred to Stage 2C, where the arbiter creates a real stall condition;
+// adding it now would put a gray2bin XOR cascade on the 130 MHz domain for no
+// benefit and risk the timing closure just achieved.
+// -----------------------------------------------------------------------------
+localparam int CMD_FIFO_W = 48;   // {cmd_addr[23:0], cmd_pixel[23:0]}
+
+logic                  cmd_fifo_wr_en;
+logic [CMD_FIFO_W-1:0] cmd_fifo_wr_data;
+logic                  cmd_fifo_full;
+logic                  cmd_fifo_rd_en;
+logic [CMD_FIFO_W-1:0] cmd_fifo_rd_data;
+logic                  cmd_fifo_empty;
+
+logic                  cmd_seen_100;
+logic [CMD_FIFO_W-1:0] cmd_last_100;
+
+assign cmd_fifo_wr_en   = rx_cmd_valid;
+assign cmd_fifo_wr_data = {rx_cmd_addr, rx_cmd_pixel};
+
+async_fifo u_cmd_fifo (
+    .wr_clk       (pll_clk_out),
+    .wr_rst_n     (sync_pll_rst_n),
+    .wr_en        (cmd_fifo_wr_en),
+    .wr_data      (cmd_fifo_wr_data),
+    .full         (cmd_fifo_full),
+    .almost_full  (),                  // Stage 2C: -> UART_CTS backpressure
+    .rd_clk       (CLK100MHZ),
+    .rd_rst_n     (sync_rst_n),
+    .rd_en        (cmd_fifo_rd_en),
+    .rd_data      (cmd_fifo_rd_data),
+    .empty        (cmd_fifo_empty),
+    .almost_empty ()                   // unused
+);
+
+// TEMPORARY Stage 2B consumer -- delete in Stage 2C along with LED[14].
+cmd_monitor #(
+    .CMD_W (CMD_FIFO_W)
+) u_cmd_monitor (
+    .clk         (CLK100MHZ),
+    .rst_n       (sync_rst_n),
+    .cmd_empty   (cmd_fifo_empty),
+    .cmd_rd_data (cmd_fifo_rd_data),
+    .cmd_rd_en   (cmd_fifo_rd_en),
+    .cmd_seen    (cmd_seen_100),
+    .cmd_last    (cmd_last_100)
+);
+
+// Overflow detector, 130 MHz write domain. Sticky, and must stay clear.
+logic cmd_ovf_sticky;
+
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n)                       cmd_ovf_sticky <= 1'b0;
+    else if (cmd_fifo_wr_en && cmd_fifo_full)  cmd_ovf_sticky <= 1'b1;
+end
+
+// -----------------------------------------------------------------------------
 // Config RGF + dispatcher
 // -----------------------------------------------------------------------------
 // Register indexing: reuses the existing {R###,C###,V###} framing rather
@@ -733,7 +810,12 @@ assign UART_CTS = ~(rom_seq_busy || tx_seq_busy || rx_mac_busy);
 // -----------------------------------------------------------------------------
 // LEDs: tie off unused for now
 // -----------------------------------------------------------------------------
-assign LED[14:13] = '0;
+// TEMPORARY Stage 2B observability -- remove with cmd_monitor in Stage 2C.
+// LED[14]: a command completed the 130 -> 100 MHz crossing and was captured.
+// LED[13]: command FIFO overflow. Must remain dark; if it ever lights, a
+//          pixel-write command was silently discarded.
+assign LED[14] = cmd_seen_100;
+assign LED[13] = cmd_ovf_sticky;
 // TEMPORARY Stage 2A observability -- see pix_wr_seen_sticky above.
 // Remove together with the sticky flag when the Stage 2B command FIFO lands.
 assign LED[15] = pix_wr_seen_sticky;
