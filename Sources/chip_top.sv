@@ -564,7 +564,14 @@ logic [CMD_FIFO_W-1:0] cmd_last_100;
 assign cmd_fifo_wr_en   = rx_cmd_valid;
 assign cmd_fifo_wr_data = {rx_cmd_addr, rx_cmd_pixel};
 
-async_fifo u_cmd_fifo (
+// .DW(48) is REQUIRED. Without it the ports default to FIFO_DATA_WIDTH (24)
+// and this 48-bit payload is silently truncated to its low half -- cmd_pixel
+// would cross and cmd_addr would be discarded, sending every write to
+// word_addr 0 / byte_lane 0. Truncation is only a width warning, never an
+// elaboration error, so nothing stops a build without it.
+async_fifo #(
+    .DW (CMD_FIFO_W)
+) u_cmd_fifo (
     .wr_clk       (pll_clk_out),
     .wr_rst_n     (sync_pll_rst_n),
     .wr_en        (cmd_fifo_wr_en),
