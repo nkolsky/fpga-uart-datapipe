@@ -127,7 +127,53 @@ module rx_classifier
     input  logic [5:0]  rr_rgf_addr,
 
     output logic        rr_cmd_valid,
-    output logic [5:0]  rr_cmd_addr
+    output logic [5:0]  rr_cmd_addr,
+
+    // -----------------------------------------------------------------
+    // SINGLE PIXEL READ: parsed request from rx_pixel_rd_parser.
+    //
+    // This is NOT an RGF producer. It leaves the module on its own
+    // strobe and crosses to the 100 MHz memory domain to reach
+    // pixel_rd_ctrl, so it does not join the rgf_src mux in chip_top and
+    // cannot contend with the two producers that do.
+    //
+    // pr_valid already carries the FULL 24-bit coordinate range check
+    // performed in the parser, so nothing here needs to re-examine the
+    // raw fields.
+    // -----------------------------------------------------------------
+    input  logic        pr_valid,
+    input  logic        pr_coord_err,
+
+    input  logic [9:0]  pr_row,
+    input  logic [9:0]  pr_col,
+
+    output logic        pr_cmd_valid,
+    output logic [9:0]  pr_cmd_row,
+    output logic [9:0]  pr_cmd_col,
+
+    // -----------------------------------------------------------------
+    // IMAGE BURST READ: parsed request from rx_burst_rd_parser.
+    //
+    // Like the Single Pixel Read command this is NOT an RGF producer. It
+    // leaves on its own strobe and crosses to the 100 MHz memory domain
+    // to reach burst_rd_ctrl, so it never joins the rgf_src mux.
+    //
+    // br_valid already carries the full 24-bit range checks AND the
+    // base+extent test, so nothing here re-examines the raw fields.
+    // -----------------------------------------------------------------
+    input  logic        br_valid,
+    input  logic        br_err,
+
+    input  logic [9:0]  br_base_row,
+    input  logic [9:0]  br_base_col,
+    input  logic [9:0]  br_height,
+    input  logic [9:0]  br_width,
+
+    output logic        br_cmd_valid,
+    output logic [9:0]  br_cmd_base_row,
+    output logic [9:0]  br_cmd_base_col,
+    output logic [9:0]  br_cmd_height,
+    output logic [9:0]  br_cmd_width
 );
 
 // -------------------------------------------------------------------------
@@ -138,6 +184,8 @@ logic pixwr_hit,  pixwr_err;
 logic unknown_msg;
 
 logic regrd_hit, regrd_err;
+logic pixrd_hit, pixrd_err;
+logic burstrd_hit, burstrd_err;
 
 always_comb begin : qualify
     // `active` is the ONLY frame-acceptance condition. During a burst this
@@ -161,6 +209,40 @@ always_comb begin : qualify
     // the existing classifier_error rather than silently truncated.
     regrd_hit = active && (msg_kind == MSG_REG_READ) && rr_valid;
     regrd_err = active && (msg_kind == MSG_REG_READ) && rr_addr_err;
+
+    // Single Pixel Read: accepted only with coordinates that are inside
+    // the image when judged on their FULL 24-bit fields.
+    //
+    // The error term is the complement of the hit rather than
+    // pr_coord_err alone, and that is deliberate. rx_msg_decode reaches
+    // MSG_PIX_READ on bytes 0, 1, 5, 6 and 11 only; the parser
+    // additionally validates bytes 10 and 15. A frame that decodes as
+    // MSG_PIX_READ but is malformed at its tail therefore has
+    // pr_coord_err low AND pr_valid low, and using pr_coord_err by
+    // itself would drop it in silence. !pr_valid covers both the bad
+    // framing and the out-of-range coordinate, which is what the
+    // diagnostic convention asks for.
+    pixrd_hit = active && (msg_kind == MSG_PIX_READ) && pr_valid;
+    pixrd_err = active && (msg_kind == MSG_PIX_READ) && !pr_valid;
+
+    // Image Burst Read. Same shape as the Single Pixel Read terms, and
+    // the error term is likewise !br_valid rather than br_err alone:
+    // rx_msg_decode reaches MSG_BURST_READ on bytes 0, 1, 5 and 6 only,
+    // while the parser additionally checks bytes 10, 11 and 15. A frame
+    // that decodes as a burst read but is malformed at its tail has
+    // br_err low AND br_valid low, so using br_err by itself would drop
+    // it silently.
+    //
+    // NOTE ON EXISTING SUITES: MSG_BURST_READ frames were previously
+    // ignored outright -- no hit, no error -- because unknown_msg only
+    // fires on MSG_UNKNOWN. tb_rx_pipeline already sends one
+    // (send_burst_read with A=0, H=256, W=256). That request is VALID, so
+    // it now produces br_cmd_valid and still no error, and the suite's
+    // expect_counts(0,0,0) over classifier_valid/error/cmd_valid is
+    // unaffected. An INVALID burst read in some future test would newly
+    // raise classifier_error, which is the intended behaviour.
+    burstrd_hit = active && (msg_kind == MSG_BURST_READ) && br_valid;
+    burstrd_err = active && (msg_kind == MSG_BURST_READ) && !br_valid;
 end : qualify
 
 // -------------------------------------------------------------------------
@@ -206,12 +288,44 @@ always_ff @(posedge clk or negedge rst_n) begin
         cmd_valid        <= 1'b0;
         rr_cmd_valid     <= 1'b0;
         rr_cmd_addr      <= 6'd0;
+        pr_cmd_valid     <= 1'b0;
+        pr_cmd_row       <= 10'd0;
+        pr_cmd_col       <= 10'd0;
+        br_cmd_valid     <= 1'b0;
+        br_cmd_base_row  <= 10'd0;
+        br_cmd_base_col  <= 10'd0;
+        br_cmd_height    <= 10'd0;
+        br_cmd_width     <= 10'd0;
     end else begin
         classifier_valid <= legacy_hit;
-        classifier_error <= legacy_err || pixwr_err || regrd_err || unknown_msg;
+        classifier_error <= legacy_err || pixwr_err || regrd_err ||
+                            pixrd_err || burstrd_err || unknown_msg;
         cmd_valid        <= pixwr_hit;
         rr_cmd_valid     <= regrd_hit;
         if (regrd_hit) rr_cmd_addr <= rr_rgf_addr;
+
+        // A rejected Single Pixel Read emits NO command, so no SRAM
+        // access and no reply can follow from it -- only the error pulse
+        // above. The coordinate registers are written on a hit only, so a
+        // rejected request cannot even leave a stale-but-plausible
+        // coordinate behind for the next requester to trip over.
+        pr_cmd_valid <= pixrd_hit;
+        if (pixrd_hit) begin
+            pr_cmd_row <= pr_row;
+            pr_cmd_col <= pr_col;
+        end
+
+        // A rejected Image Burst Read emits NO command, so no SRAM access
+        // and no reply stream can follow -- only the error pulse above.
+        // Geometry is written on a hit only, so a rejected request cannot
+        // leave a plausible-looking region behind.
+        br_cmd_valid <= burstrd_hit;
+        if (burstrd_hit) begin
+            br_cmd_base_row <= br_base_row;
+            br_cmd_base_col <= br_base_col;
+            br_cmd_height   <= br_height;
+            br_cmd_width    <= br_width;
+        end
     end
 end
 
@@ -255,8 +369,35 @@ end
     // Nothing at all may leave this module during a burst.
     a_inert_during_burst: assert property (
         @(posedge clk) disable iff (!rst_n)
-        burst_active |-> (!classifier_valid && !classifier_error && !cmd_valid)
+        burst_active |-> (!classifier_valid && !classifier_error &&
+                          !cmd_valid && !pr_cmd_valid && !br_cmd_valid)
     ) else $error("%m: classifier active during a burst");
+
+    // A frame carries exactly one msg_kind_q, so a Single Pixel Read can
+    // never coincide with either RGF producer. chip_top relies on this:
+    // pr_cmd_valid drives a separate CDC and must not be a third
+    // contender for the rgf_src mux.
+    a_burstrd_exclusive: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        br_cmd_valid |-> (!classifier_valid && !rr_cmd_valid &&
+                          !cmd_valid && !pr_cmd_valid)
+    ) else $error("%m: burst read command overlapped another command");
+
+    a_burstrd_hit_xor_err: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        !(burstrd_hit && burstrd_err)
+    ) else $error("%m: burst read both accepted and rejected");
+
+    a_pixrd_exclusive: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pr_cmd_valid |-> (!classifier_valid && !rr_cmd_valid && !cmd_valid)
+    ) else $error("%m: pixel read command overlapped another command");
+
+    // An accepted Single Pixel Read never coincides with its own error.
+    a_pixrd_hit_xor_err: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        !(pixrd_hit && pixrd_err)
+    ) else $error("%m: pixel read both accepted and rejected");
 
     // The structural layer, checked rather than assumed. If this fires,
     // bypass_active is mis-wired and only the explicit gate is protecting

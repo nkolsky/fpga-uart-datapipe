@@ -1,39 +1,86 @@
 // tx_reply_ctrl.sv
 // ----------------
-// Builds and schedules the 6-byte Register Read reply.
+// Builds and schedules host replies on the 130 MHz transmit domain.
 //
-//   byte 0  0x7B  '{'
-//   byte 1  pc_rdata[31:24]   V3      big-endian, MSB first
-//   byte 2  pc_rdata[23:16]   V2
-//   byte 3  pc_rdata[15: 8]   V1
-//   byte 4  pc_rdata[ 7: 0]   V0
-//   byte 5  0x7D  '}'
+// TWO reply kinds share one pending slot:
 //
-// tx_mac packs byte 0 in msg_data[7:0], so the frame is assembled LSB-first
-// below -- the same convention msg_composer already uses.
+//   Register Read      6 bytes, composed here from a 32-bit value
+//
+//     byte 0  0x7B  '{'
+//     byte 1  pc_rdata[31:24]   V3      big-endian, MSB first
+//     byte 2  pc_rdata[23:16]   V2
+//     byte 3  pc_rdata[15: 8]   V1
+//     byte 4  pc_rdata[ 7: 0]   V0
+//     byte 5  0x7D  '}'
+//
+//   Single Pixel Read  16 bytes, composed OUTSIDE this module by
+//                      msg_composer and presented ready-made on pix_msg
+//
+// tx_mac packs byte 0 in msg_data[7:0], so frames are assembled LSB-first
+// -- the same convention msg_composer already uses, which is exactly why
+// its output can be handed straight through.
 //
 // -----------------------------------------------------------------------
-// ARBITRATION -- why the reply waits
+// WHY THE LENGTH IS NOW LATCHED
+// -----------------------------------------------------------------------
+// reply_len used to be the constant 5'd6. With two kinds sharing the slot
+// it must travel with the payload: a 16-byte pixel reply sent with a
+// length of 6 would truncate to '{' plus three bytes of row data, and a
+// 6-byte register reply sent with a length of 16 would append ten bytes of
+// stale frame. Both are silent corruptions on the wire, so msg_q and len_q
+// are written by the same assignment and can never disagree.
+//
+// -----------------------------------------------------------------------
+// ARBITRATION -- why a reply waits
 // -----------------------------------------------------------------------
 // A reply is held until BOTH tx_seq_busy and mac_busy are low.
 //
-// An image transfer is 65536 fixed-size packets and the host reads it as one
-// uninterrupted stream, counting bytes. A 6-byte reply inserted between two
+// An image transfer is 65536 fixed-size packets and the host reads it as
+// one uninterrupted stream, counting bytes. A reply inserted between two
 // pixel messages would desynchronise every packet after it -- the capture
 // would fail with a framing error thousands of packets later, far from the
 // cause. Deferring costs nothing: at UART rates a full image takes ~1.5 s
 // and the host is not waiting on a register value during a capture.
 //
 // -----------------------------------------------------------------------
+// TWO PRODUCERS, TWO DIFFERENT BACKPRESSURE CONTRACTS
+// -----------------------------------------------------------------------
+// The two inputs are deliberately NOT symmetric, because their sources are
+// not symmetric.
+//
+//   rd_valid  is a one-cycle STROBE from cdc_cmd_sync. There is nothing at
+//             the far end that can hold it. If it arrives while the slot is
+//             occupied the only options are overwrite or drop, and dropping
+//             the NEWER one preserves the answer the host is actually
+//             waiting for. reply_overrun records that it happened.
+//
+//   pix_valid is a held LEVEL from pixel_rd_ctrl, via a level synchroniser.
+//             It has real backpressure, so there is no need to drop
+//             anything: the pixel reply simply WAITS until the slot frees,
+//             however long that takes, and is then taken normally. This is
+//             not an overrun and is not flagged as one.
+//
+// A pixel reply is accepted only when the slot is free AND no register
+// reply is arriving in the same cycle. Giving rd_valid unconditional
+// priority is what keeps the collision case out of the overrun path
+// entirely: the strobe that cannot wait is served, and the level that can
+// wait, waits.
+//
+// pix_accept is a single cycle, returned to the 100 MHz domain through a
+// pulse synchroniser. ack_hold then suppresses any further acceptance
+// until pix_valid has actually fallen, so one assertion of pix_valid
+// produces exactly one latched reply no matter how long it stays high.
+//
+// -----------------------------------------------------------------------
 // NO PULSE IS LOST
 // -----------------------------------------------------------------------
-// reply_pending is a level, set by the incoming reply and cleared only when
-// the MAC has actually taken the message (mac_busy observed high while this
+// pending is a level, set by the incoming reply and cleared only when the
+// MAC has actually taken the message (mac_busy observed high while this
 // module is driving it). Backpressure of any duration simply extends the
 // wait; nothing is dropped and nothing is re-sent.
 //
 // -----------------------------------------------------------------------
-// A SECOND REQUEST WHILE ONE IS PENDING
+// A SECOND REGISTER REQUEST WHILE ONE IS PENDING
 // -----------------------------------------------------------------------
 // The second reply is REJECTED and the first is preserved, with
 // reply_overrun raised as a sticky diagnostic. Overwriting would answer the
@@ -50,9 +97,34 @@ module tx_reply_ctrl
     input  logic         clk,            // pll_clk_out, 130 MHz
     input  logic         rst_n,          // sync_pll_rst_n
 
-    // ---- captured register value, already in this clock domain --------
+    // ---- Register Read value, already in this clock domain ------------
     input  logic         rd_valid,       // one-cycle strobe from cdc_cmd_sync
     input  logic [31:0]  rd_data,
+
+    // ---- Single Pixel Read reply, held handshake ----------------------
+    // pix_valid is pixel_rd_ctrl's rpy_valid recovered onto this clock by
+    // a level synchroniser. pix_msg is the msg_composer output driven from
+    // the 100 MHz payload registers; it is stable for many cycles before
+    // pix_valid can be observed here and stays stable until pix_accept is
+    // seen at the far side, so it needs no synchroniser of its own.
+    input  logic         pix_valid,
+    input  logic [127:0] pix_msg,
+    output logic         pix_accept,     // one cycle: payload has been latched
+
+    // ---- Image Burst Read reply, held handshake -----------------------
+    // A THIRD producer, with the same contract as the pixel reply: a held
+    // level with real backpressure, so it waits rather than being dropped.
+    // The frame is already composed (burst_msg_composer) and is 16 bytes,
+    // so no new length is introduced -- len_q simply carries 16 again.
+    //
+    // Unlike the other two this one is a STREAM: one burst emits
+    // ceil(H*W/4) messages, up to 16,384 for a full frame. Each is handed
+    // over individually through this same single slot, which is ample
+    // because the UART needs ~19.7 us per message while the handshake
+    // costs tens of nanoseconds.
+    input  logic         brd_valid,
+    input  logic [127:0] brd_msg,
+    output logic         brd_accept,
 
     // ---- transmit path status -----------------------------------------
     input  logic         tx_seq_busy,    // image transfer in progress
@@ -66,51 +138,106 @@ module tx_reply_ctrl
     // ---- status --------------------------------------------------------
     output logic         reply_pending,  // a reply is queued or in flight
     output logic         reply_sent,     // one cycle, reply handed to the MAC
-    output logic         reply_overrun   // sticky: a reply arrived while busy
+    output logic         reply_overrun   // sticky: a register reply was dropped
 );
 
-    localparam logic [4:0] REPLY_BYTES = 5'd6;
+    localparam logic [4:0] REG_REPLY_BYTES = 5'd6;
+    localparam logic [4:0] PIX_REPLY_BYTES = 5'd16;
 
-    logic [31:0] value_q;
-    logic        pending;
-    logic        driving;      // reply_req asserted, waiting for the MAC
+    logic [127:0] msg_q;
+    logic [4:0]   len_q;
+    logic         pending;
+    logic         driving;      // reply_req asserted, waiting for the MAC
+    logic         ack_hold;     // pix_valid already serviced, awaiting its fall
+    logic         brd_hold;     // same, for the burst stream
 
     assign reply_pending = pending;
-    assign reply_len     = REPLY_BYTES;
+    assign reply_msg     = msg_q;
+    assign reply_len     = len_q;
 
-    // Frame assembled LSB-first: byte 0 occupies bits [7:0].
-    assign reply_msg = {80'd0,
+    // Register Read frame, assembled LSB-first: byte 0 occupies bits [7:0].
+    // Unchanged from the single-kind version -- the bytes and their order
+    // are identical, they are simply latched now instead of being driven
+    // continuously from value_q.
+    logic [127:0] reg_frame;
+    assign reg_frame = {80'd0,
                         CHAR_CLOSE_BRACE,     // byte 5  [47:40]
-                        value_q[ 7: 0],       // byte 4  [39:32]  V0
-                        value_q[15: 8],       // byte 3  [31:24]  V1
-                        value_q[23:16],       // byte 2  [23:16]  V2
-                        value_q[31:24],       // byte 1  [15: 8]  V3
+                        rd_data[ 7: 0],       // byte 4  [39:32]  V0
+                        rd_data[15: 8],       // byte 3  [31:24]  V1
+                        rd_data[23:16],       // byte 2  [23:16]  V2
+                        rd_data[31:24],       // byte 1  [15: 8]  V3
                         CHAR_OPEN_BRACE};     // byte 0  [ 7: 0]
+
+    // A pixel reply may be taken when it is genuinely on offer, has not
+    // already been taken, the slot is free, and no register strobe is
+    // competing for that slot this cycle.
+    logic take_pix;
+    assign take_pix = pix_valid && !ack_hold && !pending && !rd_valid;
+
+    // Burst messages sit BELOW the single-pixel reply in priority. Both are
+    // held levels so the loser simply waits, and in practice they cannot
+    // contend: a single-pixel read cannot obtain memory while a burst owns
+    // it, so its reply cannot exist mid-burst. The ordering is fixed anyway
+    // so the outcome is deterministic rather than incidental.
+    logic take_brd;
+    assign take_brd = brd_valid && !brd_hold && !pending && !rd_valid && !take_pix;
 
     // Drive the MAC only when the transmit path is completely idle.
     assign reply_req = pending && !tx_seq_busy && !mac_busy;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            value_q       <= '0;
+            msg_q         <= '0;
+            len_q         <= REG_REPLY_BYTES;
             pending       <= 1'b0;
             driving       <= 1'b0;
+            ack_hold      <= 1'b0;
             reply_sent    <= 1'b0;
             reply_overrun <= 1'b0;
+            pix_accept    <= 1'b0;
+            brd_accept    <= 1'b0;
+            brd_hold      <= 1'b0;
         end
         else begin
             reply_sent <= 1'b0;
+            pix_accept <= 1'b0;
+            brd_accept <= 1'b0;
 
-            // ---- accept a new value ----------------------------------
+            // ---- re-arm the handshakes once their levels retract ------
+            if (!pix_valid)
+                ack_hold <= 1'b0;
+            if (!brd_valid)
+                brd_hold <= 1'b0;
+
+            // ---- accept a Register Read value ------------------------
+            // Unconditional priority over the pixel path: this strobe
+            // cannot be held at its source, the pixel level can.
             if (rd_valid) begin
                 if (pending) begin
                     // Keep the first answer; flag the collision.
                     reply_overrun <= 1'b1;
                 end
                 else begin
-                    value_q <= rd_data;
+                    msg_q   <= reg_frame;
+                    len_q   <= REG_REPLY_BYTES;
                     pending <= 1'b1;
                 end
+            end
+            // ---- otherwise accept a Single Pixel Read reply ----------
+            else if (take_pix) begin
+                msg_q      <= pix_msg;
+                len_q      <= PIX_REPLY_BYTES;
+                pending    <= 1'b1;
+                pix_accept <= 1'b1;
+                ack_hold   <= 1'b1;
+            end
+            // ---- otherwise accept an Image Burst Read message ---------
+            else if (take_brd) begin
+                msg_q      <= brd_msg;
+                len_q      <= PIX_REPLY_BYTES;   // also 16 bytes
+                pending    <= 1'b1;
+                brd_accept <= 1'b1;
+                brd_hold   <= 1'b1;
             end
 
             // ---- hand the frame to the MAC ---------------------------
@@ -145,21 +272,60 @@ module tx_reply_ctrl
         (pending && !(driving && mac_busy)) |=> pending
     ) else $error("%m: pending reply disappeared without being sent");
 
-    // ...and pending may fall ONLY on a genuine handoff. Expressed against
-    // reply_sent, which is set by the SAME nonblocking assignment that
-    // clears pending, so the two are sampled consistently. $past(driving &&
-    // mac_busy) does not work here: `driving` is cleared in that same NBA,
-    // so the sampled history does not describe the handoff cycle.
+    // ...and pending may fall ONLY on a genuine handoff.
     a_fall_only_on_handoff: assert property (
         @(posedge clk) disable iff (!rst_n)
         $fell(pending) |-> reply_sent
     ) else $error("%m: pending cleared without a MAC handoff");
 
-    // The held value is stable for the whole wait.
+    // The held frame and its length are stable for the whole wait, and
+    // stable TOGETHER -- a length that outlived its payload would put a
+    // truncated or over-long frame on the wire.
     a_stable: assert property (
         @(posedge clk) disable iff (!rst_n)
-        (pending && !(driving && mac_busy)) |=> $stable(value_q)
-    ) else $error("%m: pending reply value changed");
+        (pending && !(driving && mac_busy)) |=> ($stable(msg_q) &&
+                                                 $stable(len_q))
+    ) else $error("%m: pending reply changed while queued");
+
+    // Only the two legal lengths ever reach the MAC.
+    a_len_legal: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        reply_req |-> (reply_len == REG_REPLY_BYTES ||
+                       reply_len == PIX_REPLY_BYTES)
+    ) else $error("%m: illegal reply length offered to the MAC");
+
+    // The pixel handshake is one-for-one: an accept only ever fires while
+    // the level is up, and never twice for the same assertion.
+    a_accept_qualified: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_accept |-> pix_valid
+    ) else $error("%m: pix_accept asserted without pix_valid");
+
+    a_accept_once: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_accept |=> !pix_accept
+    ) else $error("%m: pix_accept asserted twice in succession");
+
+    // A pixel reply is never taken into an occupied slot.
+    a_brd_accept_qualified: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        brd_accept |-> brd_valid
+    ) else $error("%m: brd_accept asserted without brd_valid");
+
+    a_brd_accept_once: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        brd_accept |=> !brd_accept
+    ) else $error("%m: brd_accept asserted twice in succession");
+
+    a_one_producer: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        !(pix_accept && brd_accept)
+    ) else $error("%m: two reply producers accepted in one cycle");
+
+    a_pix_no_overwrite: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_accept |-> !$past(pending)
+    ) else $error("%m: pixel reply overwrote a pending reply");
 `endif
 
 endmodule : tx_reply_ctrl

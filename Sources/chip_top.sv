@@ -310,8 +310,58 @@ logic [43:0] pix_rpy_payload_130;   // captured, stable for the composer
 logic        pix_rpy_accept_130;
 logic [127:0] pix_reply_msg;
 
-assign sram_rd_en_mux   = pix_rd_owner ? pix_sram_rd_en   : rom_rd_en;
-assign sram_rd_addr_mux = pix_rd_owner ? pix_sram_rd_addr : rom_addr;
+// ---- IMAGE BURST READ ------------------------------------------------------
+// Declared here with the pixel-read signals for the same reason: several of
+// these are consumed by u_tx_reply_ctrl around line 500, far above the burst
+// datapath, and an identifier used before its declaration becomes a one-bit
+// implicit net rather than an error.
+logic        rx_br_cmd_valid;
+logic [9:0]  rx_br_cmd_base_row, rx_br_cmd_base_col;
+logic [9:0]  rx_br_cmd_height,   rx_br_cmd_width;
+
+logic        brd_req_valid_100;
+logic [39:0] brd_req_data_100;     // {base_row, base_col, height, width}
+
+logic        brd_rd_req, brd_rd_gnt, brd_rd_done;
+logic        brd_sram_rd_en;
+logic [13:0] brd_sram_rd_addr;
+logic        brd_busy, brd_overrun;
+
+logic                                          brd_msg_valid_100;
+logic                                          brd_msg_accept_100;
+logic [rx_burst_pkg::BURST_PIX_PER_MSG-1:0][rx_burst_pkg::BURST_PIX_W-1:0] brd_msg_pixels;
+
+logic        brd_msg_valid_100_d, brd_msg_send;
+logic        brd_msg_valid_130;
+logic [95:0] brd_msg_data_130;
+logic        brd_msg_held;
+logic [95:0] brd_msg_payload_130;
+logic        brd_msg_accept_130;
+logic [127:0] brd_reply_msg;
+
+// ---- shared SRAM read client ----------------------------------------------
+// pixel_rd_ctrl and burst_rd_ctrl both reach memory through mem_interlock's
+// SINGLE pix_rd client, arbitrated here rather than by adding a fourth client
+// to the interlock. The interlock is hardware-verified and its grant equation
+// is load-bearing for the write and full-frame paths; a ten-line arbiter in
+// front of it is a smaller change than a new client inside it.
+//
+// The lock is taken on request and released on done, so whichever controller
+// asks first runs to completion. They cannot normally contend -- the host
+// issues one command at a time -- but a pipelined host could, and the outcome
+// must be deterministic rather than incidental.
+logic shared_rd_req, shared_rd_gnt, shared_rd_done;
+logic arb_locked, arb_pix_owns, arb_brd_owns;
+
+// pix_rd_owner covers BOTH single-pixel and burst reads, because both go
+// through the interlock's one pix_rd client. arb_brd_owns then selects which
+// of the two actually drives the bus.
+assign sram_rd_en_mux   = pix_rd_owner
+                        ? (arb_brd_owns ? brd_sram_rd_en   : pix_sram_rd_en)
+                        : rom_rd_en;
+assign sram_rd_addr_mux = pix_rd_owner
+                        ? (arb_brd_owns ? brd_sram_rd_addr : pix_sram_rd_addr)
+                        : rom_addr;
 
 `ifndef SYNTHESIS
     // The two read clients can never both drive the port.
@@ -627,6 +677,9 @@ tx_reply_ctrl u_tx_reply_ctrl (
     .pix_valid     (pix_rpy_held),      // destination-side held request
     .pix_msg       (pix_reply_msg),
     .pix_accept    (pix_rpy_accept_130),
+    .brd_valid     (brd_msg_held),
+    .brd_msg       (brd_reply_msg),
+    .brd_accept    (brd_msg_accept_130),
     .tx_seq_busy   (tx_seq_busy),
     .mac_busy      (mac_busy),
     .reply_req     (rr_reply_req),
@@ -974,6 +1027,28 @@ rx_pixel_rd_parser u_rx_pixel_rd_parser (
 logic       rx_rr_cmd_valid;
 logic [5:0] rx_rr_cmd_addr;
 
+logic        rx_br_frame_ok, rx_br_dims_ok, rx_br_addr_ok, rx_br_extent_ok;
+logic        rx_br_valid, rx_br_err;
+logic [23:0] rx_br_addr_raw, rx_br_h_raw, rx_br_w_raw;
+logic [9:0]  rx_br_base_row, rx_br_base_col, rx_br_height, rx_br_width;
+
+rx_burst_rd_parser u_rx_burst_rd_parser (
+    .msg_in       (rx_mac_msg_data),
+    .br_frame_ok  (rx_br_frame_ok),
+    .br_dims_ok   (rx_br_dims_ok),
+    .br_addr_ok   (rx_br_addr_ok),
+    .br_extent_ok (rx_br_extent_ok),
+    .br_valid     (rx_br_valid),
+    .br_err       (rx_br_err),
+    .br_addr_raw  (rx_br_addr_raw),
+    .br_h_raw     (rx_br_h_raw),
+    .br_w_raw     (rx_br_w_raw),
+    .br_base_row  (rx_br_base_row),
+    .br_base_col  (rx_br_base_col),
+    .br_height    (rx_br_height),
+    .br_width     (rx_br_width)
+);
+
 rx_classifier u_rx_classifier (
     .clk              (pll_clk_out),
     .rst_n            (sync_pll_rst_n),
@@ -1008,7 +1083,18 @@ rx_classifier u_rx_classifier (
     .pr_col           (rx_pr_col),
     .pr_cmd_valid     (rx_pr_cmd_valid),
     .pr_cmd_row       (rx_pr_cmd_row),
-    .pr_cmd_col       (rx_pr_cmd_col)
+    .pr_cmd_col       (rx_pr_cmd_col),
+    .br_valid         (rx_br_valid),
+    .br_err           (rx_br_err),
+    .br_base_row      (rx_br_base_row),
+    .br_base_col      (rx_br_base_col),
+    .br_height        (rx_br_height),
+    .br_width         (rx_br_width),
+    .br_cmd_valid     (rx_br_cmd_valid),
+    .br_cmd_base_row  (rx_br_cmd_base_row),
+    .br_cmd_base_col  (rx_br_cmd_base_col),
+    .br_cmd_height    (rx_br_cmd_height),
+    .br_cmd_width     (rx_br_cmd_width)
 );
 
 // -----------------------------------------------------------------------------
@@ -1234,7 +1320,7 @@ pixel_rd_ctrl u_pixel_rd_ctrl (
     .req_row      (pix_req_data_100[19:10]),
     .req_col      (pix_req_data_100[ 9: 0]),
     .pix_rd_req   (pix_rd_req),
-    .pix_rd_gnt   (pix_rd_gnt),
+    .pix_rd_gnt   (pix_rd_gnt),       // from the shared-client arbiter
     .pix_rd_done  (pix_rd_done),
     .sram_rd_en   (pix_sram_rd_en),
     .sram_rd_addr (pix_sram_rd_addr),
@@ -1382,6 +1468,167 @@ cdc_pulse_sync u_cdc_pix_rpy_accept (
     .dst_pulse (pix_rpy_accept_100)
 );
 
+// -----------------------------------------------------------------------------
+// SHARED READ-CLIENT ARBITER
+// -----------------------------------------------------------------------------
+always_ff @(posedge CLK100MHZ or negedge sync_rst_n) begin
+    if (!sync_rst_n) begin
+        arb_locked   <= 1'b0;
+        arb_pix_owns <= 1'b0;
+        arb_brd_owns <= 1'b0;
+    end
+    else if (!arb_locked) begin
+        // Single-pixel read wins a simultaneous request: it is bounded at a
+        // handful of cycles, whereas a burst can hold memory for ~0.35 s.
+        if (pix_rd_req) begin
+            arb_locked   <= 1'b1;
+            arb_pix_owns <= 1'b1;
+        end
+        else if (brd_rd_req) begin
+            arb_locked   <= 1'b1;
+            arb_brd_owns <= 1'b1;
+        end
+    end
+    else if (shared_rd_done) begin
+        arb_locked   <= 1'b0;
+        arb_pix_owns <= 1'b0;
+        arb_brd_owns <= 1'b0;
+    end
+end
+
+assign shared_rd_req  = (arb_pix_owns && pix_rd_req) ||
+                        (arb_brd_owns && brd_rd_req);
+assign shared_rd_done = (arb_pix_owns && pix_rd_done) ||
+                        (arb_brd_owns && brd_rd_done);
+assign pix_rd_gnt     = arb_pix_owns && shared_rd_gnt;
+assign brd_rd_gnt     = arb_brd_owns && shared_rd_gnt;
+
+// -----------------------------------------------------------------------------
+// IMAGE BURST READ: request crossing, 130 MHz -> 100 MHz
+// -----------------------------------------------------------------------------
+cdc_cmd_sync #(
+    .ADDR_W (1),
+    .DATA_W (40)
+) u_cdc_brd_req (
+    .src_clk      (pll_clk_out),
+    .src_rst_n    (sync_pll_rst_n),
+    .src_valid    (rx_br_cmd_valid),
+    .src_is_write (1'b0),
+    .src_addr     (1'b0),
+    .src_wdata    ({rx_br_cmd_base_row, rx_br_cmd_base_col,
+                    rx_br_cmd_height,   rx_br_cmd_width}),
+    .dst_valid    (brd_req_valid_100),
+    .dst_is_write (),
+    .dst_addr     (),
+    .dst_wdata    (brd_req_data_100),
+    .dst_clk      (CLK100MHZ),
+    .dst_rst_n    (sync_rst_n)
+);
+
+burst_rd_ctrl u_burst_rd_ctrl (
+    .clk          (CLK100MHZ),
+    .rst_n        (sync_rst_n),
+    .req_valid    (brd_req_valid_100),
+    .req_base_row (brd_req_data_100[39:30]),
+    .req_base_col (brd_req_data_100[29:20]),
+    .req_height   (brd_req_data_100[19:10]),
+    .req_width    (brd_req_data_100[ 9: 0]),
+    .brd_rd_req   (brd_rd_req),
+    .brd_rd_gnt   (brd_rd_gnt),
+    .brd_rd_done  (brd_rd_done),
+    .sram_rd_en   (brd_sram_rd_en),
+    .sram_rd_addr (brd_sram_rd_addr),
+    .red_data     (red_data),
+    .green_data   (green_data),
+    .blue_data    (blue_data),
+    .msg_valid    (brd_msg_valid_100),
+    .msg_accept   (brd_msg_accept_100),
+    .msg_pixels   (brd_msg_pixels),
+    .busy         (brd_busy),
+    .req_overrun  (brd_overrun)
+);
+
+// -----------------------------------------------------------------------------
+// IMAGE BURST READ: reply crossing, 100 MHz -> 130 MHz
+// -----------------------------------------------------------------------------
+// Identical in shape to the single-pixel reply crossing: the held valid is
+// edge-detected into a one-cycle send, the whole 96-bit payload crosses as ONE
+// atomic cdc_cmd_sync transaction, and the destination converts the one-shot
+// back into a held request so tx_reply_ctrl's backpressure reaches all the way
+// back to burst_rd_ctrl.
+always_ff @(posedge CLK100MHZ or negedge sync_rst_n) begin
+    if (!sync_rst_n) brd_msg_valid_100_d <= 1'b0;
+    else             brd_msg_valid_100_d <= brd_msg_valid_100;
+end
+
+assign brd_msg_send = brd_msg_valid_100 && !brd_msg_valid_100_d;
+
+cdc_cmd_sync #(
+    .ADDR_W (1),
+    .DATA_W (96)
+) u_cdc_brd_msg (
+    .src_clk      (CLK100MHZ),
+    .src_rst_n    (sync_rst_n),
+    .src_valid    (brd_msg_send),
+    .src_is_write (1'b0),
+    .src_addr     (1'b0),
+    .src_wdata    (brd_msg_pixels),
+    .dst_valid    (brd_msg_valid_130),
+    .dst_is_write (),
+    .dst_addr     (),
+    .dst_wdata    (brd_msg_data_130),
+    .dst_clk      (pll_clk_out),
+    .dst_rst_n    (sync_pll_rst_n)
+);
+
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n) begin
+        brd_msg_held        <= 1'b0;
+        brd_msg_payload_130 <= '0;
+    end
+    else if (brd_msg_valid_130) begin
+        brd_msg_held        <= 1'b1;
+        brd_msg_payload_130 <= brd_msg_data_130;
+    end
+    else if (brd_msg_accept_130) begin
+        brd_msg_held        <= 1'b0;
+    end
+end
+
+burst_msg_composer u_burst_msg_composer (
+    .pixels (brd_msg_payload_130),
+    .msg    (brd_reply_msg)
+);
+
+cdc_pulse_sync u_cdc_brd_accept (
+    .src_clk   (pll_clk_out),
+    .src_rst_n (sync_pll_rst_n),
+    .src_pulse (brd_msg_accept_130),
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_pulse (brd_msg_accept_100)
+);
+
+`ifndef SYNTHESIS
+    a_arb_exclusive: assert property (
+        @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+        !(arb_pix_owns && arb_brd_owns)
+    ) else $error("chip_top: both read clients own the shared port");
+
+    a_brd_owns_when_reading: assert property (
+        @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+        brd_sram_rd_en |-> (arb_brd_owns && pix_rd_owner)
+    ) else $error("chip_top: burst read drove the SRAM without ownership");
+
+    // No write may be permitted at any point inside a burst -- this is the
+    // coherent-region guarantee, checked at the top level where both the
+    // burst state and the interlock verdict are visible.
+    a_no_write_during_burst: assert property (
+        @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+        (arb_brd_owns && pix_rd_owner) |-> !sram_wr_allowed
+    ) else $error("chip_top: write allowed during a burst read");
+`endif
+
 mem_interlock u_mem_interlock (
     .clk          (CLK100MHZ),
     .rst_n        (sync_rst_n),
@@ -1393,9 +1640,9 @@ mem_interlock u_mem_interlock (
     .wr_busy      (sram_wr_busy),
     .burst_active (burst_active_100),   // closes the inter-frame gaps
     .wr_allowed   (sram_wr_allowed),
-    .pix_rd_req   (pix_rd_req),
-    .pix_rd_done  (pix_rd_done),
-    .pix_rd_gnt   (pix_rd_gnt),
+    .pix_rd_req   (shared_rd_req),    // arbitrated: pixel OR burst
+    .pix_rd_done  (shared_rd_done),
+    .pix_rd_gnt   (shared_rd_gnt),
     .pix_rd_owner (pix_rd_owner)       // -> SRAM read-port mux above
 );
 
