@@ -391,14 +391,92 @@ logic        seq_done;          // rom_sequencer → chip_top: one-cycle done pu
 logic        rom_seq_busy;      // rom_sequencer → LEDs
 
 // -----------------------------------------------------------------------------
+// IMAGE FIFO STATUS FLAGS: 130 MHz -> 100 MHz
+// -----------------------------------------------------------------------------
+// The two occupancy flags are NOT generated in the same clock domain, and the
+// asymmetry is easy to miss because they are declared side by side above:
+//
+//   almost_full   registered on wr_clk  (CLK100MHZ)  -- same domain as its
+//                                                       consumer, safe as-is
+//   almost_empty  registered on rd_clk  (pll_clk_out) -- a DIFFERENT domain
+//                                                       from its consumer
+//
+// almost_empty was wired straight from the 130 MHz read domain into
+// rom_sequencer, which runs on CLK100MHZ, with no synchroniser. It is the only
+// control signal in the full-image read path that crosses domains unprotected.
+//
+// WHY THIS CORRUPTS PIXEL DATA RATHER THAN JUST DELAYING A RESUME
+// --------------------------------------------------------------
+// rom_sequencer consumes it as a next-state condition:
+//
+//     WAIT_DRAIN: if (almost_empty) next_state = READ_ROM;
+//
+// so an asynchronous signal feeds combinational logic whose result is captured
+// by current_state. A setup/hold violation there does not merely delay the
+// transition by a cycle -- which would be harmless -- it can leave the state
+// register resolving inconsistently across its bits, so current_state can land
+// on a value that is not a legal successor of WAIT_DRAIN.
+//
+// Landing on LATCH is the damaging case. LATCH re-captures pixels[] from
+// red/green/blue_data without a preceding READ_ROM, so it latches the PREVIOUS
+// word still standing on the SRAM outputs. The four pixels of that word are
+// then pushed again, and NEXT_ADDR still advances addr_counter, so the FIFO
+// receives the correct NUMBER of pixels and the frame stays aligned -- four
+// values are simply wrong. That is exactly the observed signature: scattered
+// wrong pixels, correct coordinates, the rest of the frame bit-exact.
+//
+// WHY IT IS RARE BUT NOT RARE ENOUGH
+// ----------------------------------
+// With AF_THRESHOLD = 52 and AE_THRESHOLD = 8 the sequencer drains 44 pixels
+// per cycle of backpressure, so a 65,536-pixel frame contains roughly
+// 65536/44 = ~1,490 WAIT_DRAIN exits. Each one samples almost_empty
+// asynchronously. Nearly all resolve cleanly; a handful per frame do not.
+// A few corrupted pixels per frame is the expected order of magnitude, and it
+// moves with temperature, placement and reset phase -- which is why repeated
+// readbacks disagree and why re-running implementation changes the pattern.
+//
+// THE FIX
+// -------
+// A two-flop level synchroniser, using the same cdc_level_sync already carrying
+// burst_active across the same boundary. async_fifo is NOT touched: its
+// interface, timing, pointer arithmetic and flag generation are all unchanged,
+// and the previously rejected read-gating experiment is not revived.
+//
+// Cost to throughput: rom_sequencer observes almost_empty two to three
+// CLK100MHZ cycles later, so it resumes ~20-30 ns later than before. The
+// consumer drains one pixel per ~2 us, so occupancy at the resume point is
+// unchanged for all practical purposes.
+//
+// fifo_empty is synchronised alongside it. That one only feeds rgf status bits,
+// so it cannot corrupt image data, but it is the same 130 -> 100 crossing and
+// costs nothing to close while the synchronisers are being added.
+// -----------------------------------------------------------------------------
+logic almost_empty_100;
+logic fifo_empty_100;
+
+cdc_level_sync u_cdc_almost_empty (
+    .src_level (almost_empty),      // pll_clk_out domain
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_level (almost_empty_100)
+);
+
+cdc_level_sync u_cdc_fifo_empty (
+    .src_level (fifo_empty),        // pll_clk_out domain
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_level (fifo_empty_100)
+);
+
+// -----------------------------------------------------------------------------
 // ROM Sequencer
 // -----------------------------------------------------------------------------
 rom_sequencer u_rom_sequencer (
     .clk         (CLK100MHZ),
     .rst_n       (sync_rst_n),
     .start       (read_go),        // Stage 2C: gated by mem_interlock
-    .almost_full (almost_full),
-    .almost_empty(almost_empty),
+    .almost_full (almost_full),    // already CLK100MHZ, unchanged
+    .almost_empty(almost_empty_100),
     .red_data    (red_data),
     .green_data  (green_data),
     .blue_data   (blue_data),
@@ -1590,9 +1668,9 @@ rgf u_rgf (
     .clk_sel_out        (clk_sel),
     .parity_fault_incr  (rx_parity_err_100),  // CHANGE B: was rx_parity_err_pulse (130 MHz)
     .fifo_full          (fifo_full),
-    .fifo_empty         (fifo_empty),
+    .fifo_empty         (fifo_empty_100),    // synchronised, see above
     .fifo_almost_full   (almost_full),
-    .fifo_almost_empty  (almost_empty)
+    .fifo_almost_empty  (almost_empty_100)   // synchronised, see above
 );
 
 assign start_pulse = rgf_start_img_read;

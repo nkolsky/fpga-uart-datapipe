@@ -9,7 +9,38 @@
 
 import fifo_pkg::*;
 
-module async_fifo (
+// -----------------------------------------------------------------------------
+// STAGE 2B: data-width parameterisation
+// -----------------------------------------------------------------------------
+// DW is the ONLY thing parameterised, and it defaults to
+// fifo_pkg::FIFO_DATA_WIDTH, so an instantiation with no override is
+// bit-identical to the unparameterised module. The 24-bit image FIFO in
+// chip_top passes no override; the 48-bit command FIFO passes .DW(48).
+//
+// WITHOUT this parameter the command FIFO instance silently truncates: a
+// 48-bit {cmd_addr, cmd_pixel} connected to a 24-bit port keeps only the
+// LOW half, so cmd_pixel crosses and cmd_addr is discarded. That is not an
+// elaboration error, only a width warning, and no LED-level test can see it.
+//
+// DEPTH, ADDR_WIDTH, PTR_WIDTH, AF_THRESHOLD, AE_THRESHOLD, the gray-code
+// helpers, both synchronisers and both flag computations are deliberately
+// NOT parameterised. The reason is bin2gray/gray2bin in fifo_pkg:
+//
+//   function automatic logic [PTR_WIDTH-1:0] bin2gray(input logic [PTR_WIDTH-1:0] bin);
+//
+// PTR_WIDTH is baked into their signatures. A per-instance DEPTH would give a
+// different PTR_WIDTH, and these functions would then silently truncate or
+// zero-extend the pointers -- a subtle CDC corruption that would not show up
+// as an elaboration error. Every instance therefore keeps DEPTH = 64 and the
+// helpers stay valid unchanged.
+//
+// The parameter is named DW rather than DATA_WIDTH to avoid shadowing the
+// wildcard-imported package name above.
+// -----------------------------------------------------------------------------
+
+module async_fifo #(
+    parameter int DW = fifo_pkg::FIFO_DATA_WIDTH
+) (
     // -----------------------------------------------------------------
     // Write domain
     // -----------------------------------------------------------------
@@ -19,7 +50,7 @@ module async_fifo (
                                                  //  matches diagram's "srst")
 
     input  logic                  wr_en,        // write enable from rom_sequencer
-    input  logic [DATA_WIDTH-1:0] wr_data,      // pixel data (R,G,B packed)
+    input  logic [DW-1:0]         wr_data,      // payload (image FIFO: R,G,B packed)
 
     output logic                  full,         // hard full flag - never write when high
     output logic                  almost_full,  // soft flag - rom_sequencer backpressure
@@ -34,7 +65,7 @@ module async_fifo (
 
     input  logic                  rd_en,        // read enable from tx_sequencer (fifo_pop)
 
-    output logic [DATA_WIDTH-1:0] rd_data,      // pixel data output
+    output logic [DW-1:0]         rd_data,      // payload output
     output logic                  empty,        // hard empty flag - never read when high
     output logic                  almost_empty  // soft flag - rom_sequencer resume signal
 );
@@ -44,7 +75,7 @@ module async_fifo (
 // (lives in neither domain exclusively - written by wr_clk,
 //  read by rd_clk, addressed independently on each port)
 // ===========================================================
-logic [DATA_WIDTH-1:0] fifo_mem [DEPTH-1:0];
+logic [DW-1:0] fifo_mem [DEPTH-1:0];
 
 // ===========================================================
 // WRITE DOMAIN (wr_clk, wr_rst_n)
