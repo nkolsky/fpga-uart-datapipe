@@ -74,7 +74,7 @@ Hardware testing confirmed:
 - Single Pixel Write
 - Burst Write
 - Image readback
-- Legacy register commands
+- Register File (RGF) commands
 - Repeated capture without reprogramming
 
 ## Repository Structure

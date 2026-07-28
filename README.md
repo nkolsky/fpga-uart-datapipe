@@ -1,6 +1,6 @@
 # FPGA RGB Framebuffer with UART Burst Write
 
-> SystemVerilog implementation of an FPGA-based RGB framebuffer supporting **Single Pixel Write**, **Burst Write**, **image readback**, and **legacy register commands**, verified through unit tests, end-to-end simulation, and hardware validation.
+> SystemVerilog implementation of an FPGA-based RGB framebuffer supporting **Single Pixel Write**, **Burst Write**, **image readback**, and **Register File (RGF) commands**, verified through unit tests, end-to-end simulation, and hardware validation.
 
 ## Features
 
@@ -8,7 +8,7 @@
 - UART command protocol (8E1)
 - Single Pixel Write
 - Burst Write (arbitrary H×W up to 256×256)
-- Legacy RGF command path
+- Register File (RGF) command path
 - Image readback
 - Asynchronous command FIFO
 - Write/read interlock
