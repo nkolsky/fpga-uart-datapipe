@@ -13,7 +13,7 @@ __pycache__/
 *.pyc
 
 # Generated capture images
-lab10_capture_*.png
+fp_capture_*.png
 
 # Temporary archives
 *.zip
