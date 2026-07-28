@@ -1,0 +1,25 @@
+# Vivado generated files
+*.jou
+*.log
+*.str
+
+.Xil/
+*.cache/
+*.runs/
+*.sim/
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated capture images
+lab10_capture_*.png
+
+# Temporary archives
+*.zip
+
+# Windows
+Thumbs.db
+
+# macOS
+.DS_Store
