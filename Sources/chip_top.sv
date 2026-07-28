@@ -234,6 +234,99 @@ logic [31:0] red_data;
 logic [31:0] green_data;
 logic [31:0] blue_data;
 
+// -----------------------------------------------------------------------------
+// SRAM READ-PORT MUX
+// -----------------------------------------------------------------------------
+// The read port now has TWO clients:
+//
+//   rom_sequencer   full-image readback, drives rom_rd_en / rom_addr
+//   pixel_rd_ctrl   Single Pixel Read, drives pix_rd_en / pix_rd_addr
+//
+// Selection is NOT made here on any local condition. It follows
+// mem_interlock's pix_rd_owner, which is the same registered pix_rd_active
+// that gates read_go and wr_allowed inside the arbiter. Deriving the mux
+// select from anything else -- pixel_rd_ctrl's own state, say -- would let
+// the datapath and the arbiter disagree about who owns the port, which is
+// precisely the class of bug the interlock exists to make impossible.
+//
+// Because pix_rd_owner blocks read_go, rom_rd_en is guaranteed inactive for
+// the whole window in which the mux points at the pixel reader, so nothing
+// is lost by switching the address bus wholesale.
+// -----------------------------------------------------------------------------
+logic        pix_sram_rd_en;
+logic [13:0] pix_sram_rd_addr;
+logic        pix_rd_owner;      // from mem_interlock
+
+logic        sram_rd_en_mux;
+logic [13:0] sram_rd_addr_mux;
+
+// -----------------------------------------------------------------------------
+// SINGLE PIXEL READ -- ALL signal declarations, gathered here on purpose
+// -----------------------------------------------------------------------------
+// These are declared HERE, ahead of every instantiation that touches them,
+// rather than beside the blocks that drive them.
+//
+// That is not a style preference. u_tx_reply_ctrl is instantiated around line
+// 500, roughly 600 lines above the pixel-read datapath, and connects
+// pix_rpy_valid_130, pix_reply_msg and pix_rpy_accept_130. When those were
+// declared next to their drivers -- i.e. AFTER that instantiation -- the port
+// connections referenced identifiers that did not yet exist, and Verilog's
+// implicit-net rule silently created ONE-BIT WIRES for them. A 128-bit reply
+// frame connected through a 1-bit implicit net delivers bit 0 and zeroes the
+// other 127, which is exactly how a perfectly framed reply ends up carrying an
+// all-zero payload.
+//
+// Nothing warns about this: implicit nets are legal Verilog, and the later
+// explicit declaration is a separate object. Declaring every cross-block
+// signal in one place, above all users, makes the failure unreachable.
+// -----------------------------------------------------------------------------
+
+// ---- 130 MHz: request out of rx_classifier ----------------------------------
+logic        rx_pr_cmd_valid;
+logic [9:0]  rx_pr_cmd_row, rx_pr_cmd_col;
+
+// ---- 100 MHz: request delivered to pixel_rd_ctrl ----------------------------
+logic        pix_req_valid_100;
+logic [19:0] pix_req_data_100;      // {row[9:0], col[9:0]}, atomic
+
+// ---- 100 MHz: memory arbitration --------------------------------------------
+logic        pix_rd_req, pix_rd_gnt, pix_rd_done;
+
+// ---- 100 MHz: reply payload, held by pixel_rd_ctrl until acknowledged -------
+logic        pix_rpy_valid_100, pix_rpy_accept_100;
+logic [9:0]  pix_rpy_row, pix_rpy_col;
+logic [23:0] pix_rpy_pixel;
+logic        pix_rd_busy, pix_rd_overrun;
+
+// ---- 100 MHz: one-cycle send event, derived from the held valid -------------
+logic        pix_rpy_valid_100_d;
+logic        pix_rpy_send;
+
+// ---- 130 MHz: reply delivered atomically by cdc_cmd_sync --------------------
+logic        pix_rpy_valid_130;     // one-cycle strobe
+logic [43:0] pix_rpy_data_130;      // {row, col, pixel}, coherent
+logic        pix_rpy_held;          // destination-side pending flag
+logic [43:0] pix_rpy_payload_130;   // captured, stable for the composer
+logic        pix_rpy_accept_130;
+logic [127:0] pix_reply_msg;
+
+assign sram_rd_en_mux   = pix_rd_owner ? pix_sram_rd_en   : rom_rd_en;
+assign sram_rd_addr_mux = pix_rd_owner ? pix_sram_rd_addr : rom_addr;
+
+`ifndef SYNTHESIS
+    // The two read clients can never both drive the port.
+    a_read_client_exclusive: assert property (
+        @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+        !(rom_rd_en && pix_sram_rd_en)
+    ) else $error("chip_top: image and pixel readers drove the SRAM together");
+
+    // A pixel read only ever reaches the memory while it owns it.
+    a_pix_rd_owns: assert property (
+        @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+        pix_sram_rd_en |-> pix_rd_owner
+    ) else $error("chip_top: pixel read drove the SRAM without ownership");
+`endif
+
 // Red channel SRAM
 rgb_sram #(
     .DATA_WIDTH (memory_pkg::SRAM_DATA_WIDTH),
@@ -241,8 +334,8 @@ rgb_sram #(
     .INIT_FILE  ("red_hex.mem")
 ) u_sram_red (
     .clk     (CLK100MHZ),
-    .rd_en   (rom_rd_en),
-    .rd_addr (rom_addr),
+    .rd_en   (sram_rd_en_mux),
+    .rd_addr (sram_rd_addr_mux),
     .rd_data (red_data),
     .wr_en   (sram_wr_en),
     .wr_be   (sram_wr_be),
@@ -257,8 +350,8 @@ rgb_sram #(
     .INIT_FILE  ("green_hex.mem")
 ) u_sram_green (
     .clk     (CLK100MHZ),
-    .rd_en   (rom_rd_en),
-    .rd_addr (rom_addr),
+    .rd_en   (sram_rd_en_mux),
+    .rd_addr (sram_rd_addr_mux),
     .rd_data (green_data),
     .wr_en   (sram_wr_en),
     .wr_be   (sram_wr_be),
@@ -273,8 +366,8 @@ rgb_sram #(
     .INIT_FILE  ("blue_hex.mem")
 ) u_sram_blue (
     .clk     (CLK100MHZ),
-    .rd_en   (rom_rd_en),
-    .rd_addr (rom_addr),
+    .rd_en   (sram_rd_en_mux),
+    .rd_addr (sram_rd_addr_mux),
     .rd_data (blue_data),
     .wr_en   (sram_wr_en),
     .wr_be   (sram_wr_be),
@@ -453,6 +546,9 @@ tx_reply_ctrl u_tx_reply_ctrl (
     .rst_n         (sync_pll_rst_n),
     .rd_valid      (rx_rd_reply_valid),
     .rd_data       (rx_rd_reply_data),
+    .pix_valid     (pix_rpy_held),      // destination-side held request
+    .pix_msg       (pix_reply_msg),
+    .pix_accept    (pix_rpy_accept_130),
     .tx_seq_busy   (tx_seq_busy),
     .mac_busy      (mac_busy),
     .reply_req     (rr_reply_req),
@@ -467,9 +563,61 @@ logic         tx_mac_msg_valid;
 logic [127:0] tx_mac_msg_data;
 logic [4:0]   tx_mac_msg_len;
 
-assign tx_mac_msg_valid = rr_reply_req ? 1'b1         : msg_valid;
-assign tx_mac_msg_data  = rr_reply_req ? rr_reply_msg : msg_data;
-assign tx_mac_msg_len   = rr_reply_req ? rr_reply_len : 5'd16;
+// -----------------------------------------------------------------------------
+// TX MAC SOURCE MUX -- THE SELECT MUST OUTLIVE THE REQUEST
+// -----------------------------------------------------------------------------
+// tx_mac does NOT capture the message in the cycle it sees msg_valid. It
+// samples msg_valid in MAC_IDLE, moves to MAC_LOAD, and captures on the NEXT
+// clock:
+//
+//     if (cur_state == MAC_LOAD) begin
+//         msg_buf  <= msg_data;          // tx_mac.sv
+//         last_idx <= len_m1[3:0];
+//     end
+//
+// mac_busy is registered from next_state, so it is already HIGH in that
+// MAC_LOAD cycle. And rr_reply_req is combinational:
+//
+//     reply_req = pending && !tx_seq_busy && !mac_busy;   // tx_reply_ctrl.sv
+//
+// so rr_reply_req falls in exactly the cycle tx_mac performs the capture.
+//
+// Selecting the mux on rr_reply_req alone therefore switched the data and
+// length buses back to the IMAGE path one cycle too early -- tx_mac latched
+// tx_sequencer's msg output instead of the reply. With the image path idle,
+// tx_sequencer drives msg_composer with row_latch = col_latch = pixel_latch =
+// 0, which composes a perfectly well-formed 16-byte frame whose row, column
+// and RGB fields are all zero. That is precisely the observed failure: correct
+// braces, correct 'R'/'C'/'P' markers, zero payload. The reply data was never
+// wrong -- it was never sampled.
+//
+// The same defect truncated nothing on the Register Read path but silently
+// promoted it to 16 bytes, because last_idx is latched in MAC_LOAD too and saw
+// the image path's 5'd16.
+//
+// reply_owns_mac extends the select across the capture. It is set the cycle the
+// request is made and released on reply_sent, which tx_reply_ctrl raises once
+// the MAC has genuinely taken the message -- so the buses are guaranteed stable
+// for the whole of MAC_LOAD regardless of how many cycles the MAC takes to get
+// there.
+// -----------------------------------------------------------------------------
+logic reply_owns_mac;
+
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n)      reply_owns_mac <= 1'b0;
+    else if (rr_reply_req)    reply_owns_mac <= 1'b1;
+    else if (rr_reply_sent)   reply_owns_mac <= 1'b0;
+end
+
+logic reply_drives_mac;
+assign reply_drives_mac = rr_reply_req || reply_owns_mac;
+
+// msg_valid stays qualified on rr_reply_req -- tx_mac only samples it in
+// MAC_IDLE and must see exactly one assertion -- while data and length follow
+// the extended select so they are still correct at MAC_LOAD.
+assign tx_mac_msg_valid = reply_drives_mac ? rr_reply_req  : msg_valid;
+assign tx_mac_msg_data  = reply_drives_mac ? rr_reply_msg  : msg_data;
+assign tx_mac_msg_len   = reply_drives_mac ? rr_reply_len  : 5'd16;
 
 `ifndef SYNTHESIS
     a_tx_producers_exclusive: assert property (
@@ -477,11 +625,21 @@ assign tx_mac_msg_len   = rr_reply_req ? rr_reply_len : 5'd16;
         !(rr_reply_req && msg_valid)
     ) else $error("chip_top: reply and image message offered to tx_mac together");
 
-    // Image traffic must always see the legacy 16-byte length.
+    // Image traffic must always see the legacy 16-byte length. Qualified on
+    // the EXTENDED select: while the reply owns the MAC the length bus
+    // legitimately carries 6 or 16, and tx_sequencer is idle by construction
+    // because reply_req is gated on !tx_seq_busy.
     a_image_len_16: assert property (
         @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
-        (msg_valid && !rr_reply_req) |-> (tx_mac_msg_len == 5'd16)
+        (msg_valid && !reply_drives_mac) |-> (tx_mac_msg_len == 5'd16)
     ) else $error("chip_top: image message sent with a non-16 byte length");
+
+    // The reply buses must still be selected when tx_mac actually captures.
+    // mac_busy rising is the MAC_LOAD cycle.
+    a_reply_held_through_load: assert property (
+        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+        ($rose(mac_busy) && $past(reply_drives_mac)) |-> reply_drives_mac
+    ) else $error("chip_top: reply mux released before tx_mac captured");
 `endif
 
 tx_mac u_tx_mac (
@@ -710,6 +868,31 @@ rx_reg_read_parser u_rx_reg_read_parser (
     .rr_rgf_addr (rx_rr_rgf_addr)
 );
 
+// -----------------------------------------------------------------------------
+// SINGLE PIXEL READ: request parser
+// -----------------------------------------------------------------------------
+// Combinational, stable while rx_mac_msg_valid is high, exactly like the
+// Register Read and Single Pixel Write parsers beside it. It validates the
+// COMPLETE 24-bit row and column fields against the image geometry, so a
+// coordinate with rubbish in its high bytes is rejected here and never
+// reaches the memory domain at all.
+// -----------------------------------------------------------------------------
+logic        rx_pr_frame_ok, rx_pr_coord_ok, rx_pr_valid, rx_pr_coord_err;
+logic [23:0] rx_pr_row_raw, rx_pr_col_raw;
+logic [9:0]  rx_pr_row, rx_pr_col;
+
+rx_pixel_rd_parser u_rx_pixel_rd_parser (
+    .msg_in       (rx_mac_msg_data),
+    .pr_frame_ok  (rx_pr_frame_ok),
+    .pr_coord_ok  (rx_pr_coord_ok),
+    .pr_valid     (rx_pr_valid),
+    .pr_coord_err (rx_pr_coord_err),
+    .pr_row_raw   (rx_pr_row_raw),
+    .pr_col_raw   (rx_pr_col_raw),
+    .pr_row       (rx_pr_row),
+    .pr_col       (rx_pr_col)
+);
+
 logic       rx_rr_cmd_valid;
 logic [5:0] rx_rr_cmd_addr;
 
@@ -740,7 +923,14 @@ rx_classifier u_rx_classifier (
     .rr_addr_err      (rx_rr_addr_err),
     .rr_rgf_addr      (rx_rr_rgf_addr),
     .rr_cmd_valid     (rx_rr_cmd_valid),
-    .rr_cmd_addr      (rx_rr_cmd_addr)
+    .rr_cmd_addr      (rx_rr_cmd_addr),
+    .pr_valid         (rx_pr_valid),
+    .pr_coord_err     (rx_pr_coord_err),
+    .pr_row           (rx_pr_row),
+    .pr_col           (rx_pr_col),
+    .pr_cmd_valid     (rx_pr_cmd_valid),
+    .pr_cmd_row       (rx_pr_cmd_row),
+    .pr_cmd_col       (rx_pr_cmd_col)
 );
 
 // -----------------------------------------------------------------------------
@@ -921,6 +1111,199 @@ cdc_level_sync u_cdc_burst_active (
     .dst_level (burst_active_100)
 );
 
+// -----------------------------------------------------------------------------
+// SINGLE PIXEL READ: request crossing, 130 MHz -> 100 MHz
+// -----------------------------------------------------------------------------
+// rx_classifier validates and emits the request on pll_clk_out; pixel_rd_ctrl
+// consumes it on CLK100MHZ. Reuses cdc_cmd_sync rather than adding a new
+// primitive: it is the same atomic single-entry crossing already carrying the
+// RGF command and the Register Read value, and the pacing here is even gentler
+// -- one request per 16-byte UART frame, ~21.7 us, against a handful of cycles
+// of synchroniser latency.
+//
+// The 20-bit payload is {row, col}. ADDR_W is 1 because only the strobe and
+// the data are needed; is_write is tied off.
+//
+// dst_valid is a single 100 MHz cycle, which is exactly the one-cycle strobe
+// pixel_rd_ctrl's req_valid expects, and dst_wdata is held between transfers
+// so the coordinates are stable when it fires.
+// -----------------------------------------------------------------------------
+cdc_cmd_sync #(
+    .ADDR_W (1),
+    .DATA_W (20)
+) u_cdc_pix_req (
+    .src_clk      (pll_clk_out),
+    .src_rst_n    (sync_pll_rst_n),
+    .src_valid    (rx_pr_cmd_valid),
+    .src_is_write (1'b0),
+    .src_addr     (1'b0),
+    .src_wdata    ({rx_pr_cmd_row, rx_pr_cmd_col}),
+    .dst_valid    (pix_req_valid_100),
+    .dst_is_write (),
+    .dst_addr     (),
+    .dst_wdata    (pix_req_data_100),
+    .dst_clk      (CLK100MHZ),
+    .dst_rst_n    (sync_rst_n)
+);
+
+// -----------------------------------------------------------------------------
+// SINGLE PIXEL READ: controller, 100 MHz memory domain
+// -----------------------------------------------------------------------------
+pixel_rd_ctrl u_pixel_rd_ctrl (
+    .clk          (CLK100MHZ),
+    .rst_n        (sync_rst_n),
+    .req_valid    (pix_req_valid_100),
+    .req_row      (pix_req_data_100[19:10]),
+    .req_col      (pix_req_data_100[ 9: 0]),
+    .pix_rd_req   (pix_rd_req),
+    .pix_rd_gnt   (pix_rd_gnt),
+    .pix_rd_done  (pix_rd_done),
+    .sram_rd_en   (pix_sram_rd_en),
+    .sram_rd_addr (pix_sram_rd_addr),
+    .red_data     (red_data),
+    .green_data   (green_data),
+    .blue_data    (blue_data),
+    .rpy_valid    (pix_rpy_valid_100),
+    .rpy_accept   (pix_rpy_accept_100),
+    .rpy_row      (pix_rpy_row),
+    .rpy_col      (pix_rpy_col),
+    .rpy_pixel    (pix_rpy_pixel),
+    .busy         (pix_rd_busy),
+    .req_overrun  (pix_rd_overrun)
+);
+
+// -----------------------------------------------------------------------------
+// SINGLE PIXEL READ: reply crossing, 100 MHz -> 130 MHz
+// -----------------------------------------------------------------------------
+// The reply is a HELD handshake, not a pulse, because tx_reply_ctrl can refuse
+// for the entire duration of an image transfer (~1.5 s). Three signals cross:
+//
+//   pix_rpy_valid_100   level, 100 -> 130, via cdc_level_sync
+//   {row, col, pixel}   data, 100 -> 130, UNSYNCHRONISED and guarded by the
+//                       level above
+//   pix_accept          pulse, 130 -> 100, via cdc_pulse_sync
+//
+// The unsynchronised data path is correct rather than a shortcut, and for the
+// same reason cdc_cmd_sync crosses its payload unsynchronised: pixel_rd_ctrl
+// writes the payload in P_CAP, one full 100 MHz cycle BEFORE rpy_valid rises
+// in P_SEND, and then holds it until the accept comes back. The level needs
+// two to three 130 MHz clocks to traverse its synchroniser, so by the time
+// this domain can observe pix_valid high the payload has been stable for
+// >= 30 ns and it stays stable until this domain answers. Synchronising the
+// bits individually would actively break that atomicity.
+//
+// msg_composer is REUSED here rather than duplicated. It already emits
+// {R<..>,C<..>,P<R,G,B>} for every pixel of a full-image transfer, which is
+// byte-for-byte the Single Pixel Read reply, so the reply format is identical
+// to image traffic by construction. Its msg output is a packed [15:0][7:0]
+// with byte 0 in bits [7:0] -- exactly the LSB-first order tx_mac expects.
+// -----------------------------------------------------------------------------
+// ---- source side: turn the held valid into ONE send event -------------------
+// pixel_rd_ctrl holds rpy_valid for the whole of P_SEND, which may be
+// milliseconds. cdc_cmd_sync wants a single-cycle src_valid, so the rising
+// edge is extracted here. pixel_rd_ctrl itself is untouched -- its unit test
+// passes and its interface is unchanged.
+always_ff @(posedge CLK100MHZ or negedge sync_rst_n) begin
+    if (!sync_rst_n) pix_rpy_valid_100_d <= 1'b0;
+    else             pix_rpy_valid_100_d <= pix_rpy_valid_100;
+end
+
+assign pix_rpy_send = pix_rpy_valid_100 && !pix_rpy_valid_100_d;
+
+// ---- the crossing itself: ONE atomic 44-bit transaction ---------------------
+// The whole reply -- {row, col, pixel} -- crosses as a single payload behind a
+// single toggle, captured into cdc_cmd_sync's source register on the same edge
+// that flips that toggle. The destination cannot observe a mixture of two
+// transactions, and cannot observe the payload before it is stable, because the
+// toggle needs two destination edges to traverse the synchroniser.
+//
+// This replaces an earlier arrangement that synchronised only the valid LEVEL
+// and let the payload cross combinationally underneath it. That was not a
+// coherent transfer: it made the 128-bit msg_composer OUTPUT the thing crossing
+// domains, with no structural guarantee of stability during the destination's
+// settle window -- correctness rested entirely on a timing argument rather than
+// on the hardware.
+cdc_cmd_sync #(
+    .ADDR_W (1),
+    .DATA_W (44)
+) u_cdc_pix_rpy (
+    .src_clk      (CLK100MHZ),
+    .src_rst_n    (sync_rst_n),
+    .src_valid    (pix_rpy_send),
+    .src_is_write (1'b0),
+    .src_addr     (1'b0),
+    .src_wdata    ({pix_rpy_row, pix_rpy_col, pix_rpy_pixel}),
+    .dst_valid    (pix_rpy_valid_130),
+    .dst_is_write (),
+    .dst_addr     (),
+    .dst_wdata    (pix_rpy_data_130),
+    .dst_clk      (pll_clk_out),
+    .dst_rst_n    (sync_pll_rst_n)
+);
+
+// ---- destination side: hold the transaction until tx_reply_ctrl takes it ----
+// cdc_cmd_sync delivers exactly one dst_valid strobe. tx_reply_ctrl may be
+// unable to accept for the entire duration of an image transfer, so the strobe
+// is converted back into a held request HERE, in the destination domain, where
+// holding it is free and race-free. The payload is captured at the same edge.
+//
+// This is what propagates backpressure: pix_rpy_held stays up, tx_reply_ctrl's
+// pix_accept stays down, no acknowledge crosses back, and pixel_rd_ctrl remains
+// in P_SEND with its payload intact.
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n) begin
+        pix_rpy_held        <= 1'b0;
+        pix_rpy_payload_130 <= '0;
+    end
+    else if (pix_rpy_valid_130) begin
+        pix_rpy_held        <= 1'b1;
+        pix_rpy_payload_130 <= pix_rpy_data_130;
+    end
+    else if (pix_rpy_accept_130) begin
+        pix_rpy_held        <= 1'b0;
+    end
+end
+
+// msg_composer now lives ENTIRELY in the 130 MHz domain, driven from a
+// registered payload in that same domain. Nothing combinational crosses.
+msg_composer u_pix_reply_composer (
+    .row   (pix_rpy_payload_130[43:34]),
+    .col   (pix_rpy_payload_130[33:24]),
+    .pixel (pix_rpy_payload_130[23: 0]),
+    .msg   (pix_reply_msg)
+);
+
+`ifndef SYNTHESIS
+    // A transaction is never delivered on top of one still awaiting acceptance.
+    a_pix_rpy_no_overwrite: assert property (
+        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+        pix_rpy_valid_130 |-> !pix_rpy_held
+    ) else $error("chip_top: pixel reply delivered while one was still held");
+
+    // The captured payload is stable for as long as it is on offer.
+    a_pix_rpy_stable: assert property (
+        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+        (pix_rpy_held && !pix_rpy_accept_130) |=> $stable(pix_rpy_payload_130)
+    ) else $error("chip_top: held pixel reply payload changed");
+
+    // The source must not withdraw the reply before the acknowledge lands.
+    a_pix_src_holds: assert property (
+        @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+        (pix_rpy_valid_100 && !pix_rpy_accept_100)
+            |=> ($stable(pix_rpy_row) && $stable(pix_rpy_col) &&
+                 $stable(pix_rpy_pixel))
+    ) else $error("chip_top: source released the reply payload before the ack");
+`endif
+
+cdc_pulse_sync u_cdc_pix_rpy_accept (
+    .src_clk   (pll_clk_out),
+    .src_rst_n (sync_pll_rst_n),
+    .src_pulse (pix_rpy_accept_130),
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_pulse (pix_rpy_accept_100)
+);
+
 mem_interlock u_mem_interlock (
     .clk          (CLK100MHZ),
     .rst_n        (sync_rst_n),
@@ -931,7 +1314,11 @@ mem_interlock u_mem_interlock (
     .cmd_empty    (cmd_fifo_empty),
     .wr_busy      (sram_wr_busy),
     .burst_active (burst_active_100),   // closes the inter-frame gaps
-    .wr_allowed   (sram_wr_allowed)
+    .wr_allowed   (sram_wr_allowed),
+    .pix_rd_req   (pix_rd_req),
+    .pix_rd_done  (pix_rd_done),
+    .pix_rd_gnt   (pix_rd_gnt),
+    .pix_rd_owner (pix_rd_owner)       // -> SRAM read-port mux above
 );
 
 // Command FIFO overflow detector, 130 MHz write domain. Sticky, and must stay

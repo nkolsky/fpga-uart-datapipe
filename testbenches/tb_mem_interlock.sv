@@ -30,7 +30,12 @@
 //   wr_pending  = !cmd_empty || wr_busy
 //   read_go     = start_pending && !wr_pending && !img_in_flight   (comb)
 //   read_active = read_go || rom_seq_busy                          (comb)
-//   wr_allowed  = !read_active                                     (comb)
+//   wr_allowed  = !read_active && !pix_rd_active                   (comb)
+//
+//   pix_rd_gnt    = pix_rd_req && !rom_seq_busy && !img_in_flight
+//                              && !wr_pending && !pix_rd_active    (comb)
+//   pix_rd_active : set by pix_rd_gnt, cleared by pix_rd_done
+//   pix_rd_owner  = pix_rd_active            (exported for the SRAM mux)
 //
 //   img_in_flight : set by read_go, cleared by img_done
 //   start_pending : set by (start_req && !img_in_flight && !read_go),
@@ -90,6 +95,14 @@ module tb_mem_interlock;
     logic read_go;
     logic wr_allowed;
 
+    // Single Pixel Read client. pix_rd_req is a LEVEL driven by
+    // pixel_rd_ctrl and held until granted, so the testbench drives it the
+    // same way rather than pulsing it.
+    logic pix_rd_req  = 1'b0;
+    logic pix_rd_done = 1'b0;
+    logic pix_rd_gnt;
+    logic pix_rd_owner;
+
     mem_interlock dut (
         .clk          (clk),
         .rst_n        (rst_n),
@@ -100,7 +113,11 @@ module tb_mem_interlock;
         .cmd_empty    (cmd_empty),
         .wr_busy      (wr_busy),
         .burst_active (burst_active),
-        .wr_allowed   (wr_allowed)
+        .wr_allowed   (wr_allowed),
+        .pix_rd_req   (pix_rd_req),
+        .pix_rd_done  (pix_rd_done),
+        .pix_rd_gnt   (pix_rd_gnt),
+        .pix_rd_owner (pix_rd_owner)
     );
 
     // Convenience aliases onto internal state (white-box observation only;
@@ -108,6 +125,50 @@ module tb_mem_interlock;
     wire start_pending = dut.start_pending;
     wire img_in_flight = dut.img_in_flight;
     wire wr_pending    = dut.wr_pending;
+    wire pix_rd_active = dut.pix_rd_active;
+
+    // -----------------------------------------------------------------
+    // Continuous exclusivity monitors.
+    //
+    // These run for the WHOLE regression, not just the pixel-read
+    // sections, so any existing test that happens to violate the new
+    // properties is caught too. They restate the RTL's own concurrent
+    // assertions procedurally, which also means the regression still
+    // checks them under a simulator that skips SVA.
+    // -----------------------------------------------------------------
+    int excl_viol = 0;
+
+    always @(posedge clk) if (rst_n) begin
+        // The image reader and the pixel reader can never both own the port.
+        if (pix_rd_active && (read_go || rom_seq_busy)) begin
+            excl_viol++;
+            $display("  [%0t] FAIL (%s): pixel read and image read own the port together",
+                     $time, phase);
+        end
+        // No write may proceed while a pixel read holds the memory.
+        if (pix_rd_active && wr_allowed) begin
+            excl_viol++;
+            $display("  [%0t] FAIL (%s): write allowed during a pixel read",
+                     $time, phase);
+        end
+        // A grant is never manufactured without a request.
+        if (pix_rd_gnt && !pix_rd_req) begin
+            excl_viol++;
+            $display("  [%0t] FAIL (%s): grant without a request", $time, phase);
+        end
+        // A grant only ever lands in a genuinely quiet memory.
+        if (pix_rd_gnt && (rom_seq_busy || !cmd_empty || wr_busy || burst_active)) begin
+            excl_viol++;
+            $display("  [%0t] FAIL (%s): grant issued with the memory in use",
+                     $time, phase);
+        end
+        // Ownership export must track the internal state exactly.
+        if (pix_rd_owner !== pix_rd_active) begin
+            excl_viol++;
+            $display("  [%0t] FAIL (%s): pix_rd_owner disagrees with pix_rd_active",
+                     $time, phase);
+        end
+    end
 
     // -----------------------------------------------------------------
     // Bookkeeping
@@ -214,7 +275,16 @@ module tb_mem_interlock;
                          $time, phase);
             end
             // ...but a burst must not block its own writes.
-            if (burst_active && !read_go && !rom_seq_busy && !wr_allowed) begin
+            //
+            // !pix_rd_active is required here for the same reason it was
+            // added to a_burst_may_write in the RTL: a pixel read granted
+            // BEFORE a burst began legitimately holds the memory for a few
+            // more cycles after burst_active rises, and writes are
+            // correctly blocked for that window. A pixel read can never
+            // START during a burst (the grant carries !wr_pending, which
+            // includes burst_active), but it can overlap the start of one.
+            if (burst_active && !read_go && !rom_seq_busy &&
+                !pix_rd_active && !wr_allowed) begin
                 errors++;
                 $display("  [%0t] FAIL (invariant/%s): writes blocked during a burst",
                          $time, phase);
@@ -237,10 +307,23 @@ module tb_mem_interlock;
                 $display("  [%0t] FAIL (invariant/%s): read_go while img_in_flight",
                          $time, phase);
             end
-            // wr_allowed is defined as the exact complement of read_active.
-            if (wr_allowed !== !(read_go || rom_seq_busy)) begin
+            // wr_allowed is the exact complement of "somebody owns the
+            // memory". There are now THREE owners, not two: the image
+            // reader contributes read_go and rom_seq_busy, and the
+            // single-pixel reader contributes pix_rd_active.
+            //
+            // This invariant previously read
+            //     wr_allowed !== !(read_go || rom_seq_busy)
+            // which was correct while the pixel reader did not exist. It is
+            // NOT a weaker form of the same property -- it actively demands
+            // that writes be PERMITTED whenever no image read is running,
+            // which for a cycle in which the pixel reader holds the memory
+            // is the exact opposite of the required behaviour. Left
+            // unchanged it contradicts the pix_rd_active monitor above:
+            // one of the two must fail on every such cycle.
+            if (wr_allowed !== !(read_go || rom_seq_busy || pix_rd_active)) begin
                 errors++;
-                $display("  [%0t] FAIL (invariant/%s): wr_allowed != !(read_go||rom_seq_busy)",
+                $display("  [%0t] FAIL (invariant/%s): wr_allowed != !(read_go||rom_seq_busy||pix_rd_active)",
                          $time, phase);
             end
         end
@@ -635,6 +718,236 @@ module tb_mem_interlock;
         step(8);
         chk_eq(read_go_cnt, 1, "rejected duplicate did not launch on img_done");
         chk(!img_in_flight, "transfer completed");
+
+        // =============================================================
+        banner("15 - pixel read waits for pending writes");
+        // A pixel read must not be granted while anything is queued or in
+        // the write pipeline. wr_pending covers the command FIFO, the
+        // pipeline and an active burst, so all three are exercised.
+        // =============================================================
+        @(negedge clk); cmd_empty = 1'b0;        // something queued
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(5);
+        chk(!pix_rd_gnt,    "grant issued with the command FIFO non-empty");
+        chk(!pix_rd_active, "ownership taken with writes pending");
+        chk(pix_rd_req,     "request was not held while deferred");
+
+        @(negedge clk); cmd_empty = 1'b1; wr_busy = 1'b1;
+        step(4);
+        chk(!pix_rd_gnt, "grant issued with the write pipeline busy");
+
+        @(negedge clk); wr_busy = 1'b0; burst_active = 1'b1;
+        step(4);
+        chk(!pix_rd_gnt, "grant issued during a burst");
+
+        @(negedge clk); burst_active = 1'b0;
+        step(3);
+        chk(pix_rd_active, "pixel read never granted once writes drained");
+
+        // Release.
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(2);
+        chk(!pix_rd_active, "ownership not released by pix_rd_done");
+        chk(wr_allowed,     "writes still blocked after release");
+
+        // =============================================================
+        banner("16 - image read and pixel read are mutually exclusive");
+        // =============================================================
+        // (a) A pixel read holding the memory blocks an image start.
+        clear_go_cnt();
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(3);
+        chk(pix_rd_active, "pixel read not granted into an idle memory");
+
+        pulse_start();
+        step(5);
+        chk_eq(read_go_cnt, 0, "image read launched during a pixel read");
+        chk(start_pending,     "the deferred start was lost");
+
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(4);
+        chk_eq(read_go_cnt, 1, "deferred start did not launch after the pixel read");
+
+        // Finish that transfer off.
+        @(negedge clk); rom_seq_busy = 1'b1;
+        step(3);
+        @(negedge clk); rom_seq_busy = 1'b0;
+        pulse_img_done();
+        step(4);
+        chk(!img_in_flight, "transfer did not complete");
+
+        // (b) An image read in progress blocks a pixel read.
+        clear_go_cnt();
+        pulse_start();
+        step(2);
+        chk(img_in_flight, "transfer did not launch");
+        @(negedge clk); rom_seq_busy = 1'b1;
+
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(6);
+        chk(!pix_rd_gnt,    "pixel read granted during an address walk");
+        chk(!pix_rd_active, "pixel read took ownership during an image read");
+        chk(pix_rd_req,     "pixel request dropped while deferred");
+
+        // The address walk ends but the transfer is still draining.
+        @(negedge clk); rom_seq_busy = 1'b0;
+        step(4);
+        chk(!pix_rd_gnt,
+            "pixel read granted while the image was still in flight");
+
+        // Only the real completion event releases it.
+        pulse_img_done();
+        step(4);
+        chk(pix_rd_active, "pixel read never granted after the image completed");
+
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(2);
+
+        // =============================================================
+        banner("17 - writes are blocked during a pixel read");
+        // =============================================================
+        step(2);
+        chk(wr_allowed, "writes blocked with the memory idle");
+
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(3);
+        chk(pix_rd_active, "pixel read not granted");
+        chk(!wr_allowed,   "writes permitted during a pixel read");
+
+        // Writes stay blocked for the whole of the pixel read, however
+        // long the controller holds ownership.
+        step(20);
+        chk(!wr_allowed, "writes leaked in mid-pixel-read");
+
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(2);
+        chk(wr_allowed, "writes not re-enabled after the pixel read");
+
+        // =============================================================
+        banner("18 - no starvation, no lost request");
+        // =============================================================
+        // A pixel request raised against a busy memory must eventually be
+        // granted, exactly once, with no help from the requester.
+        clear_go_cnt();
+        @(negedge clk); cmd_empty = 1'b0; wr_busy = 1'b1;
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(30);
+        chk(!pix_rd_active, "granted while writes were still active");
+        chk(pix_rd_req,     "request lost during a long deferral");
+
+        @(negedge clk); cmd_empty = 1'b1; wr_busy = 1'b0;
+        step(4);
+        chk(pix_rd_active, "request starved -- never granted");
+
+        // Exactly one grant per request: the grant must drop as soon as
+        // ownership is taken, or the controller would see a second one.
+        step(10);
+        chk(!pix_rd_gnt, "grant remained asserted after ownership was taken");
+
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(2);
+
+        // A same-cycle tie between a pending image start and a pixel
+        // request resolves in favour of the pixel read, and the image
+        // start is deferred rather than dropped.
+        clear_go_cnt();
+        @(negedge clk);
+        start_req  = 1'b1;
+        pix_rd_req = 1'b1;
+        @(negedge clk);
+        start_req  = 1'b0;
+        step(4);
+        chk(pix_rd_active,  "pixel read lost the tie-break");
+        chk_eq(read_go_cnt, 0, "image read launched despite the tie-break");
+        chk(start_pending,  "the tied start was dropped instead of deferred");
+
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(4);
+        chk_eq(read_go_cnt, 1, "deferred start never launched after the tie");
+
+        @(negedge clk); rom_seq_busy = 1'b1;
+        step(2);
+        @(negedge clk); rom_seq_busy = 1'b0;
+        pulse_img_done();
+        step(4);
+
+        // =============================================================
+        banner("19 - existing read/write behaviour preserved");
+        // =============================================================
+        // With the pixel client completely idle, the module must behave
+        // exactly as it did before it existed.
+        chk(!pix_rd_active, "pixel state not idle at the start of section 19");
+        chk(!pix_rd_owner,  "ownership asserted with no pixel client");
+
+        clear_go_cnt();
+        chk(wr_allowed, "writes blocked with everything idle");
+
+        pulse_start();
+        step(2);
+        chk_eq(read_go_cnt, 1, "a plain image start no longer launches");
+        chk(img_in_flight,     "img_in_flight not set");
+
+        @(negedge clk); rom_seq_busy = 1'b1;
+        step(2);
+        chk(!wr_allowed, "writes not excluded during the address walk");
+        @(negedge clk); rom_seq_busy = 1'b0;
+        step(2);
+        chk(wr_allowed, "writes not restored after the address walk");
+
+        pulse_img_done();
+        step(3);
+        chk(!img_in_flight, "transfer did not complete");
+
+        // Deferred-write start, unchanged from section 3.
+        clear_go_cnt();
+        @(negedge clk); cmd_empty = 1'b0;
+        pulse_start();
+        step(3);
+        chk_eq(read_go_cnt, 0, "start not deferred behind writes");
+        chk(start_pending,     "deferred start not held");
+        @(negedge clk); cmd_empty = 1'b1;
+        step(3);
+        chk_eq(read_go_cnt, 1, "deferred start did not launch");
+        pulse_img_done();
+        step(3);
+
+        // =============================================================
+        banner("20 - reset clears pixel-read ownership");
+        // =============================================================
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(3);
+        chk(pix_rd_active, "pixel read not granted before the reset");
+
+        @(negedge clk); rst_n = 1'b0;
+        step(3);
+        chk(!pix_rd_active, "ownership survived reset");
+        chk(!pix_rd_owner,  "exported ownership survived reset");
+        @(negedge clk); pix_rd_req = 1'b0;
+        @(negedge clk); rst_n = 1'b1;
+        step(3);
+        chk(wr_allowed, "writes still blocked after reset recovery");
+
+        // And it still works afterwards.
+        @(negedge clk); pix_rd_req = 1'b1;
+        step(3);
+        chk(pix_rd_active, "pixel read broken after reset recovery");
+        @(negedge clk); pix_rd_req = 1'b0; pix_rd_done = 1'b1;
+        @(negedge clk); pix_rd_done = 1'b0;
+        step(2);
+
+        // Fold the continuous monitor into the verdict.
+        checks++;
+        if (excl_viol != 0) begin
+            errors++;
+            $display("  FAIL: %0d exclusivity violations seen during the run",
+                     excl_viol);
+        end
 
         // =============================================================
         $display("-------------------------------------------------");
