@@ -432,12 +432,65 @@ logic        phy_valid;
 logic [7:0]  phy_data;
 logic        phy_ready;
 
+// -----------------------------------------------------------------------------
+// REGISTER READ: reply scheduling and TX mux
+// -----------------------------------------------------------------------------
+// The reply waits until the transmit path is completely idle. An image
+// transfer is 65536 fixed-size packets that the host reads as one stream
+// counting bytes; a 6-byte reply inserted between two pixel messages would
+// desynchronise everything after it.
+//
+// tx_reply_ctrl only asserts reply_req when !tx_seq_busy && !mac_busy, and
+// tx_sequencer only asserts msg_valid from a non-IDLE state, so the two can
+// never drive the MAC in the same cycle.
+// -----------------------------------------------------------------------------
+logic         rr_reply_req, rr_reply_pending, rr_reply_sent, rr_reply_overrun;
+logic [127:0] rr_reply_msg;
+logic [4:0]   rr_reply_len;
+
+tx_reply_ctrl u_tx_reply_ctrl (
+    .clk           (pll_clk_out),
+    .rst_n         (sync_pll_rst_n),
+    .rd_valid      (rx_rd_reply_valid),
+    .rd_data       (rx_rd_reply_data),
+    .tx_seq_busy   (tx_seq_busy),
+    .mac_busy      (mac_busy),
+    .reply_req     (rr_reply_req),
+    .reply_msg     (rr_reply_msg),
+    .reply_len     (rr_reply_len),
+    .reply_pending (rr_reply_pending),
+    .reply_sent    (rr_reply_sent),
+    .reply_overrun (rr_reply_overrun)
+);
+
+logic         tx_mac_msg_valid;
+logic [127:0] tx_mac_msg_data;
+logic [4:0]   tx_mac_msg_len;
+
+assign tx_mac_msg_valid = rr_reply_req ? 1'b1         : msg_valid;
+assign tx_mac_msg_data  = rr_reply_req ? rr_reply_msg : msg_data;
+assign tx_mac_msg_len   = rr_reply_req ? rr_reply_len : 5'd16;
+
+`ifndef SYNTHESIS
+    a_tx_producers_exclusive: assert property (
+        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+        !(rr_reply_req && msg_valid)
+    ) else $error("chip_top: reply and image message offered to tx_mac together");
+
+    // Image traffic must always see the legacy 16-byte length.
+    a_image_len_16: assert property (
+        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+        (msg_valid && !rr_reply_req) |-> (tx_mac_msg_len == 5'd16)
+    ) else $error("chip_top: image message sent with a non-16 byte length");
+`endif
+
 tx_mac u_tx_mac (
     .clk      (pll_clk_out),
     .rst_n    (sync_pll_rst_n),
     .rx_mode  (1'b0),           // always TX mode
-    .msg_valid(msg_valid),
-    .msg_data (msg_data),
+    .msg_valid(tx_mac_msg_valid),
+    .msg_data (tx_mac_msg_data),
+    .msg_len  (tx_mac_msg_len),
     .mac_busy (mac_busy),
     .phy_ready(phy_ready),
     .phy_data (phy_data),
@@ -640,6 +693,26 @@ rx_burst_ctrl u_rx_burst_ctrl (
     .err_unexpected   (rx_burst_err_unexp)
 );
 
+// -----------------------------------------------------------------------------
+// REGISTER READ: request parser
+// -----------------------------------------------------------------------------
+logic        rx_rr_frame_ok, rx_rr_addr_ok, rx_rr_valid, rx_rr_addr_err;
+logic [23:0] rx_rr_addr_raw;
+logic [5:0]  rx_rr_rgf_addr;
+
+rx_reg_read_parser u_rx_reg_read_parser (
+    .msg_in      (rx_mac_msg_data),
+    .rr_frame_ok (rx_rr_frame_ok),
+    .rr_addr_ok  (rx_rr_addr_ok),
+    .rr_valid    (rx_rr_valid),
+    .rr_addr_err (rx_rr_addr_err),
+    .rr_addr     (rx_rr_addr_raw),
+    .rr_rgf_addr (rx_rr_rgf_addr)
+);
+
+logic       rx_rr_cmd_valid;
+logic [5:0] rx_rr_cmd_addr;
+
 rx_classifier u_rx_classifier (
     .clk              (pll_clk_out),
     .rst_n            (sync_pll_rst_n),
@@ -662,7 +735,12 @@ rx_classifier u_rx_classifier (
     .cmd_valid        (rx_cmd_valid),
     .cmd_addr         (rx_cmd_addr),
     .cmd_pixel        (rx_cmd_pixel),
-    .burst_active     (rx_burst_active)   // M4: input, from rx_burst_ctrl
+    .burst_active     (rx_burst_active),  // M4: input, from rx_burst_ctrl
+    .rr_valid         (rx_rr_valid),
+    .rr_addr_err      (rx_rr_addr_err),
+    .rr_rgf_addr      (rx_rr_rgf_addr),
+    .rr_cmd_valid     (rx_rr_cmd_valid),
+    .rr_cmd_addr      (rx_rr_cmd_addr)
 );
 
 // -----------------------------------------------------------------------------
@@ -946,6 +1024,33 @@ logic        rgf_cmd_is_write_100;
 logic [7:0]  rgf_cmd_addr_100;
 logic [31:0] rgf_cmd_wdata_100;
 
+// -----------------------------------------------------------------------------
+// RGF command producer mux, 130 MHz domain
+// -----------------------------------------------------------------------------
+// Two producers now drive the single forward cdc_cmd_sync: the legacy
+// {R,C,V} path and Register Read. They are mutually exclusive because a
+// frame carries exactly one msg_kind_q -- rx_classifier asserts an assertion
+// on that, and the one below repeats it at the point of use.
+//
+// The legacy expressions are unchanged; they simply move behind the mux.
+// -----------------------------------------------------------------------------
+logic        rgf_src_valid, rgf_src_is_write;
+logic [7:0]  rgf_src_addr;
+logic [31:0] rgf_src_wdata;
+
+assign rgf_src_valid    = rx_classifier_valid || rx_rr_cmd_valid;
+assign rgf_src_is_write = rx_classifier_valid ? !rx_col_q[0] : 1'b0;
+assign rgf_src_addr     = rx_classifier_valid ? {2'b00, rx_row_q[5:0], 2'b00}
+                                              : {2'b00, rx_rr_cmd_addr};
+assign rgf_src_wdata    = rx_classifier_valid ? {8'b0, rx_pixel_q} : 32'd0;
+
+`ifndef SYNTHESIS
+    a_one_rgf_producer_top: assert property (
+        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+        !(rx_classifier_valid && rx_rr_cmd_valid)
+    ) else $error("chip_top: legacy and Register Read RGF commands overlapped");
+`endif
+
 cdc_cmd_sync #(
     .ADDR_W    (8),
     .DATA_W    (32),
@@ -953,16 +1058,64 @@ cdc_cmd_sync #(
 ) u_cdc_rgf_cmd (
     .src_clk      (pll_clk_out),
     .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rx_classifier_valid),
-    .src_is_write (!rx_col_q[0]),                        // col even = write
-    .src_addr     ({2'b00, rx_row_q[5:0], 2'b00}),       // register index * 4
-    .src_wdata    ({8'b0, rx_pixel_q}),
+    .src_valid    (rgf_src_valid),
+    .src_is_write (rgf_src_is_write),
+    .src_addr     (rgf_src_addr),
+    .src_wdata    (rgf_src_wdata),
     .dst_valid    (rgf_cmd_valid_100),
     .dst_is_write (rgf_cmd_is_write_100),
     .dst_addr     (rgf_cmd_addr_100),
     .dst_wdata    (rgf_cmd_wdata_100),
     .dst_clk      (CLK100MHZ),
     .dst_rst_n    (sync_rst_n)
+);
+
+// -----------------------------------------------------------------------------
+// REGISTER READ: capture the value and return it to the 130 MHz domain
+// -----------------------------------------------------------------------------
+// rgf.pc_rdata is a combinational mux on pc_addr, and cdc_cmd_sync presents
+// the address for exactly ONE cycle (IDLE_ADDR 0xFF otherwise). So the value
+// is captured in precisely the cycle the RGF read happens -- which is also
+// the cycle IMG_TX_MON's read-to-clear fires, leaving that side effect
+// completely untouched.
+// -----------------------------------------------------------------------------
+logic        rgf_rd_strobe;
+logic [31:0] rgf_rd_value;
+
+always_ff @(posedge CLK100MHZ or negedge sync_rst_n) begin
+    if (!sync_rst_n) begin
+        rgf_rd_strobe <= 1'b0;
+        rgf_rd_value  <= 32'd0;
+    end
+    else begin
+        rgf_rd_strobe <= rgf_cmd_valid_100 && !rgf_cmd_is_write_100;
+        if (rgf_cmd_valid_100 && !rgf_cmd_is_write_100)
+            rgf_rd_value <= rgf_pc_rdata;
+    end
+end
+
+// Return leg, 100 -> 130 MHz. Reuses the hardware-validated atomic command
+// CDC rather than adding a new primitive; ADDR_W is 1 because only the data
+// and the strobe are needed.
+logic        rx_rd_reply_valid;
+logic [31:0] rx_rd_reply_data;
+
+cdc_cmd_sync #(
+    .ADDR_W (1),
+    .DATA_W (32)
+) u_cdc_rgf_rdata (
+    .src_clk      (CLK100MHZ),
+    .src_rst_n    (sync_rst_n),
+    .src_valid    (rgf_rd_strobe),
+    .src_is_write (1'b0),
+    .src_addr     (1'b0),
+    .src_wdata    (rgf_rd_value),
+    .dst_valid    (rx_rd_reply_valid),
+    .dst_is_write (),
+    .dst_addr     (),
+    .dst_wdata    (rx_rd_reply_data),
+    .dst_clk      (pll_clk_out),
+    .dst_rst_n    (sync_pll_rst_n)
 );
 
 assign rgf_pc_wen   = rgf_cmd_valid_100 && rgf_cmd_is_write_100;

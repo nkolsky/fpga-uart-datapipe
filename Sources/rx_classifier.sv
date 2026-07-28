@@ -114,7 +114,20 @@ module rx_classifier
     // burst_active arrives here as an INPUT, in the same 130 MHz domain,
     // and makes this module completely inert for the duration of a burst.
     // -----------------------------------------------------------------
-    input  logic        burst_active
+    input  logic        burst_active,
+
+    // -----------------------------------------------------------------
+    // REGISTER READ: parsed request from rx_reg_read_parser, and the
+    // resulting RGF command. rr_cmd_valid is the SECOND producer of RGF
+    // commands; it is mutually exclusive with classifier_valid because a
+    // frame has exactly one msg_kind_q and only one msg_valid pulse.
+    // -----------------------------------------------------------------
+    input  logic        rr_valid,
+    input  logic        rr_addr_err,
+    input  logic [5:0]  rr_rgf_addr,
+
+    output logic        rr_cmd_valid,
+    output logic [5:0]  rr_cmd_addr
 );
 
 // -------------------------------------------------------------------------
@@ -123,6 +136,8 @@ module rx_classifier
 logic legacy_hit, legacy_err;
 logic pixwr_hit,  pixwr_err;
 logic unknown_msg;
+
+logic regrd_hit, regrd_err;
 
 always_comb begin : qualify
     // `active` is the ONLY frame-acceptance condition. During a burst this
@@ -140,6 +155,12 @@ always_comb begin : qualify
     // Frames rx_msg_decode could not classify at all. Preserves the
     // pre-Stage-2A behaviour of pulsing an error on garbage input.
     unknown_msg = active && (msg_kind == MSG_UNKNOWN);
+
+    // Register Read: accepted only with a usable address. A framing-good
+    // request with an out-of-range or unaligned address is reported through
+    // the existing classifier_error rather than silently truncated.
+    regrd_hit = active && (msg_kind == MSG_REG_READ) && rr_valid;
+    regrd_err = active && (msg_kind == MSG_REG_READ) && rr_addr_err;
 end : qualify
 
 // -------------------------------------------------------------------------
@@ -183,10 +204,14 @@ always_ff @(posedge clk or negedge rst_n) begin
         classifier_valid <= 1'b0;
         classifier_error <= 1'b0;
         cmd_valid        <= 1'b0;
+        rr_cmd_valid     <= 1'b0;
+        rr_cmd_addr      <= 6'd0;
     end else begin
         classifier_valid <= legacy_hit;
-        classifier_error <= legacy_err || pixwr_err || unknown_msg;
+        classifier_error <= legacy_err || pixwr_err || regrd_err || unknown_msg;
         cmd_valid        <= pixwr_hit;
+        rr_cmd_valid     <= regrd_hit;
+        if (regrd_hit) rr_cmd_addr <= rr_rgf_addr;
     end
 end
 
@@ -218,6 +243,15 @@ end
 //   the two cmd_valid signals can never assert in the same cycle
 // -------------------------------------------------------------------------
 `ifndef SYNTHESIS
+    // THE TWO RGF COMMAND PRODUCERS ARE MUTUALLY EXCLUSIVE.
+    // classifier_valid comes from MSG_LEGACY_RGF, rr_cmd_valid from
+    // MSG_REG_READ. A frame carries exactly one msg_kind_q, so they cannot
+    // coincide -- chip_top's producer mux depends on this.
+    a_one_rgf_producer: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        !(classifier_valid && rr_cmd_valid)
+    ) else $error("%m: two RGF command producers valid in the same cycle");
+
     // Nothing at all may leave this module during a burst.
     a_inert_during_burst: assert property (
         @(posedge clk) disable iff (!rst_n)

@@ -172,7 +172,12 @@ module tb_stage2c_pipeline;
         .classifier_valid(classifier_valid), .classifier_error(classifier_error),
         .row_q(row_q), .col_q(col_q), .pixel_q(pixel_q),
         .cmd_valid(rx_cmd_valid), .cmd_addr(rx_cmd_addr), .cmd_pixel(rx_cmd_pixel),
-        .burst_active(bypass_active));   // M4: input, tied low here
+        .burst_active(bypass_active),
+        // Register Read inputs tied inactive: these suites pre-date the
+        // feature and never send MSG_REG_READ, so the behaviour under test
+        // is unchanged.
+        .rr_valid(1'b0), .rr_addr_err(1'b0), .rr_rgf_addr(6'd0),
+        .rr_cmd_valid(), .rr_cmd_addr());   // M4: input, tied low here
 
     // =================================================================
     // [ 3 ] COMMAND FIFO -- 130 MHz -> 100 MHz, carries the whole command

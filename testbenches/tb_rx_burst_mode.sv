@@ -129,7 +129,12 @@ module tb_rx_burst_mode;
         .row_q(row_q), .col_q(col_q), .pixel_q(pixel_q),
         .cmd_valid(cls_cmd_valid), .cmd_addr(cls_cmd_addr),
         .cmd_pixel(cls_cmd_pixel),
-        .burst_active(burst_active));            // <-- M4: input, not output
+        .burst_active(burst_active),
+        // Register Read inputs tied inactive: these suites pre-date the
+        // feature and never send MSG_REG_READ, so the behaviour under test
+        // is unchanged.
+        .rr_valid(1'b0), .rr_addr_err(1'b0), .rr_rgf_addr(6'd0),
+        .rr_cmd_valid(), .rr_cmd_addr());            // <-- M4: input, not output
 
     rx_burst_ctrl u_burst (
         .clk(clk), .rst_n(rst_n),

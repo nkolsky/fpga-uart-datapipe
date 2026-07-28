@@ -22,6 +22,17 @@ module tx_mac (
     // Upstream interface (tx_sequencer)
     input  logic         msg_valid,
     input  logic [127:0] msg_data,    // flat [127:0]: msg_data[7:0]=byte0, [15:8]=byte1 ...
+    // -----------------------------------------------------------------
+    // REGISTER READ: number of bytes to transmit, 1..16.
+    //
+    // 16 reproduces the pre-existing behaviour exactly -- every image
+    // message passes 5'd16 and the byte walk is bit-identical. The only
+    // other user is the 6-byte Register Read reply.
+    //
+    // Latched at MAC_LOAD alongside msg_data, so the caller only has to
+    // hold it stable for the msg_valid cycle, not the whole transaction.
+    // -----------------------------------------------------------------
+    input  logic [4:0]   msg_len,
     output logic         mac_busy,
 
     // TX PHY interface
@@ -41,6 +52,13 @@ import tx_mac_pkg::*;
     logic [3:0]   byte_idx;
 
     localparam int NUM_BYTES = 16;
+
+    // REGISTER READ: transmit length, latched with the message so the
+    // caller need only hold msg_len for the msg_valid cycle. Reset value
+    // 15 keeps a mid-reset MAC on the legacy 16-byte walk.
+    logic [3:0] last_idx;
+    logic [4:0] len_m1;
+    assign len_m1 = msg_len - 5'd1;   // 16 -> 15,  6 -> 5
 
     logic phy_busy;
     assign phy_busy = !phy_ready;
@@ -77,7 +95,7 @@ import tx_mac_pkg::*;
                 if (!phy_busy) next_state = MAC_CHK_DONE;
 
             MAC_CHK_DONE:
-                if (byte_idx == 4'd15) next_state = MAC_DONE;
+                if (byte_idx == last_idx) next_state = MAC_DONE;
                 else                   next_state = MAC_TRIG_BYTE;
 
             MAC_DONE:
@@ -95,10 +113,14 @@ import tx_mac_pkg::*;
         if (!rst_n || rx_mode) begin
             msg_buf  <= 128'd0;
             byte_idx <= 4'd0;
+            last_idx <= 4'd15;          // reset to the legacy 16-byte length
         end else begin
             if (cur_state == MAC_LOAD) begin
                 msg_buf  <= msg_data;
                 byte_idx <= 4'd0;
+                // 5'd16 -> 4'd15, 5'd6 -> 4'd5. Truncating the 5-bit
+                // subtract is exact for every legal length 1..16.
+                last_idx <= len_m1[3:0];
             end
             if (cur_state == MAC_CHK_DONE)
                 byte_idx <= byte_idx + 4'd1;

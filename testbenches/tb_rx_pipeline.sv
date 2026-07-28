@@ -107,7 +107,11 @@ module tb_rx_pipeline;
         .classifier_valid(classifier_valid), .classifier_error(classifier_error),
         .row_q(row_q), .col_q(col_q), .pixel_q(pixel_q),
         .cmd_valid(cmd_valid), .cmd_addr(cmd_addr), .cmd_pixel(cmd_pixel),
-        .burst_active(bypass_active)   // M4: input, tied low here
+        .burst_active(bypass_active),  // M4: input, tied low here
+        // Register Read inputs tied inactive: this suite pre-dates the
+        // feature and never sends MSG_REG_READ.
+        .rr_valid(1'b0), .rr_addr_err(1'b0), .rr_rgf_addr(6'd0),
+        .rr_cmd_valid(), .rr_cmd_addr()
     );
 
     // -----------------------------------------------------------------
