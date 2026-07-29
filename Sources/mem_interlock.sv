@@ -167,11 +167,36 @@ module mem_interlock (
     // synchronised into this clock domain. See the note below for why the
     // FIFO flags alone are not sufficient.
     input  logic burst_active,
-    output logic wr_allowed      // -> sram_wr_ctrl
+    output logic wr_allowed,     // -> sram_wr_ctrl
+
+    // -----------------------------------------------------------------
+    // SINGLE PIXEL READ: third client of the memory. It borrows the SRAM
+    // READ port for a handful of cycles, so it must exclude both the image
+    // reader (same port) and the writer (same memory).
+    //
+    // pix_rd_req is a LEVEL, held by pixel_rd_ctrl until granted. A grant
+    // latches pix_rd_active, which blocks read_go and wr_allowed until
+    // pix_rd_done releases it.
+    // -----------------------------------------------------------------
+    input  logic pix_rd_req,
+    input  logic pix_rd_done,
+    output logic pix_rd_gnt,
+
+    // Ownership of the SRAM READ PORT, for the chip_top read mux.
+    //
+    // Exported rather than recomputed at the mux, so that the arbiter and
+    // the datapath cannot disagree about who owns the port. This is the
+    // same registered pix_rd_active that gates read_go and wr_allowed
+    // below -- one source of truth, three consumers.
+    output logic pix_rd_owner
 );
 
     logic start_pending;
     logic img_in_flight;
+    logic pix_rd_active;
+
+    // The read-port mux in chip_top follows this exactly.
+    assign pix_rd_owner = pix_rd_active;
     logic wr_pending;
     logic read_active;
 
@@ -188,14 +213,41 @@ module mem_interlock (
     // A read may launch only when the PREVIOUS transfer is completely done
     // and nothing is writing. See the header for why rom_seq_busy is not a
     // sufficient completion signal.
-    assign read_go     = start_pending && !wr_pending && !img_in_flight;
+    assign read_go     = start_pending && !wr_pending && !img_in_flight
+                                        && !pix_rd_active && !pix_rd_gnt;
 
     // Collision gate. Deliberately a DIFFERENT condition from read_go: once
     // rom_sequencer has read a word its data is already safe in the pixel
     // FIFO, so writes only have to stand off for the address walk, not for
     // the ~1.5 s of transmission that follows.
     assign read_active = read_go || rom_seq_busy;
-    assign wr_allowed  = !read_active;
+
+    // Writes stand off while a single-pixel read owns the memory. The two
+    // ports are physically independent, but allowing a concurrent write --
+    // even to a different address -- would reintroduce the same-address
+    // collision case that rgb_sram's own assertion forbids, for the sake of
+    // a command that happens a few times a second.
+    assign wr_allowed  = !read_active && !pix_rd_active;
+
+    // Granted only when the image reader is idle AND nothing is writing or
+    // waiting to write. wr_pending already covers the command FIFO, the
+    // write pipeline and an active burst, so this is one term, not three.
+    // Qualified on rom_seq_busy and img_in_flight rather than read_active,
+    // which would close a combinational loop:
+    //     read_go -> read_active -> pix_rd_gnt -> read_go
+    // Both terms are registered, so the grant is loop-free. A same-cycle tie
+    // is broken in favour of the pixel read, which finishes in a few cycles;
+    // read_go carries !pix_rd_gnt and simply waits.
+    assign pix_rd_gnt  = pix_rd_req && !rom_seq_busy && !img_in_flight
+                                    && !wr_pending && !pix_rd_active;
+
+    // A single-pixel read in progress also blocks a new image transfer, so
+    // the two can never contend for the read port.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)            pix_rd_active <= 1'b0;
+        else if (pix_rd_gnt)   pix_rd_active <= 1'b1;
+        else if (pix_rd_done)  pix_rd_active <= 1'b0;
+    end
 
     // -----------------------------------------------------------------
     // Transfer-in-flight tracking.
@@ -248,15 +300,60 @@ module mem_interlock (
     ) else $error("%m: read_go asserted with writes pending or a burst active");
 
     // A burst must never be interrupted by an image read.
+    // The image reader and the single-pixel reader can never both own the
+    // SRAM read port.
+    a_read_port_exclusive: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        !(pix_rd_active && (read_go || rom_seq_busy))
+    ) else $error("%m: single-pixel read and image read own the port together");
+
+    // No write may proceed while a single-pixel read holds the memory.
+    a_no_write_during_pix_rd: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_rd_active |-> !wr_allowed
+    ) else $error("%m: write allowed during a single-pixel read");
+
+    // A grant is never manufactured without a request.
+    a_gnt_implies_req: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_rd_gnt |-> pix_rd_req
+    ) else $error("%m: pixel read granted without a request");
+
+    // A grant is only issued into a genuinely quiet memory.
+    a_gnt_needs_idle: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_rd_gnt |-> (!rom_seq_busy && !img_in_flight &&
+                        cmd_empty && !wr_busy && !burst_active)
+    ) else $error("%m: pixel read granted with the memory in use");
+
+    // Ownership is never asserted for more than one transaction at a time:
+    // a second grant cannot arrive while the first is still held.
+    a_no_double_grant: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        pix_rd_active |-> !pix_rd_gnt
+    ) else $error("%m: pixel read granted while one was already active");
+
     a_no_read_during_burst: assert property (
         @(posedge clk) disable iff (!rst_n)
         burst_active |-> !read_go
     ) else $error("%m: read_go asserted during an active burst");
 
     // ...but a burst must not block its own writes.
+    //
+    // The antecedent carries !pix_rd_active as well as !read_go and
+    // !rom_seq_busy. wr_allowed now has three blockers, not two, so
+    // without this term the property asserts something that is simply
+    // untrue: a single-pixel read that was granted BEFORE the burst began
+    // legitimately holds the memory for a few more cycles after
+    // burst_active rises, and writes are correctly blocked for that
+    // window. The grant condition itself carries !wr_pending, which
+    // includes burst_active, so a pixel read can never START during a
+    // burst -- but one already in progress can still overlap the start of
+    // one, and that overlap is legal.
     a_burst_may_write: assert property (
         @(posedge clk) disable iff (!rst_n)
-        (burst_active && !read_go && !rom_seq_busy) |-> wr_allowed
+        (burst_active && !read_go && !rom_seq_busy && !pix_rd_active)
+            |-> wr_allowed
     ) else $error("%m: writes blocked during a burst with no read in progress");
 
     // read_go must never coincide with an active address walk. If it did,
