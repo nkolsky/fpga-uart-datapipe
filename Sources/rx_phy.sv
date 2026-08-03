@@ -21,12 +21,28 @@
 //     DOES corrupt the message by silently shifting every byte after it
 //     out of position. Gating is the correct fix, not a hang risk.
 //   - parity_err_pulse fires the same cycle byte_valid is withheld due to
-//     a parity failure -- intended to drive rx_mac's soft-reset input
-//     (new port, not added here) and an RGF fault-counter status write,
-//     both via chip_top.sv wiring (not yet done -- see handoff doc).
-//     This is a genuine one-shot pulse, not a level, by design -- a
-//     level would hold rx_mac in reset for as long as the condition it's
-//     built from stays asserted, which is not the intended behavior.
+//     a parity failure. BOTH of its intended consumers are now wired in
+//     chip_top.sv -- this is no longer pending work:
+//
+//       1. rx_mac soft reset. Connected straight to rx_mac's par_val_rst
+//          input, in this same 130 MHz domain, no synchroniser needed.
+//          rx_mac uses it to force cur_state back to MAC_IDLE and clear
+//          msg_buf / byte_idx / byte_we, so a frame corrupted by a bad
+//          byte is abandoned rather than completed with every subsequent
+//          byte shifted out of position.
+//
+//       2. RGF fault counter. Crosses to the 100 MHz domain through a
+//          cdc_pulse_sync and drives rgf's dedicated parity_fault_incr
+//          input, which increments PARITY_FAULT_CNT (0x14). Note it is an
+//          INCREMENT PULSE on its own port, not a status_* bus write --
+//          that bus has "write this whole value" semantics and cannot
+//          express "add one".
+//
+//     The crossing in (2) is why this must stay a one-shot pulse rather
+//     than becoming a level: cdc_pulse_sync is a toggle synchroniser and
+//     would translate a held level into a single event anyway, while on
+//     the rx_mac side a level would hold the MAC in reset for as long as
+//     the condition stayed asserted.
 //
 // Two real bugs fixed from the previous draft, both worth understanding
 // since they'd have made parity checking silently non-functional:

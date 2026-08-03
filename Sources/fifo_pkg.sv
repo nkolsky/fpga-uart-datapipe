@@ -1,8 +1,29 @@
-// async_fifo_pkg.sv
-// -----------------
-// Parameters and gray-code helper functions for the Lab 9 async FIFO.
+// fifo_pkg.sv
+// -----------
+// Parameters and gray-code helper functions for async_fifo.sv.
 //
-// Sizing rationale (see design discussion):
+// (This header was previously titled "async_fifo_pkg.sv"; the file and the
+// package are both named fifo_pkg.)
+//
+// TWO INSTANCES SHARE THESE PARAMETERS. async_fifo parameterises only its
+// data width -- DEPTH, the thresholds, the pointer width and the gray
+// helpers below are fixed for every instance, because bin2gray/gray2bin
+// bake PTR_WIDTH into their signatures. The sizing rationale that follows
+// was derived for the IMAGE FIFO (24-bit, rom_sequencer -> tx_sequencer).
+// The 48-bit command FIFO inherits the same numbers; its occupancy is
+// nowhere near them, since it drains at one command per clock against a
+// UART-limited arrival rate.
+//
+// SIZING RATIONALE -- NOTE THE ASSUMPTION IT WAS DERIVED UNDER.
+// The AF figure below was worked out when both FIFO ports were driven by
+// the same clock. That is no longer true: the image FIFO now writes on
+// CLK100MHZ and reads on the 130 MHz pll_clk_out (see async_fifo.sv).
+// The margin survives the change -- the read side is now FASTER than the
+// write side, so it drains sooner and the synchroniser lag term, measured
+// in write-clock cycles, is if anything smaller than the 1-pixel figure
+// assumed. The 8 slots of headroom below are therefore a lower bound, not
+// an estimate that needs redoing. Recorded explicitly so the derivation is
+// not read as though it still describes a synchronous FIFO.
 //   DEPTH = 64        - unchanged from the sync FIFO; burst pattern from
 //                        rom_sequencer (4 pixels per ROM word) is unchanged,
 //                        so the same buffering depth still applies.

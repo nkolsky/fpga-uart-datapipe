@@ -1,3 +1,38 @@
+// rom_sequencer.sv
+// ----------------
+// Full-frame image reader. Walks every word of the three channel
+// memories in address order, unpacks four pixels per word, and pushes
+// them one at a time into the image FIFO with almost_full backpressure.
+//
+// -----------------------------------------------------------------------
+// THE "ROM" NAMING IS HISTORICAL -- THE SOURCE IS SRAM
+// -----------------------------------------------------------------------
+// This module, its ports (rom_addr, rom_rd_en), its parameters
+// (ROM_DEPTH, ROM_DATA_WIDTH, ROM_LATENCY) and its states (READ_ROM,
+// WAIT_ROM) all still say ROM. The memory they address is now rgb_sram,
+// which is read-write. The names are retained deliberately, not by
+// oversight: rgb_sram was built as a cycle-exact drop-in for the read
+// side of rgb_rom, so this module did not have to change at all, and
+// keeping the identifiers stable kept that diff empty and auditable.
+// chip_top.sv makes the same choice for the same reason (see the note
+// above its rom_addr / rom_rd_en declarations).
+//
+// What this module does NOT know about, and must not be assumed to
+// coordinate with:
+//   - the write port on those SRAMs (sram_wr_ctrl)
+//   - the other two read clients (pixel_rd_ctrl, burst_rd_ctrl)
+// Exclusion between all of them is mem_interlock's job. This module
+// simply asserts rom_rd_en when its FSM says to, and is only ever
+// started via mem_interlock's read_go -- never directly from the RGF.
+//
+// -----------------------------------------------------------------------
+// CLOCK DOMAIN
+// -----------------------------------------------------------------------
+// Runs on CLK100MHZ, the memory domain. The image FIFO it writes into is
+// a genuine CDC FIFO whose read side is on the 130 MHz UART domain, so
+// almost_full arrives here already synchronised; almost_empty is
+// likewise synchronised into this domain by chip_top before use.
+
 `timescale 1ns/1ps
 import rom_sequencer_pkg::*;
 
@@ -80,12 +115,31 @@ always_ff @(posedge clk or negedge rst_n) begin
             end
         end
         LATCH: begin
-            //Latch the pixel data from ROM into internal registers
-            pixels[0] <= {red_data[31:24], green_data[31:24], blue_data[31:24]}; // Pixel 3 (bits 24-31)
-            pixels[1] <= {red_data[23:16], green_data[23:16], blue_data[23:16]}; // Pixel 2 (bits 16-23)
-            pixels[2] <= {red_data[15:8], green_data[15:8], blue_data[15:8]}; // Pixel 1 (bits 8-15)
-            pixels[3] <= {red_data[7:0], green_data[7:0], blue_data[7:0]}; // Pixel 0 (bits 0-7 of each channel)   
-            
+            // Latch the pixel data from memory into internal registers.
+            //
+            // BYTE-LANE ORIENTATION -- the MSB lane is the LEFTMOST pixel.
+            // Each 32-bit channel word packs four CONSECUTIVE pixels of one
+            // colour channel, lowest pixel index in the most significant
+            // byte (see memory_pkg.sv). pixels[] is pushed to the FIFO in
+            // index order 0,1,2,3, so pixels[0] must be the leftmost pixel
+            // of the word, which is bits [31:24].
+            //
+            // These comments previously read "Pixel 3" against [31:24] and
+            // "Pixel 0" against [7:0] -- i.e. exactly backwards. The RTL was
+            // always right; only the labels were wrong, which is why the
+            // captured image never looked scrambled. Corrected here because
+            // sram_wr_ctrl.sv derives its byte enable from this same
+            // orientation, and a reader who trusted the old labels would
+            // build the write path mirrored within every word.
+            //
+            // Confirmed by measurement: red word 4392 = 0x3D0000FF, and the
+            // captured PNG at row 68, cols 160..163 reads 61, 0, 0, 255 --
+            // [31:24] first.
+            pixels[0] <= {red_data[31:24], green_data[31:24], blue_data[31:24]}; // pixel 0 of word - LEFTMOST
+            pixels[1] <= {red_data[23:16], green_data[23:16], blue_data[23:16]}; // pixel 1 of word
+            pixels[2] <= {red_data[15:8], green_data[15:8], blue_data[15:8]}; // pixel 2 of word
+            pixels[3] <= {red_data[7:0], green_data[7:0], blue_data[7:0]}; // pixel 3 of word - RIGHTMOST
+
         end
         PUSH: begin
             push_ctr <= push_ctr + 1; // Increment push counter to move to the next pixel in the current ROM word

@@ -1,9 +1,35 @@
 // async_fifo.sv
 // -------------
 // Async FIFO - Cummings-style dual-clock gray-code pointer FIFO.
-// Same clock is tied to both wr_clk and rd_clk at the chip_top level,
-// but the internal structure is fully async (gray pointers + 2-FF
-// synchronizers crossing each domain), per Lab 9 spec.
+//
+// -----------------------------------------------------------------------------
+// THE CDC IS LOAD-BEARING. BOTH INSTANCES GENUINELY CROSS DOMAINS.
+// -----------------------------------------------------------------------------
+// This header used to say that chip_top tied the same clock to wr_clk and
+// rd_clk, making the gray pointers and synchronisers structurally correct but
+// functionally inert. THAT IS NO LONGER TRUE, and reading it that way would be
+// dangerous. Once the UART front end moved onto the 130 MHz PLL output, both
+// instantiations acquired two genuinely unrelated clocks:
+//
+//   u_async_fifo  (image FIFO, 24-bit)
+//       wr_clk = CLK100MHZ     rom_sequencer, memory domain
+//       rd_clk = pll_clk_out   tx_sequencer, 130 MHz UART domain
+//
+//   u_cmd_fifo    (command FIFO, 48-bit, .DW(48))
+//       wr_clk = pll_clk_out   rx_classifier / rx_burst_ctrl
+//       rd_clk = CLK100MHZ     sram_wr_ctrl, memory domain
+//
+// The two FIFOs cross in OPPOSITE directions, and each has its own reset
+// (sync_rst_n on the 100 MHz side, sync_pll_rst_n on the 130 MHz side). The
+// gray-coded pointers and the 2-FF synchronisers are therefore the actual
+// mechanism keeping the pointers coherent, not a spec box-tick -- removing or
+// simplifying either would corrupt the flags in hardware.
+//
+// Both clocks happen to derive from the same MMCM, so their phase relationship
+// is fixed for a given placement. That does NOT make the crossing synchronous
+// in any useful sense: the ratio is 100:130, pointers still advance in
+// unrelated cycles, and the fixed phase is an artefact of one particular
+// place-and-route rather than a property the design may rely on.
 
 `timescale 1ns/1ps
 

@@ -26,12 +26,20 @@
 // so the byte enable is  1 << (PIX_PER_WORD-1 - lane),  NOT  1 << lane.
 //
 // This orientation was established by measurement, not by reading comments.
-// The comments in rom_sequencer.sv lines 84-87 label bits[31:24] as
-// "Pixel 3" and bits[7:0] as "Pixel 0" -- THOSE COMMENTS ARE BACKWARDS.
-// pixels[] are pushed in index order 0,1,2,3, so pixels[0], taken from
-// bits[31:24], is the leftmost pixel. Confirmed against the captured image:
-// red word 4392 is 0x3D0000FF, and the captured PNG at row 68 cols 160..163
-// reads 61, 0, 0, 255 -- matching [31:24] first.
+//
+// HISTORICAL NOTE, now resolved: the pixel labels in rom_sequencer.sv's
+// LATCH state used to read "Pixel 3" against bits[31:24] and "Pixel 0"
+// against bits[7:0] -- exactly backwards -- and this module was written
+// against the measurement rather than against those labels. Those comments
+// have since been corrected at the source, so rom_sequencer.sv, memory_pkg.sv
+// and this file now all agree: MSB lane is the LEFTMOST (lowest-index) pixel.
+// The reasoning is kept here because it is the only place the evidence is
+// recorded.
+//
+// The evidence: pixels[] are pushed in index order 0,1,2,3, so pixels[0],
+// taken from bits[31:24], is the leftmost pixel. Confirmed against the
+// captured image -- red word 4392 is 0x3D0000FF, and the captured PNG at
+// row 68 cols 160..163 reads 61, 0, 0, 255, matching [31:24] first.
 //
 // Getting this backwards does not fail loudly. It silently writes the wrong
 // pixel within the correct word, which only shows up as a mislocated pixel

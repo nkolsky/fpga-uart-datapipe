@@ -12,15 +12,24 @@
 // classifier_valid pulses for one cycle to notify the sequencer.
 //
 // -----------------------------------------------------------------------
-// STAGE 2A: MESSAGE-KIND ROUTING
+// MESSAGE-KIND ROUTING
 // -----------------------------------------------------------------------
-// Two parsers now run in parallel on the same completed frame:
+// EIGHT parsers run in parallel on the same completed frame; msg_kind
+// (rx_mac's LATCHED msg_kind_q, never the provisional decode output)
+// selects which ONE is authoritative for a given frame. Six of the eight
+// are gated by this module; the two burst parsers are not (see below):
 //
-//   rx_parser            legacy {Rnnn,Cnnn,Vnnn}  -> RGF control path
-//   rx_pixel_wr_parser   {W<A>, P<R,G,B>}         -> pixel write command
-//
-// msg_kind (rx_mac's LATCHED msg_kind_q, never the provisional decode
-// output) selects which one is authoritative for a given frame.
+//   rx_parser              legacy {Rnnn,Cnnn,Vnnn} -> RGF control path
+//   rx_pixel_wr_parser     {W<A>, P<R,G,B>}        -> pixel write command
+//   rx_reg_write_parser    {W<A>, V<..>, V<..>}    -> RGF write (32-bit)
+//   rx_reg_read_parser     {R<A>}                  -> RGF read + reply
+//   rx_pixel_rd_parser     {R<..>,C<..>,P<..>}     -> pixel_rd_ctrl
+//   rx_burst_rd_parser     {R<A>,H<..>,W<..>}      -> burst_rd_ctrl
+//   rx_burst_hdr_parser /  {I<..>,H<..>,W<..>} and -> rx_burst_ctrl
+//   rx_burst_data_parser   the burst data frames      (NOT gated here --
+//                          see the burst-mode section below: rx_burst_ctrl
+//                          consumes those directly and this module gates
+//                          ALL of its own outputs on !burst_active)
 //
 // THE KIND GATES ARE CORRECTNESS CRITICAL, NOT STYLISTIC:
 //
@@ -40,30 +49,41 @@
 // -----------------------------------------------------------------------
 // classifier_error pulses ONLY for traffic that is malformed or
 // unclassifiable. A structurally valid message never raises an error
-// merely because Stage 2A has no consumer for it.
+// merely because there is no consumer for it.
 //
 //   raises an error:
 //     MSG_LEGACY_RGF with parse_error      (bad legacy framing)
 //     MSG_PIX_WRITE  with pw_parse_error   (bad pixel-write framing)
+//     MSG_REG_WRITE  with rw_addr_err      (out-of-range register addr)
+//     MSG_REG_READ   with rr_addr_err      (out-of-range register addr)
+//     MSG_PIX_READ   with !pr_valid        (bad framing or coordinates)
+//     MSG_BURST_READ with !br_valid        (bad framing or extent)
 //     MSG_UNKNOWN                          (unclassifiable frame)
 //
-//   silently ignored -- recognised, valid, no consumer yet:
-//     MSG_REG_WRITE   MSG_REG_READ   MSG_PIX_READ
-//     MSG_BURST_HDR   MSG_BURST_READ MSG_BURST_DATA
+//   silently ignored: nothing. Every message kind the receive path can
+//   classify now has a consumer.
 //
-// The legacy protocol remains the active register-control path until the
-// new register protocol is implemented and verified separately. A
-// silently dropped valid message looks like a bug, so it is called out
-// here deliberately.
+// TWO REGISTER WRITE PATHS COEXIST, DELIBERATELY:
+//   MSG_LEGACY_RGF  {Rnnn,Cnnn,Vnnn}   ASCII, 8-bit value, zero-extended
+//   MSG_REG_WRITE   {W<A>,V<..>,V<..>} binary, full 32-bit value
+// They are different msg_kinds and can never collide on one frame. The
+// legacy path is retained unchanged for backwards compatibility with the
+// existing PC-side tooling; the binary path is the one the project
+// specification defines, and the only one that can write the upper 24 bits
+// of a register.
+//
+// MSG_BURST_HDR and MSG_BURST_DATA are absent from both lists on purpose:
+// they are consumed by rx_burst_ctrl directly off rx_mac, never through
+// this module, which gates all of its outputs on !burst_active.
 //
 // KNOWN LIMITATION: rx_msg_decode inspects only bytes 0, 1, 5, 6 and 11.
-// A message of an unimplemented kind whose OTHER bytes are corrupt --
-// say a Register Write with a bad terminator at byte 15 -- still
-// classifies as MSG_REG_WRITE and is silently dropped rather than
-// flagged. Full structural validation of those kinds needs their own
-// parsers, which Stage 2A deliberately does not add. When those parsers
-// arrive their error terms join the expression below in the same shape
-// as legacy and pixel-write do now.
+// rx_reg_write_parser additionally checks bytes 0, 5, 10, 11 and 15, so a
+// Register Write that is malformed at its tail now fails the parser -- but
+// it fails with rw_addr_err LOW and rw_valid LOW, so it is dropped WITHOUT
+// an error pulse. That matches how the legacy and pixel-write paths treat a
+// framing failure. Only an address fault is reported, because only an
+// address fault is unambiguously a well-formed request the design must
+// refuse.
 
 `timescale 1ns/1ps
 
@@ -97,8 +117,9 @@ module rx_classifier
     output logic [9:0]  col_q,             // latched col
     output logic [23:0] pixel_q,           // latched pixel {R,G,B}
 
-    // Single Pixel Write command. Stage 2A has no consumer for the data
-    // buses yet -- the command FIFO arrives in Stage 2B.
+    // Single Pixel Write command -> chip_top's command mux -> the 48-bit
+    // command FIFO -> sram_wr_ctrl. Shares that FIFO with rx_burst_ctrl's
+    // command output; the two are mutually exclusive by construction.
     output logic        cmd_valid,         // one-cycle pulse
     output logic [23:0] cmd_addr,          // raw 24-bit {A2,A1,A0}
     output logic [23:0] cmd_pixel,         // {R,G,B}
@@ -128,6 +149,27 @@ module rx_classifier
 
     output logic        rr_cmd_valid,
     output logic [5:0]  rr_cmd_addr,
+
+    // -----------------------------------------------------------------
+    // REGISTER WRITE: parsed request from rx_reg_write_parser, and the
+    // resulting RGF command. rw_cmd_valid is the THIRD producer of RGF
+    // commands, alongside classifier_valid (legacy) and rr_cmd_valid
+    // (Register Read). All three are mutually exclusive because a frame
+    // has exactly one msg_kind_q and only one msg_valid pulse.
+    //
+    // Unlike the legacy path this carries a FULL 32-bit value: the legacy
+    // frame decodes a single 8-bit ASCII field which chip_top
+    // zero-extends, so it structurally cannot reach the upper bits of any
+    // register. This one can.
+    // -----------------------------------------------------------------
+    input  logic        rw_valid,
+    input  logic        rw_addr_err,
+    input  logic [5:0]  rw_rgf_addr,
+    input  logic [31:0] rw_data,
+
+    output logic        rw_cmd_valid,
+    output logic [5:0]  rw_cmd_addr,
+    output logic [31:0] rw_cmd_data,
 
     // -----------------------------------------------------------------
     // SINGLE PIXEL READ: parsed request from rx_pixel_rd_parser.
@@ -184,6 +226,7 @@ logic pixwr_hit,  pixwr_err;
 logic unknown_msg;
 
 logic regrd_hit, regrd_err;
+logic regwr_hit, regwr_err;
 logic pixrd_hit, pixrd_err;
 logic burstrd_hit, burstrd_err;
 
@@ -209,6 +252,22 @@ always_comb begin : qualify
     // the existing classifier_error rather than silently truncated.
     regrd_hit = active && (msg_kind == MSG_REG_READ) && rr_valid;
     regrd_err = active && (msg_kind == MSG_REG_READ) && rr_addr_err;
+
+    // Register Write: same shape as Register Read. Accepted only with a
+    // usable address; a framing-good request with an out-of-range or
+    // unaligned address is reported through classifier_error rather than
+    // silently truncated onto a register the host did not name.
+    //
+    // rw_addr_err is used rather than !rw_valid because rx_msg_decode
+    // reaches MSG_REG_WRITE on bytes 1 and 6 only, while the parser also
+    // checks bytes 0, 5, 10, 11 and 15. A frame that decodes as a register
+    // write but is malformed at its tail therefore has rw_addr_err LOW and
+    // rw_valid LOW, and is dropped without an error pulse -- matching how
+    // the legacy and pixel-write paths treat a framing failure, and
+    // deliberately NOT matching the pixrd/burstrd convention, where the
+    // parser is the only structural check that exists.
+    regwr_hit = active && (msg_kind == MSG_REG_WRITE) && rw_valid;
+    regwr_err = active && (msg_kind == MSG_REG_WRITE) && rw_addr_err;
 
     // Single Pixel Read: accepted only with coordinates that are inside
     // the image when judged on their FULL 24-bit fields.
@@ -288,6 +347,9 @@ always_ff @(posedge clk or negedge rst_n) begin
         cmd_valid        <= 1'b0;
         rr_cmd_valid     <= 1'b0;
         rr_cmd_addr      <= 6'd0;
+        rw_cmd_valid     <= 1'b0;
+        rw_cmd_addr      <= 6'd0;
+        rw_cmd_data      <= 32'd0;
         pr_cmd_valid     <= 1'b0;
         pr_cmd_row       <= 10'd0;
         pr_cmd_col       <= 10'd0;
@@ -299,10 +361,22 @@ always_ff @(posedge clk or negedge rst_n) begin
     end else begin
         classifier_valid <= legacy_hit;
         classifier_error <= legacy_err || pixwr_err || regrd_err ||
-                            pixrd_err || burstrd_err || unknown_msg;
+                            regwr_err  || pixrd_err || burstrd_err ||
+                            unknown_msg;
         cmd_valid        <= pixwr_hit;
         rr_cmd_valid     <= regrd_hit;
         if (regrd_hit) rr_cmd_addr <= rr_rgf_addr;
+
+        // A rejected Register Write emits NO command, so nothing reaches
+        // the RGF and no register changes -- only the error pulse above.
+        // Address and data are written on a hit only, so a rejected
+        // request cannot leave a stale-but-plausible {addr, data} pair
+        // behind for the next producer to trip over.
+        rw_cmd_valid     <= regwr_hit;
+        if (regwr_hit) begin
+            rw_cmd_addr <= rw_rgf_addr;
+            rw_cmd_data <= rw_data;
+        end
 
         // A rejected Single Pixel Read emits NO command, so no SRAM
         // access and no reply can follow from it -- only the error pulse
@@ -357,20 +431,28 @@ end
 //   the two cmd_valid signals can never assert in the same cycle
 // -------------------------------------------------------------------------
 `ifndef SYNTHESIS
-    // THE TWO RGF COMMAND PRODUCERS ARE MUTUALLY EXCLUSIVE.
+    // THE THREE RGF COMMAND PRODUCERS ARE MUTUALLY EXCLUSIVE.
     // classifier_valid comes from MSG_LEGACY_RGF, rr_cmd_valid from
-    // MSG_REG_READ. A frame carries exactly one msg_kind_q, so they cannot
-    // coincide -- chip_top's producer mux depends on this.
+    // MSG_REG_READ, rw_cmd_valid from MSG_REG_WRITE. A frame carries exactly
+    // one msg_kind_q, so no two can coincide -- chip_top's producer mux
+    // depends on this.
     a_one_rgf_producer: assert property (
         @(posedge clk) disable iff (!rst_n)
-        !(classifier_valid && rr_cmd_valid)
-    ) else $error("%m: two RGF command producers valid in the same cycle");
+        $onehot0({classifier_valid, rr_cmd_valid, rw_cmd_valid})
+    ) else $error("%m: more than one RGF command producer valid in the same cycle");
+
+    // An accepted Register Write never coincides with its own error.
+    a_regwr_hit_xor_err: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        !(regwr_hit && regwr_err)
+    ) else $error("%m: register write both accepted and rejected");
 
     // Nothing at all may leave this module during a burst.
     a_inert_during_burst: assert property (
         @(posedge clk) disable iff (!rst_n)
         burst_active |-> (!classifier_valid && !classifier_error &&
-                          !cmd_valid && !pr_cmd_valid && !br_cmd_valid)
+                          !cmd_valid && !pr_cmd_valid && !br_cmd_valid &&
+                          !rr_cmd_valid && !rw_cmd_valid)
     ) else $error("%m: classifier active during a burst");
 
     // A frame carries exactly one msg_kind_q, so a Single Pixel Read can
@@ -380,7 +462,7 @@ end
     a_burstrd_exclusive: assert property (
         @(posedge clk) disable iff (!rst_n)
         br_cmd_valid |-> (!classifier_valid && !rr_cmd_valid &&
-                          !cmd_valid && !pr_cmd_valid)
+                          !rw_cmd_valid && !cmd_valid && !pr_cmd_valid)
     ) else $error("%m: burst read command overlapped another command");
 
     a_burstrd_hit_xor_err: assert property (
@@ -390,7 +472,8 @@ end
 
     a_pixrd_exclusive: assert property (
         @(posedge clk) disable iff (!rst_n)
-        pr_cmd_valid |-> (!classifier_valid && !rr_cmd_valid && !cmd_valid)
+        pr_cmd_valid |-> (!classifier_valid && !rr_cmd_valid &&
+                          !rw_cmd_valid && !cmd_valid)
     ) else $error("%m: pixel read command overlapped another command");
 
     // An accepted Single Pixel Read never coincides with its own error.

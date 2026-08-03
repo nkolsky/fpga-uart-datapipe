@@ -1,8 +1,13 @@
 // rgb_sram.sv
 // -----------
 // Single-channel image SRAM. Drop-in replacement for the read side of
-// rgb_rom.sv's `rom` module, plus a byte-enabled write port that is
-// TIED INACTIVE in Stage 1 (chip_top.sv drives wr_en = 1'b0).
+// rgb_rom.sv's `rom` module, plus a byte-enabled write port.
+//
+// THE WRITE PORT IS LIVE. It was tied to 1'b0 when this module was first
+// introduced; it is now driven by sram_wr_ctrl, which serves both the
+// Single Pixel Write path and the Image Burst Write path (both arrive
+// through the 48-bit command FIFO). All three channel instances share
+// one wr_en / wr_be / wr_addr and take their own wr_data.
 //
 // -----------------------------------------------------------------------
 // TIMING CONTRACT -- must match rgb_rom.sv exactly
@@ -49,24 +54,47 @@
 // happen here: the read port never writes.)
 //
 // Rather than paper over that mismatch with write-forwarding logic, the
-// collision is declared ILLEGAL and enforced by the simulation-only
-// assertion at the bottom of this file. In Stage 1 the condition holds
-// vacuously (wr_en is tied low). In Stage 2 it should hold naturally,
-// since the IMG_CTRL interlock and RTS backpressure already serialise
-// the receive and transmit phases -- and if a future change violates it,
-// the assertion turns a silent hardware-only bug into a loud simulation
-// failure.
+// collision is declared ILLEGAL and enforced from two directions:
+//
+//   1. STRUCTURALLY, by mem_interlock.sv. It is the single arbiter of
+//      this memory and grants exclusive ownership to exactly one of the
+//      three clients -- the full-frame reader (rom_sequencer), the
+//      writer (sram_wr_ctrl, serving both single-pixel and burst
+//      writes), and the read-port borrower (pixel_rd_ctrl or
+//      burst_rd_ctrl, arbitrated ahead of the interlock in chip_top).
+//      wr_allowed and read_go are never both live, so rd_en and wr_en
+//      cannot be high in the same cycle at all, let alone at the same
+//      address.
+//
+//   2. BY ASSERTION, via the simulation-only check at the bottom of this
+//      file. This is the backstop: if a future change to the interlock
+//      or to the chip_top read mux breaks the exclusion above, the
+//      assertion turns a silent hardware-only bug into a loud simulation
+//      failure.
+//
+// The condition is no longer vacuous. wr_en is genuinely exercised now,
+// so the assertion is doing real work in every testbench that writes.
 //
 // -----------------------------------------------------------------------
 // SYNTHESIS NOTE
 // -----------------------------------------------------------------------
-// With wr_en tied to a constant 0 (Stage 1), Vivado will constant-
-// propagate through the write logic and this memory collapses back into
-// a ROM. Utilisation is therefore expected to be IDENTICAL to the Lab 10
-// baseline -- 16 x RAMB36E1 per instance, 48 total. That identity is the
-// Stage 1 synthesis pass criterion, but it also means Stage 1 does not
-// exercise byte-enabled SDP RAM inference; that first gets tested when
-// the write port goes live in Stage 2.
+// With the write port live, this no longer constant-propagates back into
+// a ROM: Vivado must infer true byte-enabled simple-dual-port block RAM
+// from the always_ff template below. Expect utilisation to differ from
+// the read-only Lab 10 baseline, and check the synthesis report for
+// three things in particular:
+//
+//   - the RAM is inferred as block, not distributed (the ram_style
+//     attribute below asks for block; a warning here means the byte-write
+//     loop failed to match UG901's template)
+//   - the byte-write enables map onto the BRAM WE pins rather than
+//     becoming a read-modify-write in fabric
+//   - no unexpected extra BRAM from a failed inference falling back to
+//     LUTRAM
+//
+// Read-side timing and the four properties above are unchanged by the
+// write port going live -- the read port is still a plain enabled,
+// registered output.
 
 `timescale 1ns/1ps
 
@@ -85,12 +113,14 @@ module rgb_sram #(
     output logic [DATA_WIDTH-1:0]    rd_data,
 
     // -----------------------------------------------------------------
-    // Write port -- present but INACTIVE in Stage 1.
+    // Write port -- LIVE, driven by sram_wr_ctrl.
     // wr_be selects which byte lanes of the addressed word are updated;
     // a lane whose bit is low retains its current contents. This exists
-    // now because each 32-bit channel word packs four 8-bit pixels, so
-    // Stage 2 needs to be able to fill a word one pixel at a time
-    // without a read-modify-write.
+    // because each 32-bit channel word packs four 8-bit pixels, so the
+    // write path can fill a word one pixel at a time without a
+    // read-modify-write. sram_wr_ctrl computes the lane as
+    // 1 << (PIXELS_PER_WORD-1 - (pixel_index % 4)) -- MSB lane is the
+    // LEFTMOST pixel; see the byte-lane section of sram_wr_ctrl.sv.
     // -----------------------------------------------------------------
     input  logic                     wr_en,
     input  logic [DATA_WIDTH/8-1:0]  wr_be,

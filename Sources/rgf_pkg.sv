@@ -1,13 +1,27 @@
 // rgf_pkg.sv
 // ----------
 // Register map and bitfield definitions for the Config RGF.
-// BARE MINIMUM pass: exactly the four registers Lab 8/9 specify, nothing
-// added yet. Robustness (invalid-address latching, reserved-bit masking,
-// etc.) is a deliberate follow-up pass once this is verified working.
+//
+// This started as a bare-minimum pass carrying only the four registers
+// Lab 8/9 specify. It has since grown to SIX: Lab 10 added CLK_CTRL (the
+// clock-mux select the spec asks for) and PARITY_FAULT_CNT (the rx_phy
+// parity fault counter). The map is contiguous on a 4-byte stride, so
+// register index N sits at byte address N*4 -- which is exactly what
+// chip_top.sv's legacy {R###,C###,V###} dispatcher relies on when it
+// treats row_q as a register INDEX rather than an address.
+//
+// Robustness (invalid-address latching, reserved-bit write masking) is
+// still a deliberate follow-up and is NOT implemented here: the read mux
+// returns 0 for an unmapped address and a write to one is silently
+// dropped. Note that out-of-range addresses are already rejected UPSTREAM
+// by rx_reg_read_parser / rx_reg_write_parser, which refuse anything that
+// does not fit the 6-bit port or is not word aligned -- so a malformed
+// address is reported as a classifier error and never reaches this file.
 //
 // Register access-type glossary:
 //   RW    - PC reads and writes directly (mem-style pc_wen/pc_addr/pc_wdata)
-//   RO    - PC reads only; continuous passthrough from external/static inputs
+//   RO    - PC reads only; continuous passthrough from external/static
+//           inputs or from dedicated hardware ports
 //   IW    - Internally-Written: PC reads only; written by internal chip
 //           logic (the Sequencer, via status_wen/status_addr/status_wdata)
 //           and holds its value between writes
@@ -16,14 +30,29 @@
 //           IMG_TX_MON.img_send_complete/img_send_error only (see rgf.sv
 //           section on the IMG_CTRL interlock for why).
 //
-// Four registers:
-//   IMG_STATUS  (RO)    - static image dimensions + ready flag
-//   IMG_TX_MON  (IW/+RC)- live progress of the TX drain; row_cnt/col_cnt
-//                          are plain IW, img_send_complete/img_send_error
-//                          are IW+RC (see rgf.sv)
-//   IMG_CTRL    (RW)    - PC writes bit 0 to trigger an image send
-//   FIFO_STATUS (IW)    - async_fifo flag passthrough, for PC-side debug
-//                          visibility
+// Six registers:
+//   0x00 IMG_STATUS       (RO)    - static image dimensions + ready flag
+//   0x04 IMG_TX_MON       (IW/+RC)- live progress of the TX drain;
+//                                    row_cnt/col_cnt are plain IW,
+//                                    img_send_complete/img_send_error are
+//                                    IW+RC (see rgf.sv)
+//   0x08 IMG_CTRL         (RW)    - PC writes bit 0 to trigger an image send
+//   0x0C FIFO_STATUS      (RO)    - async_fifo flag passthrough for PC-side
+//                                    debug visibility. RO, NOT IW: these are
+//                                    live hardware levels arriving on
+//                                    dedicated ports, not values written
+//                                    through the status_* bus. An earlier
+//                                    version of this header called it IW,
+//                                    which contradicted the implementation.
+//   0x10 CLK_CTRL         (RW)    - clock-mux select for the two-speed
+//                                    counter (Lab 10)
+//   0x14 PARITY_FAULT_CNT (RO)    - monotonic rx_phy parity fault count,
+//                                    incremented by a dedicated pulse input,
+//                                    not the status_* bus (Lab 10)
+//
+// Only TWO registers are writable by the PC: IMG_CTRL and CLK_CTRL. Only
+// ONE is written through the status_* bus: IMG_TX_MON. The remaining three
+// are driven by dedicated inputs.
 //
 // -----------------------------------------------------------------------
 // IMG_CTRL interlock -- resolved per the LITERAL spec wording this pass:

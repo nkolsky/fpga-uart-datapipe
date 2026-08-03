@@ -55,24 +55,28 @@ package rx_msg_pkg;
     // -----------------------------------------------------------------
     // Message classification.
     //
-    // MSG_BURST_HDR / MSG_BURST_READ / MSG_BURST_DATA are declared now
-    // but have no consumer in Stage 2A. They exist so that adding burst
-    // support later requires no change to this package, to rx_mac, or to
-    // rx_msg_decode's interface -- only the burst countdown inside
-    // rx_classifier that eventually drives bypass_active.
+    // Every member below has a live consumer. The comment column names the
+    // module that acts on each kind.
     // -----------------------------------------------------------------
     // Widened to 4 bits when MSG_PIX_READ was added -- 9 members no
     // longer fit in 3.
     typedef enum logic [3:0] {
-        MSG_UNKNOWN    = 4'd0,  // unrecognised / malformed
-        MSG_LEGACY_RGF = 4'd1,  // {Rnnn,Cnnn,Vnnn}  - ACTIVE control path
-        MSG_REG_WRITE  = 4'd2,  // {W<A>, V<..>, V<..>}  recognised, not acted on
-        MSG_REG_READ   = 4'd3,  // {R<A>}                recognised, not acted on
-        MSG_PIX_WRITE  = 4'd4,  // {W<A>, P<R,G,B>}  - new in Stage 2A
-        MSG_PIX_READ   = 4'd5,  // {R<..>, C<..>, P<R,G,B>}  recognised, not acted on
-        MSG_BURST_HDR  = 4'd6,  // {I<..>, H<..>, W<..>}     reserved
-        MSG_BURST_READ = 4'd7,  // {R<A>, H<..>, W<..>}      reserved
-        MSG_BURST_DATA = 4'd8   // {<4 px>, <4 px>, <4 px>}  reserved
+        MSG_UNKNOWN    = 4'd0,  // unrecognised / malformed -> classifier_error
+        MSG_LEGACY_RGF = 4'd1,  // {Rnnn,Cnnn,Vnnn}         -> rx_parser, RGF write
+        MSG_REG_WRITE  = 4'd2,  // {W<A>, V<..>, V<..>}     -> rx_reg_write_parser
+        MSG_REG_READ   = 4'd3,  // {R<A>}                   -> rx_reg_read_parser
+        MSG_PIX_WRITE  = 4'd4,  // {W<A>, P<R,G,B>}         -> rx_pixel_wr_parser
+        MSG_PIX_READ   = 4'd5,  // {R<..>, C<..>, P<..>}    -> rx_pixel_rd_parser
+        MSG_BURST_HDR  = 4'd6,  // {I<..>, H<..>, W<..>}    -> rx_burst_hdr_parser
+        MSG_BURST_READ = 4'd7,  // {R<A>, H<..>, W<..>}     -> rx_burst_rd_parser
+        MSG_BURST_DATA = 4'd8   // {<4 px>,<4 px>,<4 px>}   -> rx_burst_data_parser
     } msg_kind_t;
+
+    // MSG_LEGACY_RGF and MSG_REG_WRITE are BOTH register-write paths and
+    // both remain live. The legacy ASCII frame carries a single 8-bit value;
+    // the binary frame carries a full 32-bit value and is the one the project
+    // specification defines. They are distinct kinds decided at byte 1
+    // ('R' vs 'W'), so a frame can never be both, and the legacy path is
+    // retained unchanged for backwards compatibility.
 
 endpackage : rx_msg_pkg

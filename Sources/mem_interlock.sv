@@ -1,12 +1,32 @@
 // mem_interlock.sv
 // ----------------
-// Stage 2C: minimal mutual exclusion between the image-read path and the
-// single-pixel write path on the 100 MHz memory domain.
+// Sole arbiter of the three channel SRAMs on the 100 MHz memory domain.
+// Every access to that memory is granted here; nothing reaches it any
+// other way.
 //
-// This is NOT the full arbiter. There is no drain barrier, no CTS hold-off
-// and no burst handling -- those belong to a later stage. It is the smallest
-// structure that makes read/write exclusion a property of the design rather
-// than an accident of UART timing.
+// This began as a minimal read/write interlock and has since grown to
+// cover every client. It now arbitrates THREE:
+//
+//   1. Full-frame image read   rom_sequencer, via read_go.
+//                              Owns the read port for a whole frame.
+//   2. Write path              sram_wr_ctrl, via wr_allowed. Serves BOTH
+//                              Single Pixel Write and Image Burst Write --
+//                              they are the same commands arriving through
+//                              the same 48-bit FIFO, so there is no
+//                              separate burst-write client here.
+//   3. Read-port borrower      pixel_rd_ctrl OR burst_rd_ctrl, via
+//                              pix_rd_req / pix_rd_gnt / pix_rd_done.
+//                              These two are arbitrated against each other
+//                              in chip_top BEFORE this module sees them,
+//                              and arrive as one shared request. The port
+//                              names still say "pix" for that reason -- see
+//                              the port comments below.
+//
+// Burst handling IS present: burst_active closes the inter-frame gaps in an
+// Image Burst Write (see the STAGE 3 / M4 section below). What is still
+// absent is a drain barrier and CTS hold-off -- writes retain priority over
+// a pending read, so a saturating write stream could in principle starve
+// reads. See LIVENESS at the end for why that cannot happen at UART rates.
 //
 // -----------------------------------------------------------------------
 // WHAT IT PREVENTS
@@ -47,7 +67,7 @@
 // The read_go/rom_seq_busy handover is contiguous with no gap, because
 // rom_sequencer registers busy from the NEXT state:
 //
-//     busy <= (next_state != IDLE);          // rom_sequencer.sv:203
+//     busy <= (next_state != IDLE);   // rom_sequencer.sv, final always_ff
 //
 // so busy is already high in the cycle after read_go. Were it registered
 // from the CURRENT state there would be a one-cycle hole here needing an
@@ -170,13 +190,28 @@ module mem_interlock (
     output logic wr_allowed,     // -> sram_wr_ctrl
 
     // -----------------------------------------------------------------
-    // SINGLE PIXEL READ: third client of the memory. It borrows the SRAM
-    // READ port for a handful of cycles, so it must exclude both the image
-    // reader (same port) and the writer (same memory).
+    // READ-PORT BORROWER: third client of the memory. It borrows the SRAM
+    // READ port, so it must exclude both the image reader (same port) and
+    // the writer (same memory).
     //
-    // pix_rd_req is a LEVEL, held by pixel_rd_ctrl until granted. A grant
+    // THE "pix" PREFIX IS HISTORICAL. This port pair was added for
+    // pixel_rd_ctrl alone, but burst_rd_ctrl is now a second borrower with
+    // identical needs. The two are arbitrated against each other inside
+    // chip_top and presented here as ONE shared request -- see
+    // shared_rd_req / shared_rd_gnt / shared_rd_done at the instantiation.
+    // This module deliberately does not know which of the two it is
+    // granting; from here they are one client, which is why no fourth
+    // port pair was added.
+    //
+    // Duration differs sharply between them and that is fine: a single
+    // pixel read holds the port for a handful of cycles, while a Burst
+    // Read holds it for the whole rectangle -- deliberately, so the
+    // returned region is a coherent snapshot (see burst_rd_ctrl.sv). Both
+    // are just "granted until done" from this module's point of view.
+    //
+    // The request is a LEVEL, held by the borrower until granted. A grant
     // latches pix_rd_active, which blocks read_go and wr_allowed until
-    // pix_rd_done releases it.
+    // done is asserted.
     // -----------------------------------------------------------------
     input  logic pix_rd_req,
     input  logic pix_rd_done,

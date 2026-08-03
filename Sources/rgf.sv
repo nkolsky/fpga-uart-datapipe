@@ -1,15 +1,44 @@
 // rgf.sv
 // ------
-// Config RGF - Lab 9 register file. BARE MINIMUM pass: exactly the four
-// spec registers, correct interlock/clear semantics, nothing else.
-// Robustness additions (invalid-address latching, reserved-bit write
-// masking) are a deliberate follow-up once this passes its own testbench
-// and integrates cleanly.
+// Config RGF - Lab 9/10 register file. SIX registers; see rgf_pkg.sv for
+// the full map, addresses and access types.
 //
-// Two independent write ports (PC-facing and internal status updates):
-// PC writes IMG_CTRL only; the Sequencer's internal status-update path
-// writes IMG_TX_MON and FIFO_STATUS. Neither writer ever targets the same
-// register as the other, so no arbitration is needed between them.
+// Robustness additions (invalid-address latching, reserved-bit write
+// masking) remain a deliberate follow-up and are not implemented here.
+// An unmapped read returns 0 and an unmapped write is silently dropped;
+// malformed addresses are already refused upstream by the register
+// parsers, so they do not reach this module.
+//
+// -----------------------------------------------------------------------
+// HOW EACH REGISTER IS WRITTEN -- THREE MECHANISMS, NO ARBITRATION NEEDED
+// -----------------------------------------------------------------------
+// There is no single "write port". Registers are updated by three
+// separate, non-overlapping mechanisms, which is why no arbitration
+// exists anywhere in this file:
+//
+//   1. PC port (pc_wen / pc_addr / pc_wdata)
+//        writes IMG_CTRL and CLK_CTRL -- and nothing else.
+//        Only these two are PC-writable.
+//
+//   2. Status port (status_wen / status_addr / status_wdata)
+//        writes IMG_TX_MON -- and nothing else.
+//        An earlier version of this header also claimed FIFO_STATUS was
+//        written through this bus. It is not, and never was in this
+//        implementation: see mechanism 3.
+//
+//   3. Dedicated hardware inputs, bypassing both buses entirely
+//        IMG_STATUS       <- img_height_in / img_width_in / img_ready_in
+//        FIFO_STATUS      <- fifo_full / empty / almost_full / almost_empty
+//                            (combinational passthrough, no storage at all)
+//        PARITY_FAULT_CNT <- parity_fault_incr (single-bit increment pulse,
+//                            not a value write -- the status_* bus has
+//                            "write this whole value" semantics and cannot
+//                            express "add one")
+//
+// No register is targeted by more than one mechanism. The ONLY place two
+// mechanisms can touch the same register in the same cycle is IMG_TX_MON,
+// where a status write can coincide with a PC read-to-clear -- resolved by
+// explicit priority below.
 //
 // IMG_CTRL interlock (see rgf_pkg.sv header for the full reasoning):
 //   A '1' write to start_img_read is accepted only if, at the moment of
@@ -45,9 +74,11 @@ module rgf (
     output logic [DATA_WIDTH-1:0] pc_rdata,
 
     // -----------------------------------------------------------------
-    // Internal status-update port - driven by Sequencer during image
-    // drain to keep IMG_TX_MON and FIFO_STATUS current. Write-only; the
-    // Sequencer never needs to read these back through this port.
+    // Internal status-update port - driven by the Sequencer during image
+    // drain to keep IMG_TX_MON current. IMG_TX_MON is the ONLY register
+    // reachable through this bus; FIFO_STATUS arrives on its own dedicated
+    // inputs below. Write-only; the Sequencer never needs to read back
+    // through this port.
     // -----------------------------------------------------------------
     input  logic                  status_wen,
     input  logic [ADDR_WIDTH-1:0] status_addr,

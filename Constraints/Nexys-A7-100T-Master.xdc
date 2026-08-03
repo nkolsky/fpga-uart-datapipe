@@ -22,7 +22,7 @@ create_clock -name sys_clk_pin -period 10.000 -waveform {0.000 5.000} [get_ports
 ## an LED pin. Both are false/safe, so waive them.
 ##
 ## The PLL clock is resolved off the clk_wiz WRAPPER OUTPUT pin
-## (u_clk_wiz_0/clk_out1), NOT the internal MMCM pin. The wrapper output name
+## (u_clocking_subsystem/u_clk_wiz_0/clk_out1), NOT the internal MMCM pin. The wrapper output name
 ## is stable across Clocking Wizard netlists, whereas the internal
 ## mmcm_adv_inst/CLKOUT0 pin name varies and did not match here (it produced
 ## an empty second group -> "No valid object(s) found for -group"). The
@@ -40,7 +40,7 @@ create_clock -name sys_clk_pin -period 10.000 -waveform {0.000 5.000} [get_ports
 ## ---------------------------------------------------------------------------
 set_clock_groups -asynchronous \
   -group [get_clocks -quiet sys_clk_pin] \
-  -group [get_clocks -quiet -of_objects [get_pins -quiet u_clk_wiz_0/clk_out1]]
+  -group [get_clocks -quiet -of_objects [get_pins -quiet u_clocking_subsystem/u_clk_wiz_0/clk_out1]]
 
 ##Switches
 #set_property -dict { PACKAGE_PIN J15   IOSTANDARD LVCMOS33 } [get_ports { SW[0] }]; #IO_L24N_T3_RS0_15 Sch=sw[0]

@@ -47,10 +47,35 @@
 // NOTE: val is a single 8-bit value (per the confirmed format), not a
 // 24-bit RGB triplet. It is zero-extended into the 24-bit `pixel` output
 // to keep the existing rx_classifier/sequencer port widths unchanged.
-// TODO: once the RGF read/write dispatch semantics are confirmed
-// (pending, see report), revisit whether `pixel` should carry this value
-// differently downstream -- this parser's decode itself is confirmed
-// correct against real PC traffic and does not depend on that answer.
+//
+// -----------------------------------------------------------------------
+// HOW THE THREE FIELDS ARE USED DOWNSTREAM -- RESOLVED
+// -----------------------------------------------------------------------
+// This carried a TODO asking whether `pixel` should travel differently
+// once the RGF dispatch semantics were settled. They are settled, and the
+// answer is no -- the zero-extension is the final arrangement. chip_top's
+// dispatcher (see its "Config RGF + dispatcher" section) reads the three
+// outputs as:
+//
+//   row   -> REGISTER INDEX, not a byte address. Index N maps to byte
+//            address N*4, matching rgf_pkg's 4-byte stride:
+//            0=IMG_STATUS, 1=IMG_TX_MON, 2=IMG_CTRL, 3=FIFO_STATUS,
+//            4=CLK_CTRL, 5=PARITY_FAULT_CNT
+//   col   -> READ/WRITE OPCODE, by parity. EVEN = write (every legacy
+//            command historically sent col=000, so existing tooling is
+//            unaffected), ODD = read.
+//   pixel -> WRITE DATA, zero-extended to the RGF's 32-bit pc_wdata.
+//
+// The 8-bit ceiling on write data is a real limitation of this legacy
+// format and is the reason the binary Register Write message
+// {W<A>,V<..>,V<..>} exists -- that path (rx_reg_write_parser) is the
+// only one that can write the upper 24 bits of a register. Both paths
+// are retained deliberately and are distinct msg_kinds, so they can
+// never collide on one frame.
+//
+// Examples: {R002,C000,V001} writes IMG_CTRL.start (trigger an image
+// send); {R001,C001,V000} reads IMG_TX_MON (and read-to-clears it,
+// re-arming the interlock).
 
 `timescale 1ns/1ps
 
