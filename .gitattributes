@@ -1,0 +1,28 @@
+# Automatically detect text files
+* text=auto
+
+# HDL source files
+*.sv   text eol=lf
+*.svh  text eol=lf
+*.v    text eol=lf
+*.vh   text eol=lf
+
+# Constraints and scripts
+*.xdc  text eol=lf
+*.tcl  text eol=lf
+*.py   text eol=lf
+
+# Memory initialization files
+*.mem  text eol=lf
+*.coe  text eol=lf
+
+# Windows scripts
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+
+# Binary files
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.pdf  binary
+*.bit  binary
