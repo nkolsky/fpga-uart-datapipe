@@ -245,63 +245,52 @@ uart_tx_subsystem u_uart_tx_subsystem (
 );
 
 // -----------------------------------------------------------------------------
-// UART receive interconnect (130 MHz)
+// RX subsystem interconnect (130 MHz)
 // -----------------------------------------------------------------------------
 logic        rx_phy_busy;
-
-logic         rx_mac_msg_valid;
-logic [127:0] rx_mac_msg_data;
-logic         rx_mac_busy;
-
+logic        rx_mac_busy;
 logic        rx_parity_err_pulse;
 
-rx_msg_pkg::msg_kind_t             rx_msg_kind_q;      // FINAL, latched
-logic                              rx_bypass_active;   // command subsystem -> RX decoder
+logic        rx_burst_active;
 
-// -----------------------------------------------------------------------------
-// UART receive subsystem (130 MHz)
-// -----------------------------------------------------------------------------
-uart_rx_subsystem u_uart_rx_subsystem (
-    .clk                 (pll_clk_out),
-    .rst_n               (sync_pll_rst_n),
-    .rx_in               (UART_TXD_IN),
-    .bypass_active       (rx_bypass_active),      // <- rx_burst_ctrl
-    .rx_phy_busy         (rx_phy_busy),
-    .rx_parity_err_pulse (rx_parity_err_pulse),
-    .rx_mac_msg_valid    (rx_mac_msg_valid),
-    .rx_mac_msg_data     (rx_mac_msg_data),
-    .rx_msg_kind_q       (rx_msg_kind_q),
-    .rx_mac_busy         (rx_mac_busy)
-);
-
-// -----------------------------------------------------------------------------
-// Command-processing subsystem (130 MHz)
-// -----------------------------------------------------------------------------
 logic        rx_classifier_valid;
 logic        rx_classifier_error;
 logic [9:0]  rx_row_q, rx_col_q;
 logic [23:0] rx_pixel_q;
 
-logic        rx_burst_active;
-
 logic        rx_rr_cmd_valid;
-logic [5:0]  rx_rr_cmd_addr;
+logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rr_cmd_addr;
 logic        rx_rw_cmd_valid;
-logic [5:0]  rx_rw_cmd_addr;
-logic [31:0] rx_rw_cmd_data;
+logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rw_cmd_addr;
+logic [rgf_pkg::DATA_WIDTH-1:0] rx_rw_cmd_data;
 
 logic        pix_wr_seen_sticky;
 logic        cmd_ovf_sticky;
 
-command_processing_subsystem u_command_processing_subsystem (
+// -----------------------------------------------------------------------------
+// RX subsystem (130 MHz)
+//
+// Merged from uart_rx_subsystem + command_processing_subsystem. rx_mac_msg_valid,
+// rx_mac_msg_data, rx_msg_kind_q and rx_bypass_active were only ever wires
+// between those two modules and are now internal to this one.
+// -----------------------------------------------------------------------------
+rx_subsystem u_rx_subsystem (
     .clk                  (pll_clk_out),
     .rst_n                (sync_pll_rst_n),
-    .rx_mac_msg_valid     (rx_mac_msg_valid),
-    .rx_mac_msg_data      (rx_mac_msg_data),
-    .rx_msg_kind_q        (rx_msg_kind_q),
-    .cmd_fifo_full        (cmd_fifo_full),
 
-    .rx_bypass_active     (rx_bypass_active),
+    .rx_in                (UART_TXD_IN),
+
+    // The RX subsystem speaks plain ready/valid. Adapting that to whatever
+    // carries commands into the 100 MHz domain is chip_top's job -- today an
+    // async FIFO, hence the !full.
+    .cmd_ready            (!cmd_fifo_full),
+    .cmd_valid            (cmd_fifo_wr_en),
+    .cmd_data             (cmd_fifo_wr_data),
+
+    .rx_phy_busy          (rx_phy_busy),
+    .rx_parity_err_pulse  (rx_parity_err_pulse),
+    .rx_mac_busy          (rx_mac_busy),
+
     .rx_burst_active      (rx_burst_active),
 
     .rx_classifier_valid  (rx_classifier_valid),
@@ -326,8 +315,6 @@ command_processing_subsystem u_command_processing_subsystem (
     .rx_br_cmd_height     (rx_br_cmd_height),
     .rx_br_cmd_width      (rx_br_cmd_width),
 
-    .cmd_fifo_wr_en       (cmd_fifo_wr_en),
-    .cmd_fifo_wr_data     (cmd_fifo_wr_data),
     .pix_wr_seen_sticky   (pix_wr_seen_sticky),
     .cmd_ovf_sticky       (cmd_ovf_sticky)
 );
@@ -484,9 +471,11 @@ assign rgf_src_is_write = rx_classifier_valid ? !rx_col_q[0]
                         : rx_rw_cmd_valid     ? 1'b1
                         :                       1'b0;
 
+// rx_rw_cmd_addr / rx_rr_cmd_addr are now rgf_pkg::ADDR_WIDTH wide and need
+// no padding. The legacy path still forms a word address from the row field.
 assign rgf_src_addr     = rx_classifier_valid ? {rx_row_q[5:0], 2'b00}
-                        : rx_rw_cmd_valid     ? {2'b00, rx_rw_cmd_addr}
-                        :                       {2'b00, rx_rr_cmd_addr};
+                        : rx_rw_cmd_valid     ? rx_rw_cmd_addr
+                        :                       rx_rr_cmd_addr;
 
 assign rgf_src_wdata    = rx_classifier_valid ? {8'b0, rx_pixel_q}
                         : rx_rw_cmd_valid     ? rx_rw_cmd_data

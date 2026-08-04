@@ -17,14 +17,14 @@
 // no re-timing.
 //
 //   cycle  state    slot  action at the edge                cmd_valid during
-//   N      B_ACTIVE   -    latch 4 pixels, slot<=0              0
-//   N+1    B_EMIT     0    load cmd(slot0), slot<=1             0
-//   N+2    B_EMIT     1    accept slot0, load slot1, slot<=2    1  <- slot 0
-//   N+3    B_EMIT     2    accept slot1, load slot2, slot<=3    1  <- slot 1
-//   N+4    B_EMIT     3    accept slot2, load slot3, slot<=4    1  <- slot 2
-//   N+5    B_EMIT     4    accept slot3, walk complete -> exit  1  <- slot 3
-//   N+6    B_ACTIVE   -                                         0
-//        or B_DONE
+//   N      RXBURST_ACTIVE   -    latch 4 pixels, slot<=0              0
+//   N+1    RXBURST_EMIT     0    load cmd(slot0), slot<=1             0
+//   N+2    RXBURST_EMIT     1    accept slot0, load slot1, slot<=2    1  <- slot 0
+//   N+3    RXBURST_EMIT     2    accept slot1, load slot2, slot<=3    1  <- slot 1
+//   N+4    RXBURST_EMIT     3    accept slot2, load slot3, slot<=4    1  <- slot 2
+//   N+5    RXBURST_EMIT     4    accept slot3, walk complete -> exit  1  <- slot 3
+//   N+6    RXBURST_ACTIVE   -                                         0
+//        or RXBURST_DONE
 //
 // cmd_valid still occupies N+2..N+5 exactly as before, so the interface
 // contract chip_top depends on is unchanged.
@@ -42,9 +42,9 @@
 // Exiting on the load would allow:
 //
 //   cycle  slot  action                     cmd_valid  state     bypass
-//   T       3    load final cmd, -> B_DONE      1       B_EMIT      1
-//   T+1     -    cmd_ready low, held           1       B_DONE      1
-//   T+2     -    still held                    1       B_IDLE      0   <-- !
+//   T       3    load final cmd, -> RXBURST_DONE      1       RXBURST_EMIT      1
+//   T+1     -    cmd_ready low, held           1       RXBURST_DONE      1
+//   T+2     -    still held                    1       RXBURST_IDLE      0   <-- !
 //
 // At T+2 the command is still on the interface but bypass_active has gone
 // low, so chip_top's command-source mux would have switched away from this
@@ -61,7 +61,7 @@
 //
 // First command two cycles after msg_valid; four commands on four
 // consecutive cycles. A frame is fully consumed in five cycles against ~176
-// cycles between frames at 8.125 Mbaud, so B_EMIT is never still busy when
+// cycles between frames at 8.125 Mbaud, so RXBURST_EMIT is never still busy when
 // the next frame arrives.
 //
 // =======================================================================
@@ -146,7 +146,7 @@
 // Every exit funnels through one term so a timeout or an explicit abort
 // command can be added later without restructuring the FSM:
 //
-//     if (burst_abort) state <= B_IDLE;
+//     if (burst_abort) state <= RXBURST_IDLE;
 //
 // burst_abort is a real port, expected to be tied inactive for now, leaving
 // reset as the only external recovery path -- the agreed first-implementation
@@ -157,8 +157,8 @@
 
 module rx_burst_ctrl
     import memory_pkg::*;
-    import rx_msg_pkg::*;
-    import rx_burst_pkg::*;
+    import msg_format_pkg::*;
+    import rx_burst_ctrl_pkg::*;
 #(
     parameter int IMG_W = IMG_WIDTH,    // 256
     parameter int IMG_H = IMG_HEIGHT    // 256
@@ -167,17 +167,24 @@ module rx_burst_ctrl
     input  logic rst_n,
 
     // ---- from rx_mac ---------------------------------------------------
-    input  logic      msg_valid,     // one-cycle pulse, frame complete
-    input  msg_kind_t msg_kind,      // rx_mac's LATCHED msg_kind_q
+    input  logic      msg_valid,     // rx_mac frame_done, one cycle
+    input  msg_kind_t msg_kind,      // from rx_msg_parser, combinational
 
-    // ---- from rx_burst_hdr_parser (combinational on the same frame) ----
-    input  logic                   hdr_valid,
+    // ---- header, combinational on the same frame -----------------------
+    // Frame SHAPE is rx_mac's guarantee -- a frame only reaches here if it
+    // opened on '{', carried a legal delimiter at every delimiter position
+    // and closed on '}'. There is no hdr_frame_ok input any more. The
+    // DIMENSION range check is performed here; see hdr_dims_ok below.
     input  logic [BURST_DIM_W-1:0] height,
     input  logic [BURST_DIM_W-1:0] width,
 
-    // ---- from rx_burst_data_parser (combinational on the same frame) ---
-    input  logic                                          data_frame_ok,
+    // ---- payload, from rx_msg_parser -----------------------------------
     input  logic [BURST_PIX_PER_MSG-1:0][BURST_PIX_W-1:0] pixels,
+
+    // rx_mac's framing fault. During a burst this is the only way a
+    // malformed data frame can announce itself: a frame that fails framing
+    // never completes, so no data_seen pulse is generated for it.
+    input  logic                                          frame_err,
 
     // ---- recovery ------------------------------------------------------
     input  logic burst_abort,
@@ -189,7 +196,7 @@ module rx_burst_ctrl
     output logic [BURST_PIX_W-1:0]  cmd_pixel,
 
     // ---- mode ----------------------------------------------------------
-    output logic bypass_active,   // -> rx_msg_decode  (this clock domain)
+    output logic bypass_active,   // -> rx_msg_parser  (this clock domain)
     output logic burst_active,    // -> mem_interlock  (needs synchronising)
 
     // ---- status --------------------------------------------------------
@@ -206,14 +213,14 @@ module rx_burst_ctrl
     // -----------------------------------------------------------------
     // State
     // -----------------------------------------------------------------
-    burst_state_t state;
+    rx_burst_state_t state;
 
     logic [ROW_W-1:0] base_row, burst_row, h_last;
     logic [COL_W-1:0] base_col, burst_col, w_last;
 
     // One bit wider than the slot index so the counter can reach
     // BURST_PIX_PER_MSG, giving "walk complete" its own distinct value.
-    // Exiting B_EMIT from that value -- rather than from the last slot --
+    // Exiting RXBURST_EMIT from that value -- rather than from the last slot --
     // is what guarantees the final command has been ACCEPTED, not merely
     // loaded, before the mode outputs drop.
     logic [BURST_SLOT_W:0] slot;
@@ -253,9 +260,36 @@ module rx_burst_ctrl
     assign at_last_pixel = (burst_row == h_last) && at_last_col;
 
     // -----------------------------------------------------------------
+    // HEADER DIMENSION CHECK -- lives here, not in the parser.
+    //
+    // H and W are only meaningful against the image geometry, which is this
+    // module's business and not the message format's. rx_msg_parser reports
+    // whether the frame is SHAPED correctly; whether a 300-row rectangle
+    // fits in a 256-row image is a different question, and answering it in
+    // the parser would make the protocol package depend on memory_pkg.
+    //
+    // This module also NEEDS the guarantee locally. The origin load below
+    // computes height-1 and width-1; with height == 0 that underflows and
+    // h_last wraps to its maximum, turning an empty rectangle into a
+    // full-height walk. Previously the guarantee was made in
+    // rx_burst_hdr_parser and merely relied upon here, so the correctness of
+    // this module depended on a check in a file it did not reference.
+    //
+    // The expression is lifted unchanged from rx_burst_hdr_parser.
+    // -----------------------------------------------------------------
+    logic hdr_dims_ok, hdr_valid;
+
+    assign hdr_dims_ok = (height != '0) &&
+                         (height <= BURST_DIM_W'(IMG_H)) &&
+                         (width  != '0) &&
+                         (width  <= BURST_DIM_W'(IMG_W));
+
+    assign hdr_valid   = hdr_dims_ok;
+
+    // -----------------------------------------------------------------
     // Frame acceptance
     //
-    // A header is accepted ONLY in B_IDLE. Once bypass_active is asserted,
+    // A header is accepted ONLY in RXBURST_IDLE. Once bypass_active is asserted,
     // rx_msg_decode classifies every frame as MSG_BURST_DATA, so a header
     // frame arriving mid-burst is genuinely pixel data by the spec's own
     // opcode-bypass rule. The msg_kind == MSG_BURST_HDR test below is
@@ -288,16 +322,16 @@ module rx_burst_ctrl
     // is necessarily non-empty, so mem_interlock's wr_pending term
     // (!cmd_empty) already blocks a read for exactly that window.
     // -----------------------------------------------------------------
-    assign bypass_active = (state != B_IDLE);
-    assign burst_active  = (state != B_IDLE);
-    assign burst_done    = (state == B_DONE);
+    assign bypass_active = (state != RXBURST_IDLE);
+    assign burst_active  = (state != RXBURST_IDLE);
+    assign burst_done    = (state == RXBURST_DONE);
 
     // -----------------------------------------------------------------
     // Main sequential block
     // -----------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state            <= B_IDLE;
+            state            <= RXBURST_IDLE;
             base_row         <= '0;
             base_col         <= '0;
             burst_row        <= '0;
@@ -323,7 +357,7 @@ module rx_burst_ctrl
             // -----------------------------------------------------------
             // Ready/valid: a presented command is cleared ONLY when it is
             // accepted. It is never withdrawn, never modified while
-            // pending, and never skipped. B_EMIT below may re-raise it in
+            // pending, and never skipped. RXBURST_EMIT below may re-raise it in
             // the same cycle to present the next slot with no bubble.
             // -----------------------------------------------------------
             if (cmd_fire) cmd_valid <= 1'b0;
@@ -342,17 +376,17 @@ module rx_burst_ctrl
             // command.
             // -----------------------------------------------------------
             if (burst_abort) begin
-                state     <= B_IDLE;
+                state     <= RXBURST_IDLE;
                 cmd_valid <= 1'b0;
             end
             else begin
                 unique case (state)
 
                 // -------------------------------------------------------
-                // B_IDLE -- not in a burst. bypass_active is low, so frames
+                // RXBURST_IDLE -- not in a burst. bypass_active is low, so frames
                 // are opcode-decoded normally and a header can be seen.
                 // -------------------------------------------------------
-                B_IDLE: begin
+                RXBURST_IDLE: begin
                     if (hdr_seen) begin
                         if (hdr_valid) begin
                             // ORIGIN LOAD. This is the ONLY place the base
@@ -364,19 +398,19 @@ module rx_burst_ctrl
                             base_col  <= '0;
 
                             // Store the LAST index rather than the count, so
-                            // the comparisons stay narrow. height and width
-                            // are already validated in [1, IMG_H/IMG_W], so
-                            // height-1 fits in ROW_W bits.
-                            // Subtract in the field width, then narrow.
-                            // height/width are validated in [1, IMG_H/IMG_W],
-                            // so the decremented value always fits.
+                            // the comparisons stay narrow. hdr_dims_ok above
+                            // guarantees height and width are in
+                            // [1, IMG_H] / [1, IMG_W], so the decrement
+                            // cannot underflow and the result fits in
+                            // ROW_W / COL_W bits. Subtract at field width,
+                            // then narrow.
                             h_last    <= ROW_W'(height - BURST_DIM_W'(1));
                             w_last    <= COL_W'(width  - BURST_DIM_W'(1));
 
                             burst_row <= '0;
                             burst_col <= '0;
                             done_flag <= 1'b0;
-                            state     <= B_ACTIVE;
+                            state     <= RXBURST_ACTIVE;
                         end
                         else begin
                             err_hdr_invalid <= 1'b1;   // stay idle
@@ -389,20 +423,18 @@ module rx_burst_ctrl
                 end
 
                 // -------------------------------------------------------
-                // B_ACTIVE -- bypass on, waiting for the next data frame.
+                // RXBURST_ACTIVE -- bypass on, waiting for the next data frame.
                 // -------------------------------------------------------
-                B_ACTIVE: begin
+                RXBURST_ACTIVE: begin
                     if (data_seen) begin
-                        if (data_frame_ok) begin
-                            px_latch <= pixels;
-                            slot     <= '0;
-                            state    <= B_EMIT;
-                        end
-                        else begin
-                            // Malformed frame: no commands, position and
-                            // counters untouched, burst stays armed.
-                            err_data_invalid <= 1'b1;
-                        end
+                        px_latch <= pixels;
+                        slot     <= '0;
+                        state    <= RXBURST_EMIT;
+                    end
+                    else if (frame_err) begin
+                        // rx_mac rejected the frame on framing. No commands,
+                        // position and counters untouched, burst stays armed.
+                        err_data_invalid <= 1'b1;
                     end
                     else if (hdr_seen) begin
                         // Defensive: cannot occur while bypass is on.
@@ -411,13 +443,13 @@ module rx_burst_ctrl
                 end
 
                 // -------------------------------------------------------
-                // B_EMIT -- serialise up to four pixels, one per clock.
+                // RXBURST_EMIT -- serialise up to four pixels, one per clock.
                 //
                 // All four slots are visited uniformly. Slots at or beyond
                 // completion are host padding: they consume a cycle but
                 // emit nothing and do not advance the position.
                 // -------------------------------------------------------
-                B_EMIT: begin
+                RXBURST_EMIT: begin
                     if (msg_valid) begin
                         // A frame arrived while still serialising. Cannot
                         // happen at UART rates (5 cycles of work against
@@ -437,7 +469,7 @@ module rx_burst_ctrl
                             // -- cmd_slot_free guarantees the last command
                             // either never existed or is firing this cycle.
                             // Only now may the mode outputs drop.
-                            state <= done_flag ? B_DONE : B_ACTIVE;
+                            state <= done_flag ? RXBURST_DONE : RXBURST_ACTIVE;
                         end
                         else if (done_flag) begin
                             // Padding slot -- consumes a cycle, emits
@@ -474,14 +506,14 @@ module rx_burst_ctrl
                 end
 
                 // -------------------------------------------------------
-                // B_DONE -- one cycle. burst_done pulses here and the mode
+                // RXBURST_DONE -- one cycle. burst_done pulses here and the mode
                 // outputs drop as the state returns to idle.
                 // -------------------------------------------------------
-                B_DONE: begin
-                    state <= B_IDLE;
+                RXBURST_DONE: begin
+                    state <= RXBURST_IDLE;
                 end
 
-                default: state <= B_IDLE;
+                default: state <= RXBURST_IDLE;
                 endcase
             end
         end
@@ -507,10 +539,10 @@ module rx_burst_ctrl
     ) else $error("%m: slot advanced while a command was still pending");
 
     // burst_done means EVERY real command has been accepted by the FIFO,
-    // not merely presented. B_DONE is unreachable with a command pending.
+    // not merely presented. RXBURST_DONE is unreachable with a command pending.
     a_done_means_accepted: assert property (
         @(posedge clk) disable iff (!rst_n)
-        (state == B_DONE) |-> !cmd_valid
+        (state == RXBURST_DONE) |-> !cmd_valid
     ) else $error("%m: burst_done pulsed with a command still pending");
 
     // The mode outputs must not drop while a command is on the interface,
@@ -523,20 +555,20 @@ module rx_burst_ctrl
     // Padding must never produce a command.
     a_no_cmd_after_done: assert property (
         @(posedge clk) disable iff (!rst_n)
-        (state == B_EMIT && done_flag && cmd_slot_free) |=> !cmd_valid
+        (state == RXBURST_EMIT && done_flag && cmd_slot_free) |=> !cmd_valid
     ) else $error("%m: command emitted for a padding slot");
 
     // The mode outputs must track the FSM exactly.
     a_bypass_tracks_state: assert property (
         @(posedge clk) disable iff (!rst_n)
-        bypass_active == (state != B_IDLE)
+        bypass_active == (state != RXBURST_IDLE)
     ) else $error("%m: bypass_active does not track the FSM");
 
     // Abort must reach idle in one cycle from anywhere.
     a_abort_is_immediate: assert property (
         @(posedge clk) disable iff (!rst_n)
-        burst_abort |=> (state == B_IDLE)
-    ) else $error("%m: burst_abort did not return to B_IDLE");
+        burst_abort |=> (state == RXBURST_IDLE)
+    ) else $error("%m: burst_abort did not return to RXBURST_IDLE");
 `endif
 
 endmodule : rx_burst_ctrl

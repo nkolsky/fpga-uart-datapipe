@@ -1,89 +1,172 @@
 // rx_mac.sv
 // ---------
-// 4-state Moore FSM UART receiver - MAC layer.
-// Updated to ensure stable msg_data output.
+// Collects bytes from the RX PHY into a frame buffer, finds the frame
+// boundaries itself, and announces the result.
 //
-// -----------------------------------------------------------------------
-// STAGE 2A: VARIABLE-LENGTH FRAMER
-// -----------------------------------------------------------------------
-// This module is now a variable-length framer. The name is retained for
-// this milestone to keep the diff auditable; "MAC" here means byte
-// collection and frame-boundary detection only.
+// =======================================================================
+// THE FRAMING CONTRACT
+// =======================================================================
+// Every message has the same skeleton:
 //
-// It holds NO protocol knowledge. It counts bytes up to expected_len,
-// which rx_msg_decode derives combinationally from the live buffer. The
-// only structural change from the fixed-16 version is the terminal
-// comparison in MAC_CHK_DONE.
+//   byte  0        '{'
+//   byte  1        opcode         <- parser
+//   bytes 2..4     payload        <- parser
+//   byte  5        ',' or '}'
+//   byte  6        opcode         <- parser
+//   bytes 7..9     payload        <- parser
+//   byte 10        ',' or '}'
+//   byte 11        opcode         <- parser
+//   bytes 12..14   payload        <- parser
+//   byte 15        '}'
 //
-// Why count-based and not delimiter-based: payload bytes in the Final
-// Project message set are raw binary and can legitimately equal '{'
-// (0x7B) or '}' (0x7D), so scanning for a closing brace would truncate
-// valid frames.
+// THIS MODULE OWNS BYTES 0, 5, 10 AND 15. Nothing else. It never inspects an
+// opcode and never extracts a field. rx_msg_parser owns 1, 6 and 11 and
+// extracts 2-4, 7-9 and 12-14. The two never look at the same byte.
 //
-// BYTE-COUNT TIMING CONTRACT (see rx_msg_decode.sv for the full trace):
-//   byte_idx increments in MAC_STORE alongside the buffer write, both
-//   non-blocking on the same edge. So on entry to MAC_CHK_DONE the
-//   newest byte is already committed to msg_buf and byte_idx already
-//   counts it. byte_cnt therefore means BYTES ALREADY STORED, not the
-//   next storage index, and the decode sees the decisive byte on the
-//   exact cycle the decision is made -- never one cycle late.
+// A '}' at byte 5 ends the frame at 6 bytes; at byte 10, at 11 bytes.
 //
-// PROVISIONAL VS FINAL KIND:
-//   msg_kind_prov changes as bytes arrive and is meaningful only once
-//   the frame is complete. It is latched here into msg_kind_q during
-//   MAC_DONE, in the same cycle and the same manner as msg_data.
-//   Downstream logic must act only on msg_valid / msg_data / msg_kind_q.
+// =======================================================================
+// WHY THIS IS SAFE, AND WHY A DELIMITER SEARCH WOULD NOT BE
+// =======================================================================
+// Payload is RAW BINARY. A pixel value of 123 is 0x7B, which is '{'. A
+// dimension byte of 125 is 0x7D, which is '}'. Hunting for a delimiter
+// anywhere in the frame would truncate legitimate messages constantly.
+//
+// The stride is what makes it safe: delimiters occur ONLY at byte indices
+// 0, 5, 10 and 15, and payload occurs only at indices that are not those. The
+// check here is POSITIONAL -- it looks at byte 5 and asks what it is, never
+// asks where the next '}' is. A 0x7D at byte 7 is a payload byte and is never
+// examined.
+//
+// =======================================================================
+// WHAT THIS REPLACED
+// =======================================================================
+// The MAC used to receive expected_len from the parser and count up to it.
+// That made the parser's combinational decode part of this FSM's next-state
+// logic, and it created a zero-margin case: a 6-byte register read had its
+// length resolved by byte 5 -- the very byte that completed it. Correct, but
+// only because the parser saw the newest byte in the same cycle the MAC
+// compared against it.
+//
+// Deriving the boundary locally removes both. There is no expected_len, no
+// feedback from parser to MAC, and dataflow is strictly one-directional:
+//
+//   rx_mac --frame_buf, byte_cnt, frame_done, frame_err--> rx_msg_parser
+//
+// It also removed bypass_active from this module entirely. A burst data frame
+// is {<4 bytes>,<4 bytes>,<4 bytes>} -- ',' at 5 and 10, '}' at 15 -- so the
+// positional rule frames it with no special case. bypass_active still goes to
+// the parser, which must know those frames carry no opcodes, but that is
+// classification, not framing.
+//
+// =======================================================================
+// THE START GATE
+// =======================================================================
+// A frame may only begin on '{'. In IDLE with an empty buffer, any other byte
+// is discarded where it stands: not stored, not counted, no state change.
+// Mid-frame bytes are accepted unconditionally, because payload is raw binary
+// and 0x7B is a legal value there.
+//
+// Combined with MAC_ERR this also handles truncation. A frame abandoned
+// part-way used to leave byte_idx non-zero with no way back, so the host's
+// next '{' was swallowed as payload and the two frames spliced. Now a
+// malformed delimiter aborts to MAC_ERR, byte_idx clears, and the start gate
+// discards bytes until a real '{' arrives.
+//
+// =======================================================================
+// ONE BUFFER, NO COPY
+// =======================================================================
+// There is no separate published register. frame_buf is both the live tap the
+// parser sees as the frame fills and the completed frame consumers read while
+// frame_done is high, so the buffer is NOT cleared at the end of a frame.
+// Positions at or above byte_cnt hold stale bytes from the previous message;
+// consumers read the buffer only when frame_done is high, at which point
+// byte_cnt bounds exactly which bytes are real.
 
 `timescale 1ns/1ps
 
 import rx_mac_pkg::*;
 
 module rx_mac
-    import rx_msg_pkg::*;
+    import msg_format_pkg::*;
 (
     input  logic         clk,
     input  logic         rst_n,
 
-    // RX PHY interface
+    // ---- RX PHY interface ----------------------------------------------
     input  logic         byte_valid,
     input  logic [7:0]   rx_byte,
-    
-    //Parity check from RX PHY for soft reset
-    input  logic         par_val_rst, //pulses High when parity error is detected
 
-    // -----------------------------------------------------------------
-    // Framing control from rx_msg_decode (combinational)
-    // -----------------------------------------------------------------
-    input  logic [BYTE_CNT_W-1:0] expected_len,   // total bytes in this frame
-    input  msg_kind_t             msg_kind_prov,  // provisional; latched below
+    // Parity error from the RX PHY -- soft reset.
+    input  logic         par_val_rst,
 
-    // -----------------------------------------------------------------
-    // Live frame state out to rx_msg_decode. This is the LIVE tap: the
-    // buffer as it fills, not the stable copy. Distinct from msg_data.
-    // -----------------------------------------------------------------
-    output logic [127:0]          frame_buf,
+    // ---- frame out ------------------------------------------------------
+    output logic [FRAME_W-1:0]    frame_buf,
     output logic [BYTE_CNT_W-1:0] byte_cnt,
 
-    // -----------------------------------------------------------------
-    // Upstream interface (registered tap -- stable while msg_valid high)
-    // -----------------------------------------------------------------
-    output logic         msg_valid,
-    output logic [127:0] msg_data,
-    output msg_kind_t    msg_kind_q,   // final classification of msg_data
+    // One cycle each, mutually exclusive.
+    //   frame_done : a complete, correctly delimited frame is in frame_buf
+    //   frame_err  : a delimiter position held the wrong byte; frame abandoned
+    output logic         frame_done,
+    output logic         frame_err,
+
     output logic         mac_busy
 );
 
 // -------------------------------------------------------------------------
 // Internal registers
 // -------------------------------------------------------------------------
-rx_mac_state_t cur_state, next_state;
-logic [127:0] msg_buf;
-logic [4:0]   byte_idx;
-logic [7:0]   rx_byte_latch;
+// Width of the byte-lane selector. MSG_BYTES_MAX lanes need this many bits.
+localparam int LANE_W = $clog2(MSG_BYTES_MAX);
 
+rx_mac_state_t cur_state, next_state;
+logic [FRAME_W-1:0]    msg_buf;
+logic [BYTE_CNT_W-1:0] byte_idx;
+logic [7:0]            rx_byte_latch;
+
+// -------------------------------------------------------------------------
+// Start gate
+// -------------------------------------------------------------------------
+logic at_frame_start;
+logic byte_accept;
+
+assign at_frame_start = (cur_state == MAC_DONE) ||
+                        (cur_state == MAC_ERR)  ||
+                        (byte_idx  == '0);
+
+assign byte_accept = byte_valid &&
+                     (!at_frame_start || (rx_byte == CHAR_OPEN_BRACE));
+
+// -------------------------------------------------------------------------
+// Delimiter position test
+//
+// byte_idx counts bytes ALREADY STORED, so a count of 6, 11 or 16 means the
+// newest byte sits at index 5, 10 or 15. Those counts are exactly the legal
+// frame lengths -- MSG_BYTES_nGRP -- because a frame ends on its delimiter.
+// The constants come from msg_format_pkg, so the positions are DEFINED in one
+// place and merely referenced here.
+// -------------------------------------------------------------------------
+logic at_delim, at_last_delim;
+logic last_is_close, last_is_comma;
+
+assign at_delim = (byte_idx == BYTE_CNT_W'(MSG_BYTES_1GRP)) ||
+                  (byte_idx == BYTE_CNT_W'(MSG_BYTES_2GRP)) ||
+                  (byte_idx == BYTE_CNT_W'(MSG_BYTES_3GRP));
+
+// Byte 15. Only '}' is legal here -- a comma would imply a fourth group,
+// which does not exist. This is also the backstop that stops a frame running
+// past the buffer.
+assign at_last_delim = (byte_idx == BYTE_CNT_W'(MSG_BYTES_3GRP));
+
+assign last_is_close = (rx_byte_latch == CHAR_CLOSE_BRACE);
+assign last_is_comma = (rx_byte_latch == CHAR_COMMA);
+
+// -------------------------------------------------------------------------
+// State register
+// -------------------------------------------------------------------------
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n || par_val_rst) cur_state <= MAC_IDLE;
-    else        cur_state <= next_state;
+    else                       cur_state <= next_state;
 end
 
 // -------------------------------------------------------------------------
@@ -93,24 +176,32 @@ always_comb begin : next_state_logic
     next_state = cur_state;
 
     case (cur_state)
+        // A byte that is not '{' at a frame start is dropped here: no state
+        // change, so it is never stored and never counted.
         MAC_IDLE:
-            if (byte_valid) next_state = MAC_STORE;
+            if (byte_accept) next_state = MAC_STORE;
 
         MAC_STORE:
-            next_state = MAC_CHK_DONE;
+            next_state = MAC_CHK;
 
-        // STAGE 2A: the only structural change. Previously compared
-        // against the constant 5'd16. byte_idx holds the number of bytes
-        // already stored, and the newest byte was committed on the edge
-        // entering this state, so expected_len is evaluated against a
-        // buffer that already contains the deciding byte.
-        MAC_CHK_DONE:
-            if (byte_idx == expected_len) next_state = MAC_DONE;
-            else                          next_state = MAC_IDLE;
+        MAC_CHK: begin
+            if (!at_delim)
+                next_state = MAC_IDLE;              // ordinary byte, continue
+            else if (last_is_close)
+                next_state = MAC_DONE;              // frame ends here
+            else if (last_is_comma && !at_last_delim)
+                next_state = MAC_IDLE;              // another group follows
+            else
+                next_state = MAC_ERR;               // wrong byte at a delimiter
+        end
 
         MAC_DONE:
-            if (byte_valid) next_state = MAC_STORE;
-            else            next_state = MAC_IDLE;
+            if (byte_accept) next_state = MAC_STORE;
+            else             next_state = MAC_IDLE;
+
+        MAC_ERR:
+            if (byte_accept) next_state = MAC_STORE;
+            else             next_state = MAC_IDLE;
 
         default:
             next_state = MAC_IDLE;
@@ -118,12 +209,13 @@ always_comb begin : next_state_logic
 end : next_state_logic
 
 // -------------------------------------------------------------------------
-// Datapath
+// Byte latch
 // -------------------------------------------------------------------------
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
         rx_byte_latch <= 8'h00;
-    else if ((cur_state == MAC_IDLE || cur_state == MAC_DONE) && byte_valid)
+    else if ((cur_state == MAC_IDLE || cur_state == MAC_DONE ||
+              cur_state == MAC_ERR) && byte_accept)
         rx_byte_latch <= rx_byte;
 end
 
@@ -136,166 +228,129 @@ end
 //     msg_buf[127 - (byte_idx[3:0] * 8) -: 8] <= rx_byte_latch;
 //
 // Functionally correct, but it placed a chain of arithmetic between byte_idx's
-// flop output and the clock enable of every msg_buf bit. In one cycle Vivado
-// had to build, in this order:
+// flop output and the clock enable of every msg_buf bit: a 7-bit shift, an
+// 8-bit subtractor with its carry chain, and a variable part-select off that
+// base. That was an 11-level cone ending on msg_buf_reg[*]/CE -- 3.518 ns
+// logic + 3.960 ns routing = 7.478 ns against a 7.692 ns period,
+// WNS -0.153 ns. The failure was on the ENABLE, not the data.
 //
-//   1. byte_idx[3:0] * 8        a 7-bit shift (free -- this part was fine)
-//   2. 127 - (...)              an 8-bit SUBTRACTOR, with its carry chain
-//   3. a variable part-select off that 8-bit base, including the out-of-range
-//      handling the tool must assume is reachable, because nothing in the RTL
-//      told it the base only ever takes 16 legal values
-//   4. AND with (cur_state == MAC_STORE)
-//   5. OR with the MAC_DONE clear, which writes msg_buf from the same block
+// THE FIX, RETAINED HERE: compute the enable ONE CYCLE EARLY and register it
+// as a 16-bit one-hot, so msg_buf's clock enable comes straight off a flop.
 //
-// That is the reported 11-level cone ending on msg_buf_reg[*]/CE:
-//   byte_idx_reg[1]/C -> msg_buf_reg[*]/CE, 3.518 ns logic + 3.960 ns routing
-//   = 7.478 ns against a 7.692 ns period, WNS -0.153 ns.
-//
-// Note the failure is on the ENABLE, not the data. rx_byte_latch reaches the D
-// inputs through almost nothing; it is the decode of WHICH lane to enable that
-// is deep, so that is what moves.
-//
-// THE FIX: compute the enable ONE CYCLE EARLY and register it as a 16-bit
-// one-hot. msg_buf's clock enable then comes straight off a flop --
-//
-//     CE[lane] = byte_we[lane] || (cur_state == MAC_DONE)
-//
-// -- one LUT level, while the lane decode moves onto byte_we's D input where a
-// whole cycle is available for it.
-//
-// NOTHING OBSERVABLE CHANGES. The write still lands in the MAC_STORE cycle, in
-// the same lane, with the same data:
-//
-//   store_next is exactly the condition under which next_state becomes
-//   MAC_STORE -- (MAC_IDLE or MAC_DONE) and byte_valid -- so byte_we is high in
-//   precisely the cycles where cur_state == MAC_STORE. It is spelled out rather
-//   than written as (next_state == MAC_STORE) so that the byte_idx ==
-//   expected_len comparison from the MAC_CHK_DONE branch is not pulled into
-//   this path.
-//
-//   store_lane is byte_idx[3:0], except when the decision is taken from
-//   MAC_DONE, where byte_idx is being cleared to 0 on that same edge and the
-//   upcoming store therefore belongs to lane 0.
-//
-//   store_next is the SAME term that enables rx_byte_latch above, so the enable
-//   and the data it steers cannot drift apart.
-//
-// Byte ordering is unchanged -- lane 0 is msg_buf[127:120], as every
-// receive-side parser expects. Frame length decoding, parity handling,
-// byte_cnt, msg_valid, msg_data, msg_kind_q and mac_busy are all untouched.
+// store_lane is byte_idx, except when the decision is taken from MAC_DONE or
+// MAC_ERR, where byte_idx is being cleared on that same edge and the new
+// frame therefore starts at lane 0.
 // -----------------------------------------------------------------------------
-logic [15:0] byte_we;
-logic [3:0]  store_lane;
-logic        store_next;
+logic                    store_next;
+logic [LANE_W-1:0]       store_lane;
+logic [MSG_BYTES_MAX-1:0] byte_we;
 
-assign store_next = ((cur_state == MAC_IDLE) || (cur_state == MAC_DONE)) &&
-                    byte_valid;
+assign store_next = ((cur_state == MAC_IDLE) ||
+                     (cur_state == MAC_DONE) ||
+                     (cur_state == MAC_ERR)) && byte_accept;
 
-assign store_lane = (cur_state == MAC_DONE) ? 4'd0 : byte_idx[3:0];
+assign store_lane = ((cur_state == MAC_DONE) || (cur_state == MAC_ERR))
+                  ? '0 : byte_idx[LANE_W-1:0];
 
 always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n || par_val_rst) byte_we <= 16'd0;
-    else if (store_next)       byte_we <= 16'd1 << store_lane;
-    else                       byte_we <= 16'd0;
+    if (!rst_n || par_val_rst) byte_we <= '0;
+    else if (store_next)       byte_we <= MSG_BYTES_MAX'(1) << store_lane;
+    else                       byte_we <= '0;
 end
 
+// -------------------------------------------------------------------------
+// Frame buffer and byte counter
+// -------------------------------------------------------------------------
 always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n || par_val_rst) begin
-        msg_buf  <= 128'd0;
-        byte_idx <= 5'd0;
-    end else begin
-        // Fully unrolled: every bit index below is a compile-time constant,
-        // so no arithmetic and no variable part-select survives in the cone
-        // that reaches msg_buf's clock enable.
-        for (int i = 0; i < 16; i++) begin
-            if (byte_we[i]) msg_buf[127 - i*8 -: 8] <= rx_byte_latch;
+    if (!rst_n) begin
+        msg_buf  <= '0;
+        byte_idx <= '0;
+    end
+    else if (par_val_rst) begin
+        byte_idx <= '0;
+    end
+    else begin
+        // Fully unrolled: every bit index is a compile-time constant, so no
+        // arithmetic survives in the cone reaching msg_buf's clock enable.
+        for (int i = 0; i < MSG_BYTES_MAX; i++) begin
+            if (byte_we[i]) msg_buf[FRAME_W-1 - i*8 -: 8] <= rx_byte_latch;
         end
 
-        if (cur_state == MAC_STORE) begin
+        if (cur_state == MAC_STORE)
             byte_idx <= byte_idx + 1'b1;
-        end
-        if (cur_state == MAC_DONE) begin
-            byte_idx <= 5'd0;
-            // STAGE 2A: clear the buffer between frames as defence in
-            // depth against stale-byte misdecodes. rx_msg_decode already
-            // gates every narrowing rule on byte_cnt, so this is a second
-            // line of defence, not the primary one -- but it makes bytes
-            // above the count read as 0x00, which matches none of '}',
-            // 'P', 'V', 'C' or 'H'.
-            //
-            // Safe alongside "msg_data <= msg_buf" below: both are
-            // non-blocking and both sample the SAME pre-edge value, so
-            // the outgoing message is the completed frame, not zeros.
-            msg_buf <= 128'd0;
-        end
+        if (cur_state == MAC_DONE || cur_state == MAC_ERR)
+            byte_idx <= '0;
     end
 end
-
-// -------------------------------------------------------------------------
-// Live tap out to rx_msg_decode.
-//
-// Deliberately NOT the same as msg_data: the decode needs the buffer as
-// it fills, one cycle-accurate view, whereas msg_data is the stable copy
-// published to the parsers when the frame is complete.
-// -------------------------------------------------------------------------
-`ifndef SYNTHESIS
-    // The registered enable must coincide EXACTLY with the store cycle. If
-    // this fails, the restructuring has changed behaviour -- the one thing it
-    // must not do.
-    a_we_matches_store: assert property (
-        @(posedge clk) disable iff (!rst_n || par_val_rst)
-        (|byte_we) == (cur_state == MAC_STORE)
-    ) else $error("%m: byte_we and MAC_STORE disagree");
-
-    // Exactly one lane, never two.
-    a_we_onehot: assert property (
-        @(posedge clk) disable iff (!rst_n || par_val_rst)
-        $onehot0(byte_we)
-    ) else $error("%m: byte_we is not one-hot");
-
-    // ...and it must be the lane byte_idx names during that store, which is
-    // the property that guarantees byte ordering is preserved.
-    a_we_lane_correct: assert property (
-        @(posedge clk) disable iff (!rst_n || par_val_rst)
-        (cur_state == MAC_STORE) |-> byte_we[byte_idx[3:0]]
-    ) else $error("%m: byte_we selected the wrong lane");
-`endif
 
 assign frame_buf = msg_buf;
 assign byte_cnt  = byte_idx;
 
 // -------------------------------------------------------------------------
-// Registered outputs
+// Outputs
+//
+// Moore decodes. During MAC_DONE the buffer holds the complete frame and
+// byte_idx still holds its length, so every combinational consumer sees a
+// settled frame in the cycle frame_done is high.
 // -------------------------------------------------------------------------
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) msg_valid <= 1'b0;
-    else        msg_valid <= (cur_state == MAC_DONE);
-end
-
-// FINAL TWEAK: Directly output the buffer content during MAC_DONE 
-// to guarantee stable data when msg_valid is high.
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) 
-        msg_data <= 128'd0;
-    else if (cur_state == MAC_DONE)
-        msg_data <= msg_buf;
-end
-
-// STAGE 2A: latch the FINAL classification in the same cycle and the
-// same manner as msg_data. During MAC_DONE the buffer is complete and
-// byte_idx still holds the final count, so rx_msg_decode's output is
-// correct at this instant. Capturing it here is what turns a provisional
-// value into a stable one that travels with msg_data.
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-        msg_kind_q <= MSG_UNKNOWN;
-    else if (cur_state == MAC_DONE)
-        msg_kind_q <= msg_kind_prov;
-end
+assign frame_done = (cur_state == MAC_DONE);
+assign frame_err  = (cur_state == MAC_ERR);
 
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) mac_busy <= 1'b0;
     else        mac_busy <= (next_state != MAC_IDLE);
 end
+
+`ifndef SYNTHESIS
+    // The registered enable must coincide EXACTLY with the store cycle...
+    a_we_matches_store: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        (|byte_we) == (cur_state == MAC_STORE)
+    ) else $error("%m: byte_we and MAC_STORE disagree");
+
+    a_we_onehot: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        $onehot0(byte_we)
+    ) else $error("%m: byte_we is not one-hot");
+
+    // ...and it must be the lane byte_idx names, which is what preserves
+    // byte ordering.
+    a_we_lane_correct: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        (cur_state == MAC_STORE) |-> byte_we[byte_idx[LANE_W-1:0]]
+    ) else $error("%m: byte_we selected the wrong lane");
+
+    // THE START GATE, CHECKED.
+    a_frame_starts_with_brace: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        (cur_state == MAC_STORE && byte_idx == '0)
+            |-> (rx_byte_latch == CHAR_OPEN_BRACE)
+    ) else $error("%m: frame opened on a byte other than '{'");
+
+    // A completed frame is always a legal length, and always ended on '}'.
+    a_done_is_legal_length: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        frame_done |-> (byte_cnt == BYTE_CNT_W'(MSG_BYTES_1GRP) ||
+                        byte_cnt == BYTE_CNT_W'(MSG_BYTES_2GRP) ||
+                        byte_cnt == BYTE_CNT_W'(MSG_BYTES_3GRP))
+    ) else $error("%m: frame_done at an illegal length");
+
+    a_done_ends_on_brace: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        frame_done |-> last_is_close
+    ) else $error("%m: frame_done without a closing brace");
+
+    // Never both.
+    a_done_xor_err: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        !(frame_done && frame_err)
+    ) else $error("%m: frame_done and frame_err in the same cycle");
+
+    // The frame can never run past the buffer.
+    a_no_overrun: assert property (
+        @(posedge clk) disable iff (!rst_n || par_val_rst)
+        byte_cnt <= BYTE_CNT_W'(MSG_BYTES_3GRP)
+    ) else $error("%m: byte_cnt exceeded the maximum frame length");
+`endif
 
 endmodule : rx_mac

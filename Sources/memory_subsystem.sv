@@ -67,7 +67,7 @@ module memory_subsystem #(
     output logic        img_fifo_ovf_sticky
 );
 
-logic [13:0] rom_addr;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] rom_addr;
 logic        rom_rd_en;
 logic [31:0] red_data;
 logic [31:0] green_data;
@@ -84,7 +84,7 @@ logic                                    sram_wr_busy;
 logic                                    read_go;
 
 logic        pix_sram_rd_en;
-logic [13:0] pix_sram_rd_addr;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] pix_sram_rd_addr;
 logic        pix_rd_owner;
 logic        pix_rd_req;
 logic        pix_rd_gnt;
@@ -99,7 +99,7 @@ logic        brd_rd_req;
 logic        brd_rd_gnt;
 logic        brd_rd_done;
 logic        brd_sram_rd_en;
-logic [13:0] brd_sram_rd_addr;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] brd_sram_rd_addr;
 logic        brd_msg_valid;
 logic [rx_burst_pkg::BURST_PIX_PER_MSG-1:0]
       [rx_burst_pkg::BURST_PIX_W-1:0] brd_msg_pixels;
@@ -113,7 +113,7 @@ logic arb_pix_owns;
 logic arb_brd_owns;
 
 logic        sram_rd_en_mux;
-logic [13:0] sram_rd_addr_mux;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_rd_addr_mux;
 
 assign sram_rd_en_mux   = pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_en   : pix_sram_rd_en)
@@ -167,7 +167,15 @@ rgb_sram #(
     .wr_data (sram_wr_data_b)
 );
 
-rom_sequencer u_rom_sequencer (
+// rom_sequencer declares its OWN IMG_WIDTH / IMG_HEIGHT / PIXELS_PER_WORD
+// parameters with 256x256 defaults. They were never overridden, so ROM_DEPTH
+// and ADDR_WIDTH were pinned at 16384 / 14 regardless of memory_pkg -- the
+// module looked parameterised but was not connected to anything. Bind them.
+rom_sequencer #(
+    .IMG_WIDTH       (memory_pkg::IMG_WIDTH),
+    .IMG_HEIGHT      (memory_pkg::IMG_HEIGHT),
+    .PIXELS_PER_WORD (memory_pkg::PIXELS_PER_WORD)
+) u_rom_sequencer (
     .clk          (clk),
     .rst_n        (rst_n),
     .start        (read_go),
