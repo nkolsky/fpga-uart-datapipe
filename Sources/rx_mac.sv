@@ -100,6 +100,12 @@ module rx_mac
     // Parity error from the RX PHY -- soft reset.
     input  logic         par_val_rst,
 
+    // ---- downstream back-pressure ---------------------------------------
+    // High while rx_classifier is still holding a message that has not been
+    // taken by the crossing. A completed frame WAITS IN THE BUFFER rather
+    // than being announced, so the held message cannot be overwritten.
+    input  logic         stall,
+
     // ---- frame out ------------------------------------------------------
     output logic [FRAME_W-1:0]    frame_buf,
     output logic [BYTE_CNT_W-1:0] byte_cnt,
@@ -188,7 +194,16 @@ always_comb begin : next_state_logic
             if (!at_delim)
                 next_state = MAC_IDLE;              // ordinary byte, continue
             else if (last_is_close)
-                next_state = MAC_DONE;              // frame ends here
+                // Hold here, NOT in MAC_DONE. frame_done is a Moore decode
+                // of MAC_DONE, so waiting there would hold it high for many
+                // cycles and the classifier would accept the same frame over
+                // and over. Waiting here keeps the completed frame in the
+                // buffer and simply delays the announcement.
+                //
+                // mac_busy is (next_state != MAC_IDLE), so stalling here also
+                // keeps mac_busy high, and UART_CTS already includes it. The
+                // PC therefore pauses with no further change.
+                next_state = stall ? MAC_CHK : MAC_DONE;
             else if (last_is_comma && !at_last_delim)
                 next_state = MAC_IDLE;              // another group follows
             else
