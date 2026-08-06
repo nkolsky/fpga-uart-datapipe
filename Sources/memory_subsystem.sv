@@ -37,9 +37,13 @@ module memory_subsystem #(
     output logic [23:0] img_fifo_wr_data,
 
     // Pixel-write command FIFO read side. The FIFO remains in chip_top.
-    input  logic             cmd_fifo_empty,
-    input  logic [CMD_W-1:0] cmd_fifo_rd_data,
-    output logic             cmd_fifo_rd_en,
+    // ---- message in, from cdc_msg_sync ---------------------------------
+    // Replaces the command FIFO. Every message frame crosses here, in order,
+    // and back-pressure runs from this port all the way to the PC.
+    input  logic                        msg_valid,
+    output logic                        msg_ready,
+    input  msg_format_pkg::msg_kind_t   msg_kind,
+    input  msg_format_pkg::msg_payload_t msg_payload,
 
     // Single-pixel read request/reply, already in the 100 MHz domain.
     input  logic        pix_req_valid,
@@ -112,27 +116,43 @@ logic arb_locked;
 logic arb_pix_owns;
 logic arb_brd_owns;
 
+// Write path <-> SRAM
+logic                                   wr_rd_en;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] wr_rd_addr;
+logic                                   wr_port_req;
+logic                                   wr_port_grant;
+logic                                   wr_rect_busy;
+logic                                   wr_rmw_pulse;
+
 logic        sram_rd_en_mux;
 logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_rd_addr_mux;
 
-assign sram_rd_en_mux   = pix_rd_owner
+// THE WRITE PATH IS NOW A READ CLIENT TOO.
+//
+// rgb_sram has no per-byte write enable, so a partial-word update is a
+// read-modify-write and sram_rmw needs the read port. It takes priority in
+// this mux because mem_interlock only grants it when no reader owns the
+// port -- the two conditions are mutually exclusive by construction, and the
+// interlock asserts it.
+assign sram_rd_en_mux   = wr_rd_en ? 1'b1
+                        : pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_en   : pix_sram_rd_en)
                         : rom_rd_en;
-assign sram_rd_addr_mux = pix_rd_owner
+assign sram_rd_addr_mux = wr_rd_en ? wr_rd_addr
+                        : pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_addr : pix_sram_rd_addr)
                         : rom_addr;
 
 rgb_sram #(
     .DATA_WIDTH (memory_pkg::SRAM_DATA_WIDTH),
     .DEPTH      (memory_pkg::SRAM_DEPTH),
-    .INIT_FILE  ("red_hex.mem")
+    .INIT_FILE  (memory_pkg::SRAM_INIT_R)
 ) u_sram_red (
     .clk     (clk),
     .rd_en   (sram_rd_en_mux),
     .rd_addr (sram_rd_addr_mux),
     .rd_data (red_data),
     .wr_en   (sram_wr_en),
-    .wr_be   (sram_wr_be),
     .wr_addr (sram_wr_addr),
     .wr_data (sram_wr_data_r)
 );
@@ -140,14 +160,13 @@ rgb_sram #(
 rgb_sram #(
     .DATA_WIDTH (memory_pkg::SRAM_DATA_WIDTH),
     .DEPTH      (memory_pkg::SRAM_DEPTH),
-    .INIT_FILE  ("green_hex.mem")
+    .INIT_FILE  (memory_pkg::SRAM_INIT_G)
 ) u_sram_green (
     .clk     (clk),
     .rd_en   (sram_rd_en_mux),
     .rd_addr (sram_rd_addr_mux),
     .rd_data (green_data),
     .wr_en   (sram_wr_en),
-    .wr_be   (sram_wr_be),
     .wr_addr (sram_wr_addr),
     .wr_data (sram_wr_data_g)
 );
@@ -155,14 +174,13 @@ rgb_sram #(
 rgb_sram #(
     .DATA_WIDTH (memory_pkg::SRAM_DATA_WIDTH),
     .DEPTH      (memory_pkg::SRAM_DEPTH),
-    .INIT_FILE  ("blue_hex.mem")
+    .INIT_FILE  (memory_pkg::SRAM_INIT_B)
 ) u_sram_blue (
     .clk     (clk),
     .rd_en   (sram_rd_en_mux),
     .rd_addr (sram_rd_addr_mux),
     .rd_data (blue_data),
     .wr_en   (sram_wr_en),
-    .wr_be   (sram_wr_be),
     .wr_addr (sram_wr_addr),
     .wr_data (sram_wr_data_b)
 );
@@ -192,25 +210,54 @@ rom_sequencer #(
     .busy         (rom_seq_busy)
 );
 
-sram_wr_ctrl #(
-    .CMD_W (CMD_W)
-) u_sram_wr_ctrl (
-    .clk         (clk),
-    .rst_n       (rst_n),
-    .cmd_empty   (cmd_fifo_empty),
-    .cmd_rd_data (cmd_fifo_rd_data),
-    .cmd_rd_en   (cmd_fifo_rd_en),
-    .wr_allowed  (sram_wr_allowed),
-    .wr_busy     (sram_wr_busy),
-    .wr_en       (sram_wr_en),
-    .wr_be       (sram_wr_be),
-    .wr_addr     (sram_wr_addr),
-    .wr_data_r   (sram_wr_data_r),
-    .wr_data_g   (sram_wr_data_g),
-    .wr_data_b   (sram_wr_data_b),
-    .wr_seen     (sram_wr_seen),
-    .wr_rejected (sram_wr_rejected)
+// -----------------------------------------------------------------------
+// WRITE PATH
+//
+// Replaces sram_wr_ctrl and the command FIFO. Messages arrive whole:
+//
+//   mem_msg_writer     decodes msg_kind and opens a rectangle
+//   pixel_word_packer  accumulates pixels into 32-bit words
+//   sram_rmw           writes the word, reading first only when the update
+//                      does not cover every lane
+//
+// A burst data message carries four pixels and four pixels are exactly one
+// word per channel, so burst traffic writes whole words and needs no reads.
+// -----------------------------------------------------------------------
+mem_write_subsystem u_write_path (
+    .clk             (clk),
+    .rst_n           (rst_n),
+
+    .msg_valid       (msg_valid),
+    .msg_ready       (msg_ready),
+    .msg_kind        (msg_kind),
+    .msg_payload     (msg_payload),
+
+    .rd_en           (wr_rd_en),
+    .rd_addr         (wr_rd_addr),
+    .rd_data_r       (red_data),
+    .rd_data_g       (green_data),
+    .rd_data_b       (blue_data),
+
+    .wr_en           (sram_wr_en),
+    .wr_addr         (sram_wr_addr),
+    .wr_data_r       (sram_wr_data_r),
+    .wr_data_g       (sram_wr_data_g),
+    .wr_data_b       (sram_wr_data_b),
+
+    .port_req        (wr_port_req),
+    .port_grant      (wr_port_grant),
+    .wr_busy         (sram_wr_busy),
+
+    .rect_busy       (wr_rect_busy),
+    .rmw_count_pulse (wr_rmw_pulse),
+    .wr_rejected     (sram_wr_rejected)
 );
+
+// sram_wr_seen: at least one pixel has been written.
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)          sram_wr_seen <= 1'b0;
+    else if (sram_wr_en) sram_wr_seen <= 1'b1;
+end
 
 pixel_rd_ctrl u_pixel_rd_ctrl (
     .clk          (clk),
@@ -295,10 +342,10 @@ mem_interlock u_mem_interlock (
     .rom_seq_busy (rom_seq_busy),
     .img_done     (img_done),
     .read_go      (read_go),
-    .cmd_empty    (cmd_fifo_empty),
+    .wr_port_req  (wr_port_req),
     .wr_busy      (sram_wr_busy),
     .burst_active (burst_active),
-    .wr_allowed   (sram_wr_allowed),
+    .wr_port_grant (wr_port_grant),
     .pix_rd_req   (shared_rd_req),
     .pix_rd_done  (shared_rd_done),
     .pix_rd_gnt   (shared_rd_gnt),

@@ -81,12 +81,16 @@ logic        brd_msg_accept_130;
 // -----------------------------------------------------------------------------
 localparam int CMD_FIFO_W = 48;
 
-logic                  cmd_fifo_wr_en;
-logic [CMD_FIFO_W-1:0] cmd_fifo_wr_data;
-logic                  cmd_fifo_full;
-logic                  cmd_fifo_rd_en;
-logic [CMD_FIFO_W-1:0] cmd_fifo_rd_data;
-logic                  cmd_fifo_empty;
+// Message crossing, 130 MHz side and 100 MHz side.
+logic                            rx_msg_valid, rx_msg_ready;
+msg_format_pkg::msg_kind_t       rx_msg_kind;
+msg_format_pkg::msg_payload_t    rx_msg_payload;
+
+logic                            mem_msg_valid, mem_msg_ready;
+msg_format_pkg::msg_kind_t       mem_msg_kind;
+msg_format_pkg::msg_payload_t    mem_msg_payload;
+
+logic                            burst_err_sticky;
 
 logic                  sram_wr_seen;
 logic                  sram_wr_rejected;
@@ -152,9 +156,10 @@ memory_subsystem #(
     .img_fifo_wr_en        (fifo_wr_en),
     .img_fifo_wr_data      (fifo_wr_data),
 
-    .cmd_fifo_empty        (cmd_fifo_empty),
-    .cmd_fifo_rd_data      (cmd_fifo_rd_data),
-    .cmd_fifo_rd_en        (cmd_fifo_rd_en),
+    .msg_valid             (mem_msg_valid),
+    .msg_ready             (mem_msg_ready),
+    .msg_kind              (mem_msg_kind),
+    .msg_payload           (mem_msg_payload),
 
     .pix_req_valid         (pix_req_valid_100),
     .pix_req_data          (pix_req_data_100),
@@ -265,7 +270,6 @@ logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rw_cmd_addr;
 logic [rgf_pkg::DATA_WIDTH-1:0] rx_rw_cmd_data;
 
 logic        pix_wr_seen_sticky;
-logic        cmd_ovf_sticky;
 
 // -----------------------------------------------------------------------------
 // RX subsystem (130 MHz)
@@ -277,64 +281,57 @@ logic        cmd_ovf_sticky;
 rx_subsystem u_rx_subsystem (
     .clk                  (pll_clk_out),
     .rst_n                (sync_pll_rst_n),
-
     .rx_in                (UART_TXD_IN),
 
-    // The RX subsystem speaks plain ready/valid. Adapting that to whatever
-    // carries commands into the 100 MHz domain is chip_top's job -- today an
-    // async FIFO, hence the !full.
-    .cmd_ready            (!cmd_fifo_full),
-    .cmd_valid            (cmd_fifo_wr_en),
-    .cmd_data             (cmd_fifo_wr_data),
+    .msg_valid            (rx_msg_valid),
+    .msg_ready            (rx_msg_ready),
+    .msg_kind             (rx_msg_kind),
+    .msg_payload          (rx_msg_payload),
 
     .rx_phy_busy          (rx_phy_busy),
     .rx_parity_err_pulse  (rx_parity_err_pulse),
     .rx_mac_busy          (rx_mac_busy),
-
     .rx_burst_active      (rx_burst_active),
-
-    .rx_classifier_valid  (rx_classifier_valid),
     .rx_classifier_error  (rx_classifier_error),
-    .rx_row_q             (rx_row_q),
-    .rx_col_q             (rx_col_q),
-    .rx_pixel_q           (rx_pixel_q),
-
-    .rx_rr_cmd_valid      (rx_rr_cmd_valid),
-    .rx_rr_cmd_addr       (rx_rr_cmd_addr),
-    .rx_rw_cmd_valid      (rx_rw_cmd_valid),
-    .rx_rw_cmd_addr       (rx_rw_cmd_addr),
-    .rx_rw_cmd_data       (rx_rw_cmd_data),
-
-    .rx_pr_cmd_valid      (rx_pr_cmd_valid),
-    .rx_pr_cmd_row        (rx_pr_cmd_row),
-    .rx_pr_cmd_col        (rx_pr_cmd_col),
-
-    .rx_br_cmd_valid      (rx_br_cmd_valid),
-    .rx_br_cmd_base_row   (rx_br_cmd_base_row),
-    .rx_br_cmd_base_col   (rx_br_cmd_base_col),
-    .rx_br_cmd_height     (rx_br_cmd_height),
-    .rx_br_cmd_width      (rx_br_cmd_width),
 
     .pix_wr_seen_sticky   (pix_wr_seen_sticky),
-    .cmd_ovf_sticky       (cmd_ovf_sticky)
+    .burst_err_sticky     (burst_err_sticky)
 );
 
-// Explicit width is required for the 48-bit {address, pixel} command.
-async_fifo #(
-    .DW (CMD_FIFO_W)
-) u_cmd_fifo (
-    .wr_clk       (pll_clk_out),
-    .wr_rst_n     (sync_pll_rst_n),
-    .wr_en        (cmd_fifo_wr_en),
-    .wr_data      (cmd_fifo_wr_data),
-    .full         (cmd_fifo_full),
-    .almost_full  (),                  // OPEN: intended -> UART_CTS backpressure
-    .rd_clk       (CLK100MHZ),
-    .rd_rst_n     (sync_rst_n),
-    .rd_en        (cmd_fifo_rd_en),
-    .rd_data      (cmd_fifo_rd_data),
-    .empty        (cmd_fifo_empty),
-    .almost_empty ()                   // unused
+// -----------------------------------------------------------------------------
+// MESSAGE CROSSING, 130 MHz -> 100 MHz
+//
+// Replaces the 16-deep asynchronous command FIFO. There was no rate mismatch
+// to absorb: at 8.125 Mbaud a message takes ~2816 receive clocks and carries
+// four pixels, against a memory side at 100 MHz. There was also nothing to
+// buffer into -- the RX side holds no image data.
+//
+// The FIFO's real function was hiding a missing back-pressure path. It turned
+// "lose the next command" into "lose the seventeenth", and cmd_ovf_sticky
+// existed to report when that happened. This crossing stalls instead:
+// msg_ready propagates to rx_classifier, rx_mac and UART_CTS.
+//
+// ~105 flops against roughly 800.
+//
+// XDC: the data register inside needs a false path or max-delay constraint.
+// Without one the tool tries to close it as a single-cycle path between
+// asynchronous clocks and reports a failure that is not real.
+// -----------------------------------------------------------------------------
+cdc_msg_sync #(
+    .WIDTH ($bits(msg_format_pkg::msg_kind_t) +
+            $bits(msg_format_pkg::msg_payload_t))
+) u_msg_cdc (
+    .src_clk   (pll_clk_out),
+    .src_rst_n (sync_pll_rst_n),
+    .src_valid (rx_msg_valid),
+    .src_ready (rx_msg_ready),
+    .src_data  ({rx_msg_kind, rx_msg_payload}),
+
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_valid (mem_msg_valid),
+    .dst_ready (mem_msg_ready),
+    .dst_data  ({mem_msg_kind, mem_msg_payload})
 );
 
 // -----------------------------------------------------------------------------
@@ -594,7 +591,11 @@ assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy);
 // LEDs
 // -----------------------------------------------------------------------------
 assign LED[14] = tx_done_sticky;
-assign LED[13] = cmd_ovf_sticky || sram_wr_rejected;
+// cmd_ovf_sticky is gone with the command FIFO: overflow was its failure
+// mode, and the crossing back-pressures instead of dropping. What remains
+// worth reporting is a write addressed outside the image, and a burst data
+// frame arriving with no burst armed.
+assign LED[13] = sram_wr_rejected || burst_err_sticky;
 assign LED[15] = img_fifo_ovf_sticky;
 assign LED[12] = heartbeat;
 assign LED[11] = clk_sel;

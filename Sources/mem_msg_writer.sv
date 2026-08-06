@@ -63,6 +63,7 @@
 
 module mem_msg_writer
     import msg_format_pkg::*;
+    import memory_pkg::*;
 #(
     parameter int PAYLOAD_BITS = 96,
     parameter int PIX_BITS     = 8
@@ -88,8 +89,31 @@ module mem_msg_writer
     output logic [PIX_BITS-1:0]      pixel_g,
     output logic [PIX_BITS-1:0]      pixel_b,
 
-    input  logic                     pack_busy
+    input  logic                     pack_busy,
+
+    // Sticky: at least one message was discarded for addressing outside the
+    // image. See the note below.
+    output logic                     wr_rejected
 );
+
+    // -----------------------------------------------------------------
+    // ADDRESS RANGE CHECK -- INHERITED FROM sram_wr_ctrl
+    //
+    // rx_classifier deliberately applies NO bound to a single pixel write:
+    // any 24-bit address is structurally legal, and the check belongs to
+    // whoever knows the image geometry. That used to be sram_wr_ctrl, which
+    // this path replaces, so the check moves here. Without it an
+    // out-of-range address would wrap into the SRAM and corrupt an unrelated
+    // pixel.
+    //
+    // A burst header is bounds-checked by rx_classifier already (base inside
+    // the image, extent does not overrun), so only the single pixel case
+    // needs testing here.
+    // -----------------------------------------------------------------
+    localparam int TOTAL_PIXELS = IMG_WIDTH * IMG_HEIGHT;
+
+    logic pix_addr_ok;
+    assign pix_addr_ok = (msg_payload[47:24] < 24'(TOTAL_PIXELS));
 
     localparam int N_PIX = 4;               // pixels per burst data message
 
@@ -130,6 +154,7 @@ module mem_msg_writer
             held           <= '0;
             pix_left       <= '0;
             pix_idx        <= '0;
+            wr_rejected    <= 1'b0;
             pack_start     <= 1'b0;
             pack_base_addr <= '0;
             pack_height    <= '0;
@@ -160,7 +185,10 @@ module mem_msg_writer
                         unique case (msg_kind)
 
                             // ---- single pixel: a 1x1 rectangle ----------
-                            MSG_PIX_WRITE: begin
+                            MSG_PIX_WRITE: if (!pix_addr_ok) begin
+                                // Outside the image. Drop it and report.
+                                wr_rejected <= 1'b1;
+                            end else begin
                                 pack_start     <= 1'b1;
                                 pack_base_addr <= msg_payload[47:24];
                                 pack_height    <= 10'd1;

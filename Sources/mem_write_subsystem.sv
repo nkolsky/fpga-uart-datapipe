@@ -80,7 +80,8 @@ module mem_write_subsystem
 
     // ---- status -----------------------------------------------------------
     output logic              rect_busy,        // a rectangle is in progress
-    output logic              rmw_count_pulse   // one per read-modify-write
+    output logic              rmw_count_pulse,  // one per read-modify-write
+    output logic              wr_rejected       // sticky: address out of image
 );
 
     // ---- writer -> packer ------------------------------------------------
@@ -106,7 +107,8 @@ module mem_write_subsystem
         .pixel_r        (pixel_r),
         .pixel_g        (pixel_g),
         .pixel_b        (pixel_b),
-        .pack_busy      (rect_busy)
+        .pack_busy      (rect_busy),
+        .wr_rejected    (wr_rejected)
     );
 
     // ---- packer -> rmw ---------------------------------------------------
