@@ -105,6 +105,11 @@ module pixel_word_packer
 
     localparam int LANE_W = $clog2(NLANE);      // 2
 
+    // A single set lane, typed UNSIGNED and already the width of wr_be.
+    // Writing NLANE'(1) instead makes the literal SIGNED, because NLANE is
+    // an int, and the OR below then mixes signed and unsigned operands.
+    localparam logic [NLANE-1:0] LANE_ONE = {{(NLANE-1){1'b0}}, 1'b1};
+
     // -------------------------------------------------------------------
     // Position within the image and within the rectangle
     // -------------------------------------------------------------------
@@ -220,7 +225,7 @@ module pixel_word_packer
                 // the first lane of a word, so take word_addr directly.
                 wr_addr   <= (acc_be == '0) ? word_addr : acc_addr;
 
-                wr_be     <= acc_be | (NLANE'(1) << idx);
+                wr_be     <= acc_be | (LANE_ONE << idx);
 
                 wr_data_r <= acc_r; wr_data_r[idx*8 +: 8] <= pixel_r;
                 wr_data_g <= acc_g; wr_data_g[idx*8 +: 8] <= pixel_g;

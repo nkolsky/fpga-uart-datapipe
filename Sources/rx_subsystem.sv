@@ -101,6 +101,10 @@ logic [BURST_PIX_PER_MSG-1:0][BURST_PIX_W-1:0] rx_burst_pixels;
 
 logic                  rx_bypass_active;
 logic                  rx_hdr_accept;
+// Dimensions travel WITH hdr_accept out of the classifier: they are
+// registered there, so taking them from the parser would give rx_burst_ctrl
+// values that had already moved on.
+logic [9:0]            rx_hdr_height, rx_hdr_width;
 logic                  rx_out_busy;
 logic                  rx_burst_done;
 
@@ -175,6 +179,8 @@ rx_classifier u_rx_classifier (
     .out_payload      (msg_payload),
     .out_busy         (rx_out_busy),
     .hdr_accept       (rx_hdr_accept),
+    .hdr_height       (rx_hdr_height),
+    .hdr_width        (rx_hdr_width),
 
     .classifier_error (rx_classifier_error)
 );
@@ -193,8 +199,8 @@ rx_burst_ctrl u_rx_burst_ctrl (
     .msg_valid      (rx_frame_done),
     .msg_kind       (rx_msg_kind),
     .hdr_accept     (rx_hdr_accept),
-    .height         (rx_field1),
-    .width          (rx_field2),
+    .height         (BURST_DIM_W'(rx_hdr_height)),
+    .width          (BURST_DIM_W'(rx_hdr_width)),
     .burst_abort    (1'b0),
     .bypass_active  (rx_bypass_active),
     .burst_active   (rx_burst_active),
