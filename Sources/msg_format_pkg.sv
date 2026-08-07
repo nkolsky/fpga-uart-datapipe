@@ -92,9 +92,6 @@ package msg_format_pkg;
     localparam logic [7:0] CHAR_I           = 8'h49;  // 'I'  image burst write
     localparam logic [7:0] CHAR_H           = 8'h48;  // 'H'  height
 
-    // Retained for the legacy {Rnnn,Cnnn,Vnnn} path, whose payload is three
-    // ASCII decimal digits rather than three raw bytes.
-    localparam logic [7:0] ASCII_ZERO       = 8'h30;  // '0'
 
     // -----------------------------------------------------------------
     // Stride model
@@ -177,7 +174,6 @@ package msg_format_pkg;
     // -----------------------------------------------------------------
     typedef enum logic [3:0] {
         MSG_UNKNOWN    = 4'd0,  // unrecognised / malformed
-        MSG_LEGACY_RGF = 4'd1,  // {Rnnn,Cnnn,Vnnn}          16, ASCII payload
         MSG_REG_WRITE  = 4'd2,  // {W<A>, V<..>, V<..>}      16
         MSG_REG_READ   = 4'd3,  // {R<A>}                     6
         MSG_PIX_WRITE  = 4'd4,  // {W<A>, P<R,G,B>}          11
@@ -185,6 +181,13 @@ package msg_format_pkg;
         MSG_BURST_HDR  = 4'd6,  // {I<..>, H<..>, W<..>}     16
         MSG_BURST_READ = 4'd7,  // {R<A>, H<..>, W<..>}      16
         MSG_BURST_DATA = 4'd8   // {<4 px>,<4 px>,<4 px>}    16, no opcodes
+
+        // 4'd1 was MSG_LEGACY_RGF, the {Rnnn,Cnnn,Vnnn} form carried over
+        // from earlier labs. It is NOT in the final project message set, and
+        // its ASCII decimal payload -- two multiplies and a three-term sum
+        // per field -- was the critical path at 130 MHz. Removed rather than
+        // pipelined, since nothing in the spec asks for it. The encoding is
+        // left unused so the others keep their values.
     } msg_kind_t;
 
     // Group count for each kind. This is the ONLY place message length is
@@ -290,13 +293,6 @@ package msg_format_pkg;
         logic [9:0]  height;
         logic [23:0] base_addr;
     } pl_burst_read_t;                                   // 44
-
-    // {Rnnn, Cnnn, Vnnn} -- decoded from ASCII by the classifier
-    typedef struct packed {
-        logic [9:0]  row;
-        logic [9:0]  col;
-        logic [23:0] pixel;
-    } pl_legacy_t;                                       // 44
 
     // Zero-extend any of the above into the shared payload.
     function automatic msg_payload_t pl_pack(input logic [MSG_PAYLOAD_W-1:0] v,

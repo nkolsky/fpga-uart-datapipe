@@ -57,7 +57,6 @@
 //                          the image; base + extent does not overrun
 //   Single pixel write     none -- any 24-bit address is structurally legal,
 //                          bounds are enforced by the memory side
-//   legacy {Rnnn,...}      every payload byte is ASCII '0'..'9'
 //   Burst data             none -- the payload is raw pixels
 //
 // A rejected message is not forwarded; classifier_error pulses instead.
@@ -208,28 +207,12 @@ module rx_classifier
                           ((br_base_col_full + s1_f2) <= PAYLOAD_W'(IMG_WIDTH));
     assign br_ok        = br_dims_ok && br_addr_ok && br_extent_ok;
 
-    // ---- legacy: ASCII digits ------------------------------------------
-    function automatic logic is_digit(input logic [7:0] b);
-        return (b >= ASCII_ZERO) && (b <= (ASCII_ZERO + 8'd9));
-    endfunction
-
-    function automatic int dec3(input logic [PAYLOAD_W-1:0] f);
-        return (int'(f[23:16]) - int'(ASCII_ZERO)) * 100
-             + (int'(f[15: 8]) - int'(ASCII_ZERO)) * 10
-             + (int'(f[ 7: 0]) - int'(ASCII_ZERO));
-    endfunction
-
-    logic legacy_digits_ok;
-    always_comb begin : check_digits
-        legacy_digits_ok = 1'b1;
-        for (int g = 0; g < 3; g++) begin
-            logic [PAYLOAD_W-1:0] f;
-            f = (g == 0) ? s1_f0 : (g == 1) ? s1_f1 : s1_f2;
-            if (!is_digit(f[23:16])) legacy_digits_ok = 1'b0;
-            if (!is_digit(f[15: 8])) legacy_digits_ok = 1'b0;
-            if (!is_digit(f[ 7: 0])) legacy_digits_ok = 1'b0;
-        end
-    end : check_digits
+    // The legacy {Rnnn,Cnnn,Vnnn} form is gone, and with it the ASCII
+    // decimal decode that lived here: two multiplies and a three-term sum
+    // per field, feeding the payload packing mux. That was the critical
+    // path at 130 MHz -- s1_f2 to out_payload, twelve logic levels. The
+    // message is not in the final project set, so it was removed rather
+    // than pipelined.
 
     // =================================================================
     // ACCEPT / REJECT
@@ -242,8 +225,6 @@ module rx_classifier
 
         if (s1_valid) begin
             unique case (s1_kind)
-                MSG_LEGACY_RGF : begin accept =  legacy_digits_ok;
-                                       reject = !legacy_digits_ok; end
                 MSG_PIX_WRITE  : accept = 1'b1;   // no semantic constraint
                 MSG_BURST_DATA : accept = 1'b1;   // raw pixels
                 MSG_BURST_HDR  : begin accept =  br_dims_ok;
@@ -281,13 +262,12 @@ module rx_classifier
         pl_reg_read_t   rr;
         pl_pix_read_t   pr;
         pl_burst_read_t br;
-        pl_legacy_t     lg;
 
         // Every local is cleared first. Without this the case arms leave
         // the unused structs unassigned on some paths and the tool infers
         // latches for them.
         pw = '0; bh = '0; bd = '0; rw = '0;
-        rr = '0; pr = '0; br = '0; lg = '0;
+        rr = '0; pr = '0; br = '0;
 
         packed_payload = '0;
 
@@ -341,13 +321,6 @@ module rx_classifier
                 packed_payload = msg_payload_t'(br);
             end
 
-            // Legacy payload is ASCII decimal, decoded here.
-            MSG_LEGACY_RGF: begin
-                lg.row         = 10'(dec3(s1_f0));
-                lg.col         = 10'(dec3(s1_f1));
-                lg.pixel       = 24'(dec3(s1_f2));
-                packed_payload = msg_payload_t'(lg);
-            end
 
             default: packed_payload = '0;
 

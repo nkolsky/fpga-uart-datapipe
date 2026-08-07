@@ -4,9 +4,10 @@
 // Pure hierarchy extraction of the complete 100 MHz memory domain.
 //
 // Contains:
+//   - mem_msg_router      dispatches each arriving message
+//   - mem_write_subsystem message writer, word packer
 //   - rgb_sram x3
 //   - rom_sequencer
-//   - sram_wr_ctrl
 //   - pixel_rd_ctrl
 //   - burst_rd_ctrl
 //   - shared pixel/burst read arbiter
@@ -14,13 +15,22 @@
 //   - SRAM read-port mux
 //   - image FIFO overflow sticky diagnostic
 //
-// All CDC primitives and both async FIFOs remain in chip_top.
+// The write path used to be sram_wr_ctrl fed by a 16-deep asynchronous
+// COMMAND FIFO. Both are gone: messages now arrive whole on one ordered
+// stream through cdc_msg_sync, and back-pressure runs from here to the PC.
+//
+// One async FIFO remains in chip_top, the IMAGE FIFO. That one is between
+// rom_sequencer and tx_sequencer and is a genuine rate buffer: the memory
+// side produces a pixel every few clocks and the UART consumes one roughly
+// every 700. The command FIFO was the opposite case -- producer three
+// orders of magnitude SLOWER than consumer -- so it buffered nothing and
+// only hid a missing back-pressure path.
+//
+// All CDC primitives remain in chip_top.
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 
-module memory_subsystem #(
-    parameter int CMD_W = 48
-) (
+module memory_subsystem (
     input  logic        clk,
     input  logic        rst_n,
 
@@ -36,7 +46,7 @@ module memory_subsystem #(
     output logic        img_fifo_wr_en,
     output logic [23:0] img_fifo_wr_data,
 
-    // Pixel-write command FIFO read side. The FIFO remains in chip_top.
+    // Message input. Every message frame arrives here in order.
     // ---- message in, from cdc_msg_sync ---------------------------------
     // Replaces the command FIFO. Every message frame crosses here, in order,
     // and back-pressure runs from this port all the way to the PC.
@@ -87,7 +97,6 @@ logic [memory_pkg::SRAM_ADDR_WIDTH-1:0]   sram_wr_addr;
 logic [memory_pkg::SRAM_DATA_WIDTH-1:0]   sram_wr_data_r;
 logic [memory_pkg::SRAM_DATA_WIDTH-1:0]   sram_wr_data_g;
 logic [memory_pkg::SRAM_DATA_WIDTH-1:0]   sram_wr_data_b;
-logic                                    sram_wr_allowed;
 logic                                    sram_wr_busy;
 logic                                    read_go;
 
@@ -439,7 +448,7 @@ end
 
     a_no_write_during_burst: assert property (
         @(posedge clk) disable iff (!rst_n)
-        (arb_brd_owns && pix_rd_owner) |-> !sram_wr_allowed
+        (arb_brd_owns && pix_rd_owner) |-> !wr_port_grant
     ) else $error("memory_subsystem: write allowed during burst read");
 
     a_pix_src_holds: assert property (

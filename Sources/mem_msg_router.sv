@@ -6,7 +6,7 @@
 //                        +-> write path      pixel write, burst header/data
 //   msg -> mem_msg_router+-> pixel_rd_ctrl   single pixel read
 //                        +-> burst_rd_ctrl   image burst read
-//                        +-> register file   register read/write, legacy
+//                        +-> register file   register read and write
 //
 // -----------------------------------------------------------------------
 // WHY IT HOLDS
@@ -93,13 +93,11 @@ module mem_msg_router
     pl_burst_read_t br;
     pl_reg_read_t   rr;
     pl_reg_write_t  rw;
-    pl_legacy_t     lg;
 
     assign pr = pl_pix_read_t'(msg_payload[$bits(pl_pix_read_t)-1:0]);
     assign br = pl_burst_read_t'(msg_payload[$bits(pl_burst_read_t)-1:0]);
     assign rr = pl_reg_read_t'(msg_payload[$bits(pl_reg_read_t)-1:0]);
     assign rw = pl_reg_write_t'(msg_payload[$bits(pl_reg_write_t)-1:0]);
-    assign lg = pl_legacy_t'(msg_payload[$bits(pl_legacy_t)-1:0]);
 
     // A burst read carries a linear base address; the controller wants row
     // and column. IMG_WIDTH is a power of two so both collapse to wiring;
@@ -127,8 +125,7 @@ module mem_msg_router
             MSG_PIX_READ   : to_pix   = 1'b1;
             MSG_BURST_READ : to_brd   = 1'b1;
             MSG_REG_READ,
-            MSG_REG_WRITE,
-            MSG_LEGACY_RGF : to_rgf   = 1'b1;
+            MSG_REG_WRITE  : to_rgf   = 1'b1;
             // MSG_UNKNOWN never reaches here: rx_classifier does not forward
             // it. Dropped rather than stalling the router if it somehow does.
             default        : to_drop  = 1'b1;
@@ -210,20 +207,10 @@ module mem_msg_router
                             rgf_cmd_addr     <= rr.addr;
                             rgf_cmd_wdata    <= '0;
                         end
-                        MSG_REG_WRITE: begin
+                        default: begin   // MSG_REG_WRITE
                             rgf_cmd_is_write <= 1'b1;
                             rgf_cmd_addr     <= rw.addr;
                             rgf_cmd_wdata    <= rw.data;
-                        end
-                        // The legacy {Rnnn,Cnnn,Vnnn} form addresses the
-                        // register file with its ROW field and carries the
-                        // value in its pixel field. Read or write is taken
-                        // from the low bit of the column field. Preserved
-                        // exactly as chip_top formed it before the rework.
-                        default: begin
-                            rgf_cmd_is_write <= !lg.col[0];
-                            rgf_cmd_addr     <= {lg.row[5:0], 2'b00};
-                            rgf_cmd_wdata    <= {8'd0, lg.pixel};
                         end
                     endcase
                 end
