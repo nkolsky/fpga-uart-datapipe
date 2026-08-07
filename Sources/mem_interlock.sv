@@ -182,21 +182,15 @@ module mem_interlock (
 
     // ---- write side ----------------------------------------------------
     //
-    // THE WRITE PATH NOW USES THE READ PORT TOO.
+    // Writes do NOT need the read port. rgb_sram has a per-byte write
+    // enable, so changing a single pixel is one write with three lanes
+    // masked off -- no read, and no read-modify-write.
     //
-    // rgb_sram has no per-byte write enable, so changing a single pixel is a
-    // READ-MODIFY-WRITE: read the word, replace one byte, write it back.
-    // Writes are therefore no longer independent of the readers, and the
-    // grant below is a genuine port grant rather than a permission flag.
-    //
-    // CRITICAL: the grant MUST be held for the WHOLE update. Handing the
-    // port to a reader between the read and the write of one word would let
-    // the write land on top of a word the reader had moved on from, or --
-    // worse -- let a second update read the same stale value. sram_rmw holds
-    // wr_port_req high for the entire request, and wr_pending below includes
-    // it, so nothing can take the port mid-update. There is an assertion.
-    input  logic wr_port_req,    // sram_rmw wants the port, held all request
-    input  logic wr_busy,        // sram_rmw mid-update -- must not be cut off
+    // They still stand off while a reader owns the memory, because rgb_sram
+    // forbids a read and a write to the same address in one cycle and the
+    // readers walk the whole image.
+    input  logic wr_port_req,    // the write path has a word to place
+    input  logic wr_busy,        // a rectangle is in progress
     // A burst is in progress on the receive side, already synchronised into
     // this clock domain. See the note below for why a request signal alone
     // is not sufficient.
@@ -271,9 +265,10 @@ module mem_interlock (
     // the ~1.5 s of transmission that follows.
     assign read_active = read_go || rom_seq_busy;
 
-    // The write path stands off while either reader owns the port. This is
-    // no longer a courtesy: a read-modify-write NEEDS the read port, so the
-    // three clients genuinely contend for one resource.
+    // The write path stands off while either reader owns the memory. The
+    // ports are physically independent, but rgb_sram's own assertion forbids
+    // a read and a write to the same address in one cycle, and a reader
+    // walking the image would eventually collide.
     assign wr_port_grant = !read_active && !pix_rd_active;
 
     // Granted only when the image reader is idle AND nothing is writing or
@@ -334,14 +329,6 @@ module mem_interlock (
     end
 
 `ifndef SYNTHESIS
-    // THE NEW SAFETY PROPERTY. An update in progress must never lose the
-    // port. If this fires, a reader has taken the port between the read and
-    // the write of a single word, and that word will be corrupted.
-    a_grant_held_through_update: assert property (
-        @(posedge clk) disable iff (!rst_n)
-        wr_busy |-> wr_port_grant
-    ) else $error("%m: write lost the port mid read-modify-write");
-
     // Only one client may own the port at a time.
     a_one_owner: assert property (
         @(posedge clk) disable iff (!rst_n)

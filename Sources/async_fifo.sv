@@ -173,7 +173,11 @@ always_ff @(posedge wr_clk or negedge wr_rst_n) begin
     if (!wr_rst_n) begin
         almost_full <= 1'b0;
     end else begin
-        almost_full <= (gray2bin(wr_ptr_gray) - gray2bin(rd_ptr_gray_sync)) >= AF_THRESHOLD;
+        // Cast to the pointer width before subtracting. Without it the
+        // operands widen to 32 bits against a 7-bit function result and the
+        // tool warns at every occurrence.
+        almost_full <= ((PTR_WIDTH'(gray2bin(wr_ptr_gray)) -
+                         PTR_WIDTH'(gray2bin(rd_ptr_gray_sync))) >= PTR_WIDTH'(AF_THRESHOLD));
     end
 end
 
@@ -253,7 +257,8 @@ always_ff @(posedge rd_clk or negedge rd_rst_n) begin
     if (!rd_rst_n) begin
         almost_empty <= 1'b0;
     end else begin
-        almost_empty <= (gray2bin(wr_ptr_gray_sync) - gray2bin(rd_ptr_gray)) <= AE_THRESHOLD;
+        almost_empty <= ((PTR_WIDTH'(gray2bin(wr_ptr_gray_sync)) -
+                          PTR_WIDTH'(gray2bin(rd_ptr_gray))) <= PTR_WIDTH'(AE_THRESHOLD));
     end 
 end
 

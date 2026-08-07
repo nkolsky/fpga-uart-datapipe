@@ -7,7 +7,7 @@
 // introduced; it is now driven by sram_wr_ctrl, which serves both the
 // Single Pixel Write path and the Image Burst Write path (both arrive
 // through the 48-bit command FIFO). All three channel instances share
-// one wr_en / wr_addr and take their own wr_data.
+// one wr_en / wr_be / wr_addr and take their own wr_data.
 //
 // -----------------------------------------------------------------------
 // TIMING CONTRACT -- must match rgb_rom.sv exactly
@@ -113,19 +113,17 @@ module rgb_sram #(
     output logic [DATA_WIDTH-1:0]    rd_data,
 
     // -----------------------------------------------------------------
-    // Write port -- WHOLE WORD ONLY.
-    //
-    // There is no per-byte write enable. A write replaces all DATA_WIDTH
-    // bits of the addressed word.
-    //
-    // Each 32-bit channel word packs FOUR 8-bit pixels, so changing a
-    // single pixel means READ-MODIFY-WRITE: read the word, replace one
-    // byte, write it back. sram_rmw does that, and skips the read when the
-    // incoming data covers all four lanes -- which is the normal case for
-    // burst traffic, since a burst data message carries exactly four
-    // pixels and four pixels are exactly one word.
+    // Write port -- LIVE, driven by sram_wr_ctrl.
+    // wr_be selects which byte lanes of the addressed word are updated;
+    // a lane whose bit is low retains its current contents. This exists
+    // because each 32-bit channel word packs four 8-bit pixels, so the
+    // write path can fill a word one pixel at a time without a
+    // read-modify-write. sram_wr_ctrl computes the lane as
+    // 1 << (PIXELS_PER_WORD-1 - (pixel_index % 4)) -- MSB lane is the
+    // LEFTMOST pixel; see the byte-lane section of sram_wr_ctrl.sv.
     // -----------------------------------------------------------------
     input  logic                     wr_en,
+    input  logic [DATA_WIDTH/8-1:0]  wr_be,
     input  logic [$clog2(DEPTH)-1:0] wr_addr,
     input  logic [DATA_WIDTH-1:0]    wr_data
 );
@@ -176,7 +174,13 @@ module rgb_sram #(
     // block RAM inference outright.
     // -----------------------------------------------------------------
     always_ff @(posedge clk) begin
-        if (wr_en) mem[wr_addr] <= wr_data;
+        if (wr_en) begin
+            for (int i = 0; i < NUM_BYTES; i++) begin
+                if (wr_be[i]) begin
+                    mem[wr_addr][i*8 +: 8] <= wr_data[i*8 +: 8];
+                end
+            end
+        end
 
         if (rd_en) begin
             rd_data <= mem[rd_addr];

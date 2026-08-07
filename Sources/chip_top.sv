@@ -92,6 +92,12 @@ msg_format_pkg::msg_payload_t    mem_msg_payload;
 
 logic                            burst_err_sticky;
 
+// Register file commands, routed on the memory side from the message stream.
+logic        mem_rgf_cmd_valid;
+logic        mem_rgf_cmd_is_write;
+logic [7:0]  mem_rgf_cmd_addr;
+logic [31:0] mem_rgf_cmd_wdata;
+
 logic                  sram_wr_seen;
 logic                  sram_wr_rejected;
 logic                  img_fifo_ovf_sticky;
@@ -161,17 +167,18 @@ memory_subsystem #(
     .msg_kind              (mem_msg_kind),
     .msg_payload           (mem_msg_payload),
 
-    .pix_req_valid         (pix_req_valid_100),
-    .pix_req_data          (pix_req_data_100),
     .pix_rpy_accept        (pix_rpy_accept_100),
     .pix_rpy_send          (pix_rpy_send),
     .pix_rpy_payload       (pix_rpy_payload_100),
 
-    .brd_req_valid         (brd_req_valid_100),
-    .brd_req_data          (brd_req_data_100),
     .brd_msg_accept        (brd_msg_accept_100),
     .brd_msg_send          (brd_msg_send),
     .brd_msg_payload       (brd_msg_payload_100),
+
+    .rgf_cmd_valid         (mem_rgf_cmd_valid),
+    .rgf_cmd_is_write      (mem_rgf_cmd_is_write),
+    .rgf_cmd_addr          (mem_rgf_cmd_addr),
+    .rgf_cmd_wdata         (mem_rgf_cmd_wdata),
 
     .seq_done              (seq_done),
     .rom_seq_busy          (rom_seq_busy),
@@ -348,23 +355,11 @@ cdc_level_sync u_cdc_burst_active (
 // -----------------------------------------------------------------------------
 // Pixel-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
-cdc_cmd_sync #(
-    .ADDR_W (1),
-    .DATA_W (20)
-) u_cdc_pix_req (
-    .src_clk      (pll_clk_out),
-    .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rx_pr_cmd_valid),
-    .src_is_write (1'b0),
-    .src_addr     (1'b0),
-    .src_wdata    ({rx_pr_cmd_row, rx_pr_cmd_col}),
-    .dst_valid    (pix_req_valid_100),
-    .dst_is_write (),
-    .dst_addr     (),
-    .dst_wdata    (pix_req_data_100),
-    .dst_clk      (CLK100MHZ),
-    .dst_rst_n    (sync_rst_n)
-);
+// u_cdc_pix_req deleted. A single pixel read request is a MESSAGE now and
+// crosses on cdc_msg_sync with everything else, in order. It used to have
+// its own crossing running in parallel with the command FIFO, which meant
+// nothing ordered a read against the writes around it.
+
 
 // -----------------------------------------------------------------------------
 // Pixel-read reply CDC (100 MHz -> 130 MHz)
@@ -399,24 +394,9 @@ cdc_pulse_sync u_cdc_pix_rpy_accept (
 // -----------------------------------------------------------------------------
 // Burst-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
-cdc_cmd_sync #(
-    .ADDR_W (1),
-    .DATA_W (40)
-) u_cdc_brd_req (
-    .src_clk      (pll_clk_out),
-    .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rx_br_cmd_valid),
-    .src_is_write (1'b0),
-    .src_addr     (1'b0),
-    .src_wdata    ({rx_br_cmd_base_row, rx_br_cmd_base_col,
-                    rx_br_cmd_height,   rx_br_cmd_width}),
-    .dst_valid    (brd_req_valid_100),
-    .dst_is_write (),
-    .dst_addr     (),
-    .dst_wdata    (brd_req_data_100),
-    .dst_clk      (CLK100MHZ),
-    .dst_rst_n    (sync_rst_n)
-);
+// u_cdc_brd_req deleted. Same reason: an image burst read request is a
+// message. mem_msg_router dispatches it on the memory side.
+
 
 // -----------------------------------------------------------------------------
 // Burst-read reply CDC (100 MHz -> 130 MHz)
@@ -490,24 +470,15 @@ assign rgf_src_wdata    = rx_classifier_valid ? {8'b0, rx_pixel_q}
     ) else $error("chip_top: Register Write did not present a write command");
 `endif
 
-cdc_cmd_sync #(
-    .ADDR_W    (8),
-    .DATA_W    (32),
-    .IDLE_ADDR (8'hFF)
-) u_cdc_rgf_cmd (
-    .src_clk      (pll_clk_out),
-    .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rgf_src_valid),
-    .src_is_write (rgf_src_is_write),
-    .src_addr     (rgf_src_addr),
-    .src_wdata    (rgf_src_wdata),
-    .dst_valid    (rgf_cmd_valid_100),
-    .dst_is_write (rgf_cmd_is_write_100),
-    .dst_addr     (rgf_cmd_addr_100),
-    .dst_wdata    (rgf_cmd_wdata_100),
-    .dst_clk      (CLK100MHZ),
-    .dst_rst_n    (sync_rst_n)
-);
+// u_cdc_rgf_cmd deleted. Register reads and writes, and the legacy
+// {Rnnn,Cnnn,Vnnn} form, are messages. mem_msg_router decodes them and
+// drives register_subsystem directly.
+//
+// This one mattered most for ordering: a register write that enables
+// something, followed by a read that depends on it, used to cross on a
+// DIFFERENT path from the writes around them. Only similar latencies made
+// that appear to work.
+
 
 // Event CDCs (130 MHz -> 100 MHz)
 logic rx_parity_err_100;

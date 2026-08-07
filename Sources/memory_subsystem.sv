@@ -45,19 +45,23 @@ module memory_subsystem #(
     input  msg_format_pkg::msg_kind_t   msg_kind,
     input  msg_format_pkg::msg_payload_t msg_payload,
 
-    // Single-pixel read request/reply, already in the 100 MHz domain.
-    input  logic        pix_req_valid,
-    input  logic [19:0] pix_req_data,
+    // Read REQUESTS no longer arrive as separate crossings: they are
+    // messages like any other, and mem_msg_router dispatches them. Only the
+    // REPLIES still cross on their own, since they travel the other way.
     input  logic        pix_rpy_accept,
     output logic        pix_rpy_send,
     output logic [43:0] pix_rpy_payload,
 
-    // Burst-read request/reply, already in the 100 MHz domain.
-    input  logic        brd_req_valid,
-    input  logic [39:0] brd_req_data,
     input  logic        brd_msg_accept,
     output logic        brd_msg_send,
     output logic [95:0] brd_msg_payload,
+
+    // Register file commands, routed from the same message stream. The RGF
+    // itself lives in register_subsystem at the top level.
+    output logic        rgf_cmd_valid,
+    output logic        rgf_cmd_is_write,
+    output logic [7:0]  rgf_cmd_addr,
+    output logic [31:0] rgf_cmd_wdata,
 
     // Status/diagnostics retained for top-level integration and LEDs.
     output logic        seq_done,
@@ -116,30 +120,30 @@ logic arb_locked;
 logic arb_pix_owns;
 logic arb_brd_owns;
 
-// Write path <-> SRAM
-logic                                   wr_rd_en;
-logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] wr_rd_addr;
-logic                                   wr_port_req;
-logic                                   wr_port_grant;
-logic                                   wr_rect_busy;
-logic                                   wr_rmw_pulse;
+// Write path
+logic wr_port_grant;
+logic wr_rect_busy;
+
+// Router -> write path
+logic                                wr_msg_valid, wr_msg_ready;
+msg_format_pkg::msg_kind_t           wr_msg_kind;
+msg_format_pkg::msg_payload_t        wr_msg_payload;
+
+// Router -> read controllers
+logic       pix_req_valid;
+logic [9:0] pix_req_row, pix_req_col;
+logic       brd_req_valid;
+logic [9:0] brd_req_base_row, brd_req_base_col, brd_req_height, brd_req_width;
 
 logic        sram_rd_en_mux;
 logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_rd_addr_mux;
 
-// THE WRITE PATH IS NOW A READ CLIENT TOO.
-//
-// rgb_sram has no per-byte write enable, so a partial-word update is a
-// read-modify-write and sram_rmw needs the read port. It takes priority in
-// this mux because mem_interlock only grants it when no reader owns the
-// port -- the two conditions are mutually exclusive by construction, and the
-// interlock asserts it.
-assign sram_rd_en_mux   = wr_rd_en ? 1'b1
-                        : pix_rd_owner
+// The write path is NOT a read client: byte enables mean a partial-word
+// update needs no read.
+assign sram_rd_en_mux   = pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_en   : pix_sram_rd_en)
                         : rom_rd_en;
-assign sram_rd_addr_mux = wr_rd_en ? wr_rd_addr
-                        : pix_rd_owner
+assign sram_rd_addr_mux = pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_addr : pix_sram_rd_addr)
                         : rom_addr;
 
@@ -153,6 +157,7 @@ rgb_sram #(
     .rd_addr (sram_rd_addr_mux),
     .rd_data (red_data),
     .wr_en   (sram_wr_en),
+    .wr_be   (sram_wr_be),
     .wr_addr (sram_wr_addr),
     .wr_data (sram_wr_data_r)
 );
@@ -167,6 +172,7 @@ rgb_sram #(
     .rd_addr (sram_rd_addr_mux),
     .rd_data (green_data),
     .wr_en   (sram_wr_en),
+    .wr_be   (sram_wr_be),
     .wr_addr (sram_wr_addr),
     .wr_data (sram_wr_data_g)
 );
@@ -181,6 +187,7 @@ rgb_sram #(
     .rd_addr (sram_rd_addr_mux),
     .rd_data (blue_data),
     .wr_en   (sram_wr_en),
+    .wr_be   (sram_wr_be),
     .wr_addr (sram_wr_addr),
     .wr_data (sram_wr_data_b)
 );
@@ -223,34 +230,72 @@ rom_sequencer #(
 // A burst data message carries four pixels and four pixels are exactly one
 // word per channel, so burst traffic writes whole words and needs no reads.
 // -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// MESSAGE ROUTER
+//
+// Every message arrives on one ordered stream and is dispatched to the one
+// thing that handles it. Reads and register commands used to reach this
+// domain through their OWN cdc_cmd_sync instances, in parallel with the
+// command FIFO carrying writes, and nothing ordered those paths against each
+// other. Now dispatch follows the order the PC sent.
+//
+// The router HOLDS a message until its destination can take it. Both read
+// controllers take a one-cycle strobe and drop anything arriving while busy
+// -- each carries a req_overrun sticky saying so -- and that stall
+// propagates back through the crossing to the PC.
+// -----------------------------------------------------------------------
+mem_msg_router u_msg_router (
+    .clk              (clk),
+    .rst_n            (rst_n),
+
+    .msg_valid        (msg_valid),
+    .msg_ready        (msg_ready),
+    .msg_kind         (msg_kind),
+    .msg_payload      (msg_payload),
+
+    .wr_msg_valid     (wr_msg_valid),
+    .wr_msg_ready     (wr_msg_ready),
+    .wr_msg_kind      (wr_msg_kind),
+    .wr_msg_payload   (wr_msg_payload),
+
+    .pix_req_valid    (pix_req_valid),
+    .pix_req_row      (pix_req_row),
+    .pix_req_col      (pix_req_col),
+    .pix_busy         (pix_rd_busy),
+
+    .brd_req_valid    (brd_req_valid),
+    .brd_req_base_row (brd_req_base_row),
+    .brd_req_base_col (brd_req_base_col),
+    .brd_req_height   (brd_req_height),
+    .brd_req_width    (brd_req_width),
+    .brd_busy         (brd_busy),
+
+    .rgf_cmd_valid    (rgf_cmd_valid),
+    .rgf_cmd_is_write (rgf_cmd_is_write),
+    .rgf_cmd_addr     (rgf_cmd_addr),
+    .rgf_cmd_wdata    (rgf_cmd_wdata)
+);
+
 mem_write_subsystem u_write_path (
-    .clk             (clk),
-    .rst_n           (rst_n),
+    .clk          (clk),
+    .rst_n        (rst_n),
 
-    .msg_valid       (msg_valid),
-    .msg_ready       (msg_ready),
-    .msg_kind        (msg_kind),
-    .msg_payload     (msg_payload),
+    .msg_valid    (wr_msg_valid),
+    .msg_ready    (wr_msg_ready),
+    .msg_kind     (wr_msg_kind),
+    .msg_payload  (wr_msg_payload),
 
-    .rd_en           (wr_rd_en),
-    .rd_addr         (wr_rd_addr),
-    .rd_data_r       (red_data),
-    .rd_data_g       (green_data),
-    .rd_data_b       (blue_data),
+    .wr_en        (sram_wr_en),
+    .wr_be        (sram_wr_be),
+    .wr_addr      (sram_wr_addr),
+    .wr_data_r    (sram_wr_data_r),
+    .wr_data_g    (sram_wr_data_g),
+    .wr_data_b    (sram_wr_data_b),
 
-    .wr_en           (sram_wr_en),
-    .wr_addr         (sram_wr_addr),
-    .wr_data_r       (sram_wr_data_r),
-    .wr_data_g       (sram_wr_data_g),
-    .wr_data_b       (sram_wr_data_b),
+    .wr_allowed   (wr_port_grant),
 
-    .port_req        (wr_port_req),
-    .port_grant      (wr_port_grant),
-    .wr_busy         (sram_wr_busy),
-
-    .rect_busy       (wr_rect_busy),
-    .rmw_count_pulse (wr_rmw_pulse),
-    .wr_rejected     (sram_wr_rejected)
+    .rect_busy    (wr_rect_busy),
+    .wr_rejected  (sram_wr_rejected)
 );
 
 // sram_wr_seen: at least one pixel has been written.
@@ -263,8 +308,8 @@ pixel_rd_ctrl u_pixel_rd_ctrl (
     .clk          (clk),
     .rst_n        (rst_n),
     .req_valid    (pix_req_valid),
-    .req_row      (pix_req_data[19:10]),
-    .req_col      (pix_req_data[9:0]),
+    .req_row      (pix_req_row),
+    .req_col      (pix_req_col),
     .pix_rd_req   (pix_rd_req),
     .pix_rd_gnt   (pix_rd_gnt),
     .pix_rd_done  (pix_rd_done),
@@ -286,10 +331,10 @@ burst_rd_ctrl u_burst_rd_ctrl (
     .clk          (clk),
     .rst_n        (rst_n),
     .req_valid    (brd_req_valid),
-    .req_base_row (brd_req_data[39:30]),
-    .req_base_col (brd_req_data[29:20]),
-    .req_height   (brd_req_data[19:10]),
-    .req_width    (brd_req_data[9:0]),
+    .req_base_row (brd_req_base_row),
+    .req_base_col (brd_req_base_col),
+    .req_height   (brd_req_height),
+    .req_width    (brd_req_width),
     .brd_rd_req   (brd_rd_req),
     .brd_rd_gnt   (brd_rd_gnt),
     .brd_rd_done  (brd_rd_done),
@@ -342,8 +387,8 @@ mem_interlock u_mem_interlock (
     .rom_seq_busy (rom_seq_busy),
     .img_done     (img_done),
     .read_go      (read_go),
-    .wr_port_req  (wr_port_req),
-    .wr_busy      (sram_wr_busy),
+    .wr_port_req  (wr_msg_valid),
+    .wr_busy      (wr_rect_busy),
     .burst_active (burst_active),
     .wr_port_grant (wr_port_grant),
     .pix_rd_req   (shared_rd_req),
