@@ -221,6 +221,22 @@ logic        tx_activity_led;
 logic        rr_reply_pending;
 logic        rr_reply_overrun;
 
+// UART_RTS is the host's RTS pin: asynchronous to pll_clk_out, since the
+// FTDI runs from its own crystal. Sampled directly it can violate setup or
+// hold on a transmit-path flop and go metastable, and an invalid level fanned
+// out to several gates can be read as 0 by one and 1 by another -- which puts
+// the transmit state machine into a state its own logic says cannot exist.
+// Two flops give the first one a full clock period, with nothing downstream,
+// to settle before the second samples it.
+//
+// Reset value is 1 = deasserted = hold off, so the transmitter never starts
+// before the real level has been observed.
+logic cts_meta, cts_sync;
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n) {cts_sync, cts_meta} <= 2'b11;
+    else                 {cts_sync, cts_meta} <= {cts_meta, UART_RTS};
+end
+
 uart_tx_subsystem u_uart_tx_subsystem (
     .clk                (pll_clk_out),
     .rst_n              (sync_pll_rst_n),
@@ -228,7 +244,7 @@ uart_tx_subsystem u_uart_tx_subsystem (
     .fifo_empty         (fifo_empty),
     .fifo_rd_data       (fifo_rd_data),
     .fifo_rd_en         (fifo_rd_en),
-    .cts                (UART_RTS),
+    .cts                (cts_sync),
 
     .rd_reply_valid     (rx_rd_reply_valid),
     .rd_reply_data      (rx_rd_reply_data),
@@ -514,7 +530,18 @@ assign start_pulse = rgf_start_img_read;
 // -----------------------------------------------------------------------------
 // UART flow control
 // -----------------------------------------------------------------------------
-assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy);
+// rr_reply_pending belongs here as much as the other three. The reply path
+// has a SINGLE slot: while one reply is queued, a request arriving behind it
+// has nowhere to put its answer. Advertising readiness in that state invites
+// the host to send a request whose reply is then lost -- silently, because
+// the request itself was accepted and parsed perfectly well.
+//
+// This matters only once the transmitter can actually be held off. Before
+// cts gating existed, `pending` cleared within a message time (~20 us) and
+// the window was too narrow to hit; a host that stalls the link now holds it
+// open for as long as it likes.
+assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy ||
+                   rr_reply_pending);
 
 // -----------------------------------------------------------------------------
 // LEDs

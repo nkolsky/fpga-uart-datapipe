@@ -153,6 +153,7 @@ tx_reply_ctrl u_tx_reply_ctrl (
     .brd_accept    (burst_reply_accept),
     .tx_seq_busy   (tx_seq_busy),
     .mac_busy      (mac_busy),
+    .cts           (cts),
     .reply_req     (reply_req),
     .reply_msg     (reply_msg),
     .reply_len     (reply_len),
