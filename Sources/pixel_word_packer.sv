@@ -65,7 +65,9 @@
 module pixel_word_packer
     import memory_pkg::*;
 #(
-    parameter int PIX_W  = 8,                       // bits per channel
+    // Derived like the three below it, which already come from memory_pkg.
+    // It was the only literal in the group.
+    parameter int PIX_W  = CHANNEL_WIDTH,           // bits per channel
     parameter int ADDR_W = SRAM_ADDR_WIDTH,         // word address width
     parameter int DATA_W = SRAM_DATA_WIDTH,         // 32
     parameter int NLANE  = PIXELS_PER_WORD          // 4

@@ -65,8 +65,13 @@ module mem_msg_writer
     import msg_format_pkg::*;
     import memory_pkg::*;
 #(
-    parameter int PAYLOAD_BITS = 96,
-    parameter int PIX_BITS     = 8
+    // Derived, not literal. Both packages are already imported above, so
+    // these were 96 and 8 by coincidence rather than by connection: change
+    // MSG_PAYLOAD_W or CHANNEL_WIDTH and this module would have gone on
+    // slicing the old width, which Vivado reports as a width warning at
+    // most. Same class as the tx_sequencer geometry bug.
+    parameter int PAYLOAD_BITS = MSG_PAYLOAD_W,     // 96
+    parameter int PIX_BITS     = CHANNEL_WIDTH      // 8
 )(
     input  logic clk,
     input  logic rst_n,
