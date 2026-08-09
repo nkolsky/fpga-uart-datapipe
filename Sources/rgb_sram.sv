@@ -4,10 +4,14 @@
 // rgb_rom.sv's `rom` module, plus a byte-enabled write port.
 //
 // THE WRITE PORT IS LIVE. It was tied to 1'b0 when this module was first
-// introduced; it is now driven by sram_wr_ctrl, which serves both the
-// Single Pixel Write path and the Image Burst Write path (both arrive
-// through the 48-bit command FIFO). All three channel instances share
+// introduced; it is now driven by mem_write_subsystem, which serves both
+// the Single Pixel Write path and the Image Burst Write path -- both arrive
+// as MESSAGES on cdc_msg_sync, and mem_msg_writer turns each into a
+// rectangle that pixel_word_packer fills. All three channel instances share
 // one wr_en / wr_be / wr_addr and take their own wr_data.
+//
+// Earlier revisions named sram_wr_ctrl here, fed by a 48-bit command FIFO.
+// Both are gone.
 //
 // -----------------------------------------------------------------------
 // TIMING CONTRACT -- must match rgb_rom.sv exactly
@@ -59,16 +63,17 @@
 //   1. STRUCTURALLY, by mem_interlock.sv. It is the single arbiter of
 //      this memory and grants exclusive ownership to exactly one of the
 //      three clients -- the full-frame reader (rom_sequencer), the
-//      writer (sram_wr_ctrl, serving both single-pixel and burst
+//      writer (mem_write_subsystem, serving both single-pixel and burst
 //      writes), and the read-port borrower (pixel_rd_ctrl or
-//      burst_rd_ctrl, arbitrated ahead of the interlock in chip_top).
+//      burst_rd_ctrl, arbitrated ahead of the interlock inside
+//      memory_subsystem).
 //      wr_allowed and read_go are never both live, so rd_en and wr_en
 //      cannot be high in the same cycle at all, let alone at the same
 //      address.
 //
 //   2. BY ASSERTION, via the simulation-only check at the bottom of this
 //      file. This is the backstop: if a future change to the interlock
-//      or to the chip_top read mux breaks the exclusion above, the
+//      or to memory_subsystem's read mux breaks the exclusion above, the
 //      assertion turns a silent hardware-only bug into a loud simulation
 //      failure.
 //
@@ -113,14 +118,16 @@ module rgb_sram #(
     output logic [DATA_WIDTH-1:0]    rd_data,
 
     // -----------------------------------------------------------------
-    // Write port -- LIVE, driven by sram_wr_ctrl.
+    // Write port -- LIVE, driven by pixel_word_packer.
     // wr_be selects which byte lanes of the addressed word are updated;
     // a lane whose bit is low retains its current contents. This exists
     // because each 32-bit channel word packs four 8-bit pixels, so the
     // write path can fill a word one pixel at a time without a
-    // read-modify-write. sram_wr_ctrl computes the lane as
-    // 1 << (PIXELS_PER_WORD-1 - (pixel_index % 4)) -- MSB lane is the
-    // LEFTMOST pixel; see the byte-lane section of sram_wr_ctrl.sv.
+    // read-modify-write. pixel_word_packer computes the lane index as
+    // idx = (NLANE-1) - pixel_index[1:0] and sets wr_be[idx] -- MSB lane
+    // is the LEFTMOST pixel; see the LANE ORIENTATION section of
+    // pixel_word_packer.sv. rom_sequencer, pixel_rd_ctrl and burst_rd_ctrl
+    // all read with the same orientation.
     // -----------------------------------------------------------------
     input  logic                     wr_en,
     input  logic [DATA_WIDTH/8-1:0]  wr_be,

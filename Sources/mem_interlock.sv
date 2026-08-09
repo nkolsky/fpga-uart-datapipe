@@ -9,15 +9,26 @@
 //
 //   1. Full-frame image read   rom_sequencer, via read_go.
 //                              Owns the read port for a whole frame.
-//   2. Write path              sram_rmw, via wr_port_grant. Serves BOTH
-//                              Single Pixel Write and Image Burst Write --
-//                              they are the same commands arriving through
-//                              the same 48-bit FIFO, so there is no
-//                              separate burst-write client here.
+//   2. Write path              mem_write_subsystem, via wr_port_grant.
+//                              Serves BOTH Single Pixel Write and Image
+//                              Burst Write -- mem_msg_writer turns each
+//                              into a rectangle (1x1 or HxW) and
+//                              pixel_word_packer issues masked word
+//                              writes, so there is no separate burst-write
+//                              client here.
+//
+//                              NAMED sram_rmw AND sram_wr_ctrl IN EARLIER
+//                              REVISIONS. Both are gone, and so is the
+//                              48-bit command FIFO they drained. The name
+//                              sram_rmw is actively misleading now: there
+//                              is no read-modify-write anywhere in this
+//                              design, because rgb_sram has a per-byte
+//                              write enable and a single pixel is exactly
+//                              one byte lane.
 //   3. Read-port borrower      pixel_rd_ctrl OR burst_rd_ctrl, via
 //                              pix_rd_req / pix_rd_gnt / pix_rd_done.
 //                              These two are arbitrated against each other
-//                              in chip_top BEFORE this module sees them,
+//                              in memory_subsystem BEFORE this module sees them,
 //                              and arrive as one shared request. The port
 //                              names still say "pix" for that reason -- see
 //                              the port comments below.
@@ -133,11 +144,24 @@
 // -----------------------------------------------------------------------
 // NO COMBINATIONAL LOOP
 // -----------------------------------------------------------------------
-// wr_busy comes only from registered state inside sram_wr_ctrl (pop_q,
-// wr_en), never from its combinational cmd_rd_en. The cycle in which
-// a request is asserted is covered here by wr_port_req instead, since one
-// can only be issued when the FIFO is non-empty. That breaks what would
-// otherwise be a loop through wr_port_grant.
+// Both write-side inputs are registered at their source, so nothing here
+// feeds back into wr_port_grant:
+//
+//   wr_busy      is mem_write_subsystem's rect_busy, which is
+//                pixel_word_packer's `busy` FLOP -- set on start, cleared
+//                when the rectangle completes.
+//   wr_port_req  is mem_msg_router's wr_msg_valid = msg_valid && to_write,
+//                and msg_valid is cdc_msg_sync's dst_valid, also a flop.
+//
+// wr_port_grant therefore depends only on registered state. It reaches the
+// packer as its wr_ready, and the resulting stall propagates back through
+// pixel_ready and the writer's msg_ready -- all of which are decodes of
+// registered FSM state, not of the grant. That breaks what would otherwise
+// be a loop.
+//
+// An earlier version of this note argued the same point in terms of
+// sram_wr_ctrl's pop_q / wr_en / cmd_rd_en and the command FIFO being
+// non-empty. That module and that FIFO are both gone.
 //
 // -----------------------------------------------------------------------
 // STAGE 3 / M4: burst_active
@@ -195,7 +219,8 @@ module mem_interlock (
     // this clock domain. See the note below for why a request signal alone
     // is not sufficient.
     input  logic burst_active,
-    output logic wr_port_grant,  // -> sram_rmw.port_grant
+    output logic wr_port_grant,  // -> mem_write_subsystem.wr_allowed,
+                                 //    i.e. pixel_word_packer's wr_ready
 
     // -----------------------------------------------------------------
     // READ-PORT BORROWER: third client of the memory. It borrows the SRAM
@@ -205,7 +230,7 @@ module mem_interlock (
     // THE "pix" PREFIX IS HISTORICAL. This port pair was added for
     // pixel_rd_ctrl alone, but burst_rd_ctrl is now a second borrower with
     // identical needs. The two are arbitrated against each other inside
-    // chip_top and presented here as ONE shared request -- see
+    // memory_subsystem and presented here as ONE shared request -- see
     // shared_rd_req / shared_rd_gnt / shared_rd_done at the instantiation.
     // This module deliberately does not know which of the two it is
     // granting; from here they are one client, which is why no fourth
@@ -225,7 +250,7 @@ module mem_interlock (
     input  logic pix_rd_done,
     output logic pix_rd_gnt,
 
-    // Ownership of the SRAM READ PORT, for the chip_top read mux.
+    // Ownership of the SRAM READ PORT, for memory_subsystem's read mux.
     //
     // Exported rather than recomputed at the mux, so that the arbiter and
     // the datapath cannot disagree about who owns the port. This is the
@@ -238,7 +263,7 @@ module mem_interlock (
     logic img_in_flight;
     logic pix_rd_active;
 
-    // The read-port mux in chip_top follows this exactly.
+    // The read-port mux in memory_subsystem follows this exactly.
     assign pix_rd_owner = pix_rd_active;
     logic wr_pending;
     logic read_active;
@@ -249,8 +274,9 @@ module mem_interlock (
     // does go low between frames -- without this term a start arriving
     // mid-burst would launch rom_sequencer with half an image written.
     //
-    // wr_busy is what protects an update in progress: while sram_rmw is
-    // between its read and its write, nothing else may take the port.
+    // wr_busy is what protects an update in progress: while a rectangle is
+    // open in pixel_word_packer -- pixels absorbed but the accumulated word
+    // not yet issued -- nothing else may take the port.
     assign wr_pending  = wr_port_req || wr_busy || burst_active;
 
     // A read may launch only when the PREVIOUS transfer is completely done

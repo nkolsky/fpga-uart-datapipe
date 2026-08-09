@@ -65,9 +65,14 @@
 // Nothing is discarded; the transfer takes longer. Every link is one register
 // deep, so no queue is needed anywhere.
 //
-// NOTE: the RX side does not yet consume src_ready. rx_classifier still
-// pulses its command for one cycle and assumes it was taken. Until that chain
-// is built, src_ready is correct but unused on this side of the boundary.
+// THE CHAIN IS BUILT. rx_classifier consumes src_ready: it holds out_valid
+// until out_ready, raises out_busy while either pipeline stage is occupied,
+// and rx_mac stalls a completed frame in its buffer rather than announcing
+// it (waiting in MAC_CHK, not MAC_DONE, so frame_done is not held high).
+// mac_busy therefore stays high and UART_CTS deasserts. An earlier version
+// of this note said the RX side did not yet consume src_ready and that
+// rx_classifier still pulsed its command for one cycle -- that has not been
+// true since the classifier was given its output register and second stage.
 //
 // -----------------------------------------------------------------------
 // HOW IT WORKS -- TWO-PHASE (TOGGLE) REQ/ACK
