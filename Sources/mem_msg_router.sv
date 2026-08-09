@@ -176,12 +176,38 @@ module mem_msg_router
             brd_req_width    <= '0;
             rgf_cmd_valid    <= 1'b0;
             rgf_cmd_is_write <= 1'b0;
-            rgf_cmd_addr     <= '0;
+            // NOT '0 -- see the parking note below. 8'h00 is IMG_STATUS.
+            rgf_cmd_addr     <= rgf_pkg::IDLE_ADDR;
             rgf_cmd_wdata    <= '0;
         end else begin
             pix_req_valid <= 1'b0;
             brd_req_valid <= 1'b0;
             rgf_cmd_valid <= 1'b0;
+
+            // ADDRESS PARKING -- REQUIRED BY THE REGISTER FILE.
+            //
+            // rgf's IMG_TX_MON read-to-clear is a level-sensitive decode
+            // with no valid qualifier:
+            //
+            //     else if (!pc_wen && pc_sel_img_tx_mon)   // rgf.sv
+            //
+            // so holding the last address between commands clears
+            // img_send_complete/img_send_error on every idle cycle once
+            // that address has been IMG_TX_MON_ADDR, and the IMG_CTRL
+            // start interlock quietly stops working.
+            //
+            // This obligation used to be met by cdc_cmd_sync, which drove
+            // dst_addr to its IDLE_ADDR parameter whenever dst_valid was
+            // low. That crossing was deleted when register commands became
+            // messages, and the parking went with it -- rgf_cmd_addr was
+            // assigned only inside `if (fire && to_rgf)` and therefore held
+            // indefinitely. Defaulting it here restores the guarantee at
+            // the module that now owns the port.
+            //
+            // The non-blocking assignment in the to_rgf arm below overrides
+            // this on the cycle a command is actually issued, so the address
+            // is correct exactly when rgf_cmd_valid is high.
+            rgf_cmd_addr  <= rgf_pkg::IDLE_ADDR;
 
             if (fire) begin
                 if (to_pix) begin

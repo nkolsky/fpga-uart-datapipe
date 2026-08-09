@@ -88,6 +88,37 @@ package rgf_pkg;
     localparam logic [7:0] PARITY_FAULT_CNT_ADDR = 8'h14;
 
     // -----------------------------------------------------------------
+    // IDLE_ADDR -- the address presented when NO command is being issued.
+    //
+    // This is a REQUIREMENT of this register file, not a convenience of
+    // whoever drives it, which is why it lives here beside the map.
+    //
+    // IMG_TX_MON's read-to-clear is a LEVEL-SENSITIVE decode:
+    //
+    //     else if (!pc_wen && pc_sel_img_tx_mon)   // rgf.sv
+    //
+    // There is no valid qualifier on it. So a driver that HOLDS its last
+    // address between commands clears img_send_complete/img_send_error on
+    // every idle cycle once that address has been 0x04, and the IMG_CTRL
+    // start interlock silently stops working -- no error, no assertion,
+    // just a flag that can never latch.
+    //
+    // The requirement is therefore: park the address here whenever the
+    // command is not valid. It must decode to nothing, i.e. match none of
+    // 0x00/0x04/0x08/0x0C/0x10/0x14.
+    //
+    // HISTORY. This used to be enforced structurally by cdc_cmd_sync's
+    // IDLE_ADDR parameter, which defaulted to '1 and drove dst_addr to it
+    // whenever dst_valid was low. That crossing was removed when register
+    // commands became messages routed by mem_msg_router, and the parking
+    // went with it -- mem_msg_router assigned rgf_cmd_addr only inside
+    // `if (fire && to_rgf)`, so the address held indefinitely. The
+    // obligation now belongs to the router, and naming the constant here
+    // keeps it defined once rather than as a literal at the driver.
+    // -----------------------------------------------------------------
+    localparam logic [7:0] IDLE_ADDR = 8'hFF;
+
+    // -----------------------------------------------------------------
     // IMG_STATUS bitfields - RO (continuous passthrough from static inputs)
     //   [9:0]   img_height
     //   [19:10] img_width
