@@ -1,6 +1,6 @@
 // tx_reply_ctrl.sv
 // ----------------
-// Builds and schedules host replies on the 130 MHz transmit domain.
+// Builds and schedules host replies on the 256 MHz transmit domain.
 //
 // TWO reply kinds share one pending slot:
 //
@@ -94,7 +94,7 @@
 module tx_reply_ctrl
     import msg_pkg::*;
 (
-    input  logic         clk,            // pll_clk_out, 130 MHz
+    input  logic         clk,            // pll_clk_out, 256 MHz
     input  logic         rst_n,          // sync_pll_rst_n
 
     // ---- Register Read value, already in this clock domain ------------
@@ -120,7 +120,7 @@ module tx_reply_ctrl
     // Unlike the other two this one is a STREAM: one burst emits
     // ceil(H*W/4) messages, up to 16,384 for a full frame. Each is handed
     // over individually through this same single slot, which is ample
-    // because the UART needs ~19.7 us per message while the handshake
+    // because the UART needs ~22 us per message while the handshake
     // costs tens of nanoseconds.
     input  logic         brd_valid,
     input  logic [127:0] brd_msg,

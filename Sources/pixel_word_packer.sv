@@ -50,8 +50,9 @@
 //     linear addr 7 -> word 1, lane 3 -> word[ 7: 0], be[0]
 //
 // So the byte-enable bit index and the data byte position are the SAME index,
-// 3 - lane. This matches sram_wr_ctrl's existing convention exactly; changing
-// it here would shuffle pixels within each group of four.
+// 3 - lane. This matches the lane ordering used by rom_sequencer,
+// pixel_rd_ctrl and burst_rd_ctrl; changing it here would shuffle pixels
+// within each group of four.
 //
 // -----------------------------------------------------------------------
 // FLOW CONTROL

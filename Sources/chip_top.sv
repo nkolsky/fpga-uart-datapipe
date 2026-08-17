@@ -29,6 +29,8 @@ logic pll_locked;
 logic clk_sel;              // driven by register_subsystem below
 logic heartbeat;
 
+// clk_130_out / rst_130_n are legacy signal names kept for compatibility;
+// the PLL output is the 256 MHz domain used by the UART and image logic.
 clocking_subsystem u_clocking_subsystem (
     .clk_100_in   (CLK100MHZ),
     .async_reset_n(CPU_RESETN),
@@ -80,7 +82,7 @@ logic        brd_msg_accept_130;
 // FIFO, status and register-reply interconnect
 // -----------------------------------------------------------------------------
 
-// Message crossing, 130 MHz side and 100 MHz side.
+// Message crossing, 256 MHz side and 100 MHz side.
 logic                            rx_msg_valid, rx_msg_ready;
 msg_format_pkg::msg_kind_t       rx_msg_kind;
 msg_format_pkg::msg_payload_t    rx_msg_payload;
@@ -120,7 +122,7 @@ logic        seq_done;          // rom_sequencer → chip_top: one-cycle done pu
 logic        rom_seq_busy;
 
 // -----------------------------------------------------------------------------
-// Image FIFO status CDC (130 MHz -> 100 MHz)
+// Image FIFO status CDC (256 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 logic almost_empty_100;
 logic fifo_empty_100;
@@ -209,7 +211,7 @@ async_fifo u_img_fifo (
 );
 
 // -----------------------------------------------------------------------------
-// UART transmit subsystem (130 MHz)
+// UART transmit subsystem (256 MHz)
 // -----------------------------------------------------------------------------
 logic        mac_busy;
 logic        tx_img_done;
@@ -270,7 +272,7 @@ uart_tx_subsystem u_uart_tx_subsystem (
 );
 
 // -----------------------------------------------------------------------------
-// RX subsystem interconnect (130 MHz)
+// RX subsystem interconnect (256 MHz)
 // -----------------------------------------------------------------------------
 logic        rx_phy_busy;
 logic        rx_mac_busy;
@@ -284,7 +286,7 @@ logic        rx_classifier_error;
 logic        pix_wr_seen_sticky;
 
 // -----------------------------------------------------------------------------
-// RX subsystem (130 MHz)
+// RX subsystem (256 MHz)
 //
 // This block receives UART data, decodes frames, and emits one message at a
 // time for the memory side.
@@ -310,7 +312,7 @@ rx_subsystem u_rx_subsystem (
 );
 
 // -----------------------------------------------------------------------------
-// MESSAGE CROSSING, 130 MHz -> 100 MHz
+// MESSAGE CROSSING, 256 MHz -> 100 MHz
 //
 // RX messages are handed to the memory side with back-pressure. The source
 // stalls when the destination is busy, so the receiver does not silently drop
@@ -337,7 +339,7 @@ cdc_msg_sync #(
 );
 
 // -----------------------------------------------------------------------------
-// Burst-active CDC (130 MHz -> 100 MHz)
+// Burst-active CDC (256 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 
 cdc_level_sync u_cdc_burst_active (
@@ -348,13 +350,13 @@ cdc_level_sync u_cdc_burst_active (
 );
 
 // -----------------------------------------------------------------------------
-// Pixel-read request CDC (130 MHz -> 100 MHz)
+// Pixel-read request CDC (256 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 // Single-pixel reads are carried as messages and ordered with the rest of the
 // request stream.
 
 // -----------------------------------------------------------------------------
-// Pixel-read reply CDC (100 MHz -> 130 MHz)
+// Pixel-read reply CDC (100 MHz -> 256 MHz)
 // -----------------------------------------------------------------------------
 cdc_cmd_sync #(
     .ADDR_W (1),
@@ -384,13 +386,13 @@ cdc_pulse_sync u_cdc_pix_rpy_accept (
 );
 
 // -----------------------------------------------------------------------------
-// Burst-read request CDC (130 MHz -> 100 MHz)
+// Burst-read request CDC (256 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 // Burst requests are also sent as messages, then dispatched by the memory-side
 // router.
 
 // -----------------------------------------------------------------------------
-// Burst-read reply CDC (100 MHz -> 130 MHz)
+// Burst-read reply CDC (100 MHz -> 256 MHz)
 // -----------------------------------------------------------------------------
 cdc_cmd_sync #(
     .ADDR_W (1),
@@ -425,7 +427,7 @@ cdc_pulse_sync u_cdc_brd_accept (
 // Register reads/writes arrive as messages and are decoded on the memory side
 // before driving the register subsystem.
 
-// Event CDCs (130 MHz -> 100 MHz)
+// Event CDCs (256 MHz -> 100 MHz)
 logic rx_parity_err_100;
 
 cdc_pulse_sync u_cdc_tx_img_done (
@@ -482,7 +484,7 @@ register_subsystem u_register_subsystem (
     .clk_sel           (clk_sel)
 );
 
-// Register-read reply CDC (100 MHz -> 130 MHz)
+// Register-read reply CDC (100 MHz -> 256 MHz)
 cdc_cmd_sync #(
     .ADDR_W (1),
     .DATA_W (32)

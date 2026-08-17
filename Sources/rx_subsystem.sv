@@ -1,6 +1,6 @@
 // rx_subsystem.sv
 // ---------------
-// Complete 130 MHz receive path: serial line in, ONE message out.
+// Complete 256 MHz receive path: serial line in, ONE message out.
 //
 //   rx_in -> rx_phy -> rx_mac -> rx_msg_parser -> rx_classifier -> msg out
 //                        ^            |                  |
@@ -47,7 +47,7 @@
 // FIFO and cmd_ovf_sticky on LED[13] to report when it overflowed.
 //
 // -----------------------------------------------------------------------
-// SINGLE CLOCK DOMAIN -- 130 MHz
+// SINGLE CLOCK DOMAIN -- 256 MHz
 // -----------------------------------------------------------------------
 // Everything here runs on pll_clk_out and resets from sync_pll_rst_n. There
 // is NO clock-domain crossing inside this module and none may ever be added:
@@ -59,7 +59,7 @@
 module rx_subsystem
     import msg_format_pkg::*;
 (
-    // ---- 130 MHz UART domain -------------------------------------------
+    // ---- 256 MHz UART domain -------------------------------------------
     input  logic                 clk,             // pll_clk_out
     input  logic                 rst_n,           // sync_pll_rst_n
 

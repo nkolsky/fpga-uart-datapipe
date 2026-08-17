@@ -5,11 +5,14 @@
 //
 // Contains:
 //   - 100 MHz reset synchronizer
-//   - clk_wiz_0 (100 MHz -> 130 MHz)
-//   - 130 MHz reset synchronizer
+//   - clk_wiz_0 (100 MHz -> 256 MHz PLL output)
+//   - PLL reset synchronizer
 //   - synthesis BUFGCTRL / simulation glitchless_clk_mux
 //   - PLL-lock qualification for clock selection
 //   - heartbeat counter driven by the selected clock
+//
+// clk_130_out / rst_130_n are legacy names kept for compatibility; the
+// active PLL output is the 256 MHz domain.
 //
 // IMPORTANT XDC HIERARCHY CHANGE:
 //   u_clk_wiz_0/... becomes
@@ -40,7 +43,7 @@ reset_synch u_reset_synch (
     .sync_rst_n  (rst_100_n)
 );
 
-// Clocking Wizard: 100 MHz input -> 130 MHz output.
+// Clocking Wizard: 100 MHz input -> 256 MHz PLL output.
 clk_wiz_0 u_clk_wiz_0 (
     .clk_out1 (clk_130_out),
     .resetn   (rst_100_n),
@@ -48,7 +51,7 @@ clk_wiz_0 u_clk_wiz_0 (
     .clk_in1  (clk_100_in)
 );
 
-// Synchronize external reset release into the 130 MHz domain.
+// Synchronize external reset release into the PLL domain.
 reset_synch u_pll_reset_synch (
     .clk         (clk_130_out),
     .async_rst_n (async_reset_n),

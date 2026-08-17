@@ -3,7 +3,7 @@
 // 6-state Moore FSM UART receiver - PHY layer only.
 // Strictly structured 3-block FSM style:
 //   - Clean separation of State, Next-State, and Output blocks.
-//   - Implements a 3-FF CDC Synchronizer to prevent simulation/hardware metastabilities.
+//   - Implements a 3-FF CDC synchronizer to prevent simulation/hardware metastabilities.
 //   - Aligns oversampling counters to incoming falling edges to eliminate clock jitter.
 //
 // Oversampling: 16 ticks per bit period. Data bits sampled at tick_q==8 (centre).
@@ -25,7 +25,7 @@
 //     chip_top.sv -- this is no longer pending work:
 //
 //       1. rx_mac soft reset. Connected straight to rx_mac's par_val_rst
-//          input, in this same 130 MHz domain, no synchroniser needed.
+//          input, in this same 256 MHz domain, no synchroniser needed.
 //          rx_mac uses it to force cur_state back to MAC_IDLE and clear
 //          msg_buf / byte_idx / byte_we, so a frame corrupted by a bad
 //          byte is abandoned rather than completed with every subsequent

@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 // uart_tx_subsystem.sv
 //
-// Pure hierarchy extraction of the complete 130 MHz UART transmit datapath.
+// Pure hierarchy extraction of the complete 256 MHz UART transmit datapath.
 //
 // Contains:
 //   - tx_sequencer
@@ -29,16 +29,16 @@ module uart_tx_subsystem (
     // Host-side flow control.
     input  logic         cts,
 
-    // Register-read reply, already delivered into the 130 MHz domain.
+    // Register-read reply, already delivered into the 256 MHz domain.
     input  logic         rd_reply_valid,
     input  logic [31:0]  rd_reply_data,
 
-    // Atomic pixel-reply transaction from the 100->130 MHz CDC.
+    // Atomic pixel-reply transaction from the 100 MHz -> 256 MHz CDC.
     input  logic         pix_reply_valid,
     input  logic [43:0]  pix_reply_data,
     output logic         pix_reply_accept,
 
-    // Atomic burst-reply transaction from the 100->130 MHz CDC.
+    // Atomic burst-reply transaction from the 100 MHz -> 256 MHz CDC.
     input  logic         burst_reply_valid,
     input  logic [95:0]  burst_reply_data,
     output logic         burst_reply_accept,

@@ -34,7 +34,6 @@
 //        11       2     W  P                  Single Pixel Write
 //        16       3     W  V  V               Register Write
 //        16       3     R  C  P               Single Pixel Read
-//        16       3     R  C  V               legacy {Rnnn,Cnnn,Vnnn}
 //        16       3     I  H  W               Image Burst Write header
 //        16       3     R  H  W               Image Burst Read
 //        16       -     (bypass_active)       Image Burst Write data

@@ -26,8 +26,8 @@
 //
 //   A 256x256 Burst Read reads 65,536 pixels and emits 16,384 messages.
 //   Ownership is held across the whole of that, including every TX stall,
-//   so writes and full-frame reads are blocked for roughly 0.35 s at
-//   8.125 Mbaud. Pending writes are deferred, not lost -- mem_interlock
+//   so writes and full-frame reads are blocked for roughly 0.36 s at
+//   8 Mbaud. Pending writes are deferred, not lost -- mem_interlock
 //   holds them -- but the host must not expect a write issued during a
 //   large burst to complete promptly.
 //
@@ -59,8 +59,8 @@
 // sub-rectangle's rows are generally not word-aligned and W is generally
 // not a multiple of four, so the four pixels of a message are not in
 // general four lanes of one word. Reading one pixel at a time costs four
-// SRAM accesses per message instead of one; at 8.125 Mbaud the UART needs
-// ~19.7 us per message and the SRAM is idle for effectively all of it.
+// SRAM accesses per message instead of one; at 8 Mbaud the UART needs
+// ~22 us per message and the SRAM is idle for effectively all of it.
 //
 // -----------------------------------------------------------------------
 // PADDING

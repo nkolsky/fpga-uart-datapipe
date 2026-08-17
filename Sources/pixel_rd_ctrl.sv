@@ -42,14 +42,14 @@
 //
 // The payload is written in P_CAP, one full cycle BEFORE rpy_valid rises
 // in P_SEND. That ordering matters because the level crosses to the
-// 130 MHz domain through a two-flop synchroniser while the payload crosses
+// 256 MHz domain through a two-flop synchroniser while the payload crosses
 // unsynchronised: by the time the destination can possibly observe
 // rpy_valid high, the payload has been stable for at least three
 // destination clocks. It then stays stable until the accept returns.
 //
 // P_DONE holds for HS_RECOVER cycles rather than one. tx_reply_ctrl arms
 // its next pixel acceptance on the FALLING edge of the synchronised
-// rpy_valid, which takes two to three 130 MHz clocks to propagate back.
+// rpy_valid, which takes two to three 256 MHz clocks to propagate back.
 // Waiting here removes any need to argue from UART pacing that the next
 // request cannot arrive too soon.
 //
@@ -84,9 +84,9 @@
 //
 //     pixels[0] <= {red_data[31:24], green_data[31:24], blue_data[31:24]};
 //
-// -- and sram_wr_ctrl writes with wr_be = 1 << (3 - lane), which is the
-// same convention seen from the write side. Reading with the opposite
-// orientation would return a neighbouring pixel, silently.
+// -- and the write path uses the same lane convention when packing bytes
+// into a word. Reading with the opposite orientation would return a
+// neighbouring pixel, silently.
 
 `timescale 1ns/1ps
 
@@ -95,7 +95,7 @@ module pixel_rd_ctrl
 #(
     // Cycles held in P_DONE so the cross-domain handshake can retract.
     // Eight 100 MHz cycles (80 ns) comfortably covers the two-to-three
-    // 130 MHz clocks (~23 ns) the level takes to fall at the far side.
+    // 256 MHz clocks (~12 ns) the level takes to fall at the far side.
     parameter int HS_RECOVER = 8
 )(
     input  logic        clk,              // CLK100MHZ
