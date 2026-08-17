@@ -79,14 +79,23 @@ logic        brd_msg_accept_130;
 // -----------------------------------------------------------------------------
 // FIFO, status and register-reply interconnect
 // -----------------------------------------------------------------------------
-localparam int CMD_FIFO_W = 48;
 
-logic                  cmd_fifo_wr_en;
-logic [CMD_FIFO_W-1:0] cmd_fifo_wr_data;
-logic                  cmd_fifo_full;
-logic                  cmd_fifo_rd_en;
-logic [CMD_FIFO_W-1:0] cmd_fifo_rd_data;
-logic                  cmd_fifo_empty;
+// Message crossing, 130 MHz side and 100 MHz side.
+logic                            rx_msg_valid, rx_msg_ready;
+msg_format_pkg::msg_kind_t       rx_msg_kind;
+msg_format_pkg::msg_payload_t    rx_msg_payload;
+
+logic                            mem_msg_valid, mem_msg_ready;
+msg_format_pkg::msg_kind_t       mem_msg_kind;
+msg_format_pkg::msg_payload_t    mem_msg_payload;
+
+logic                            burst_err_sticky;
+
+// Register file commands, routed on the memory side from the message stream.
+logic        mem_rgf_cmd_valid;
+logic        mem_rgf_cmd_is_write;
+logic [7:0]  mem_rgf_cmd_addr;
+logic [31:0] mem_rgf_cmd_wdata;
 
 logic                  sram_wr_seen;
 logic                  sram_wr_rejected;
@@ -99,14 +108,14 @@ logic [31:0]           rx_rd_reply_data;
 // -----------------------------------------------------------------------------
 // Image FIFO interconnect
 // -----------------------------------------------------------------------------
-logic        fifo_wr_en;        // rom_sequencer → async_fifo write enable
-logic [23:0] fifo_wr_data;      // rom_sequencer → async_fifo pixel data
-logic        almost_full;       // async_fifo → rom_sequencer backpressure
-logic        almost_empty;      // async_fifo → rom_sequencer resume signal
-logic        fifo_rd_en;        // tx_sequencer → async_fifo read enable
-logic [23:0] fifo_rd_data;      // async_fifo → tx_sequencer pixel data (24-bit RGB)
-logic        fifo_empty;        // async_fifo → tx_sequencer empty flag
-logic        fifo_full;         // async_fifo full flag (monitored, not used for control)
+logic        fifo_wr_en;        // rom_sequencer -> image FIFO write enable
+logic [23:0] fifo_wr_data;      // rom_sequencer -> image FIFO pixel data
+logic        almost_full;       // image FIFO -> rom_sequencer backpressure
+logic        almost_empty;      // image FIFO -> rom_sequencer resume signal
+logic        fifo_rd_en;        // tx_sequencer -> image FIFO read enable
+logic [23:0] fifo_rd_data;      // image FIFO -> tx_sequencer pixel data (24-bit RGB)
+logic        fifo_empty;        // image FIFO -> tx_sequencer empty flag
+logic        fifo_full;         // image FIFO full flag (monitored, not used for control)
 logic        seq_done;          // rom_sequencer → chip_top: one-cycle done pulse
 logic        rom_seq_busy;
 
@@ -136,9 +145,7 @@ cdc_level_sync u_cdc_fifo_empty (
 logic [43:0] pix_rpy_payload_100;
 logic [95:0] brd_msg_payload_100;
 
-memory_subsystem #(
-    .CMD_W (CMD_FIFO_W)
-) u_memory_subsystem (
+memory_subsystem u_memory_subsystem (
     .clk                   (CLK100MHZ),
     .rst_n                 (sync_rst_n),
 
@@ -152,21 +159,23 @@ memory_subsystem #(
     .img_fifo_wr_en        (fifo_wr_en),
     .img_fifo_wr_data      (fifo_wr_data),
 
-    .cmd_fifo_empty        (cmd_fifo_empty),
-    .cmd_fifo_rd_data      (cmd_fifo_rd_data),
-    .cmd_fifo_rd_en        (cmd_fifo_rd_en),
+    .msg_valid             (mem_msg_valid),
+    .msg_ready             (mem_msg_ready),
+    .msg_kind              (mem_msg_kind),
+    .msg_payload           (mem_msg_payload),
 
-    .pix_req_valid         (pix_req_valid_100),
-    .pix_req_data          (pix_req_data_100),
     .pix_rpy_accept        (pix_rpy_accept_100),
     .pix_rpy_send          (pix_rpy_send),
     .pix_rpy_payload       (pix_rpy_payload_100),
 
-    .brd_req_valid         (brd_req_valid_100),
-    .brd_req_data          (brd_req_data_100),
     .brd_msg_accept        (brd_msg_accept_100),
     .brd_msg_send          (brd_msg_send),
     .brd_msg_payload       (brd_msg_payload_100),
+
+    .rgf_cmd_valid         (mem_rgf_cmd_valid),
+    .rgf_cmd_is_write      (mem_rgf_cmd_is_write),
+    .rgf_cmd_addr          (mem_rgf_cmd_addr),
+    .rgf_cmd_wdata         (mem_rgf_cmd_wdata),
 
     .seq_done              (seq_done),
     .rom_seq_busy          (rom_seq_busy),
@@ -182,7 +191,7 @@ memory_subsystem #(
 // -----------------------------------------------------------------------------
 // Asynchronous FIFO
 // -----------------------------------------------------------------------------
-async_fifo u_async_fifo (
+async_fifo u_img_fifo (
     // Write domain (rom_sequencer side)
     .wr_clk      (CLK100MHZ),
     .wr_rst_n    (sync_rst_n),
@@ -212,6 +221,22 @@ logic        tx_activity_led;
 logic        rr_reply_pending;
 logic        rr_reply_overrun;
 
+// UART_RTS is the host's RTS pin: asynchronous to pll_clk_out, since the
+// FTDI runs from its own crystal. Sampled directly it can violate setup or
+// hold on a transmit-path flop and go metastable, and an invalid level fanned
+// out to several gates can be read as 0 by one and 1 by another -- which puts
+// the transmit state machine into a state its own logic says cannot exist.
+// Two flops give the first one a full clock period, with nothing downstream,
+// to settle before the second samples it.
+//
+// Reset value is 1 = deasserted = hold off, so the transmitter never starts
+// before the real level has been observed.
+logic cts_meta, cts_sync;
+always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
+    if (!sync_pll_rst_n) {cts_sync, cts_meta} <= 2'b11;
+    else                 {cts_sync, cts_meta} <= {cts_meta, UART_RTS};
+end
+
 uart_tx_subsystem u_uart_tx_subsystem (
     .clk                (pll_clk_out),
     .rst_n              (sync_pll_rst_n),
@@ -219,7 +244,7 @@ uart_tx_subsystem u_uart_tx_subsystem (
     .fifo_empty         (fifo_empty),
     .fifo_rd_data       (fifo_rd_data),
     .fifo_rd_en         (fifo_rd_en),
-    .cts                (UART_RTS),
+    .cts                (cts_sync),
 
     .rd_reply_valid     (rx_rd_reply_valid),
     .rd_reply_data      (rx_rd_reply_data),
@@ -253,19 +278,10 @@ logic        rx_parity_err_pulse;
 
 logic        rx_burst_active;
 
-logic        rx_classifier_valid;
 logic        rx_classifier_error;
-logic [9:0]  rx_row_q, rx_col_q;
-logic [23:0] rx_pixel_q;
 
-logic        rx_rr_cmd_valid;
-logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rr_cmd_addr;
-logic        rx_rw_cmd_valid;
-logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rw_cmd_addr;
-logic [rgf_pkg::DATA_WIDTH-1:0] rx_rw_cmd_data;
 
 logic        pix_wr_seen_sticky;
-logic        cmd_ovf_sticky;
 
 // -----------------------------------------------------------------------------
 // RX subsystem (130 MHz)
@@ -277,64 +293,57 @@ logic        cmd_ovf_sticky;
 rx_subsystem u_rx_subsystem (
     .clk                  (pll_clk_out),
     .rst_n                (sync_pll_rst_n),
-
     .rx_in                (UART_TXD_IN),
 
-    // The RX subsystem speaks plain ready/valid. Adapting that to whatever
-    // carries commands into the 100 MHz domain is chip_top's job -- today an
-    // async FIFO, hence the !full.
-    .cmd_ready            (!cmd_fifo_full),
-    .cmd_valid            (cmd_fifo_wr_en),
-    .cmd_data             (cmd_fifo_wr_data),
+    .msg_valid            (rx_msg_valid),
+    .msg_ready            (rx_msg_ready),
+    .msg_kind             (rx_msg_kind),
+    .msg_payload          (rx_msg_payload),
 
     .rx_phy_busy          (rx_phy_busy),
     .rx_parity_err_pulse  (rx_parity_err_pulse),
     .rx_mac_busy          (rx_mac_busy),
-
     .rx_burst_active      (rx_burst_active),
-
-    .rx_classifier_valid  (rx_classifier_valid),
     .rx_classifier_error  (rx_classifier_error),
-    .rx_row_q             (rx_row_q),
-    .rx_col_q             (rx_col_q),
-    .rx_pixel_q           (rx_pixel_q),
-
-    .rx_rr_cmd_valid      (rx_rr_cmd_valid),
-    .rx_rr_cmd_addr       (rx_rr_cmd_addr),
-    .rx_rw_cmd_valid      (rx_rw_cmd_valid),
-    .rx_rw_cmd_addr       (rx_rw_cmd_addr),
-    .rx_rw_cmd_data       (rx_rw_cmd_data),
-
-    .rx_pr_cmd_valid      (rx_pr_cmd_valid),
-    .rx_pr_cmd_row        (rx_pr_cmd_row),
-    .rx_pr_cmd_col        (rx_pr_cmd_col),
-
-    .rx_br_cmd_valid      (rx_br_cmd_valid),
-    .rx_br_cmd_base_row   (rx_br_cmd_base_row),
-    .rx_br_cmd_base_col   (rx_br_cmd_base_col),
-    .rx_br_cmd_height     (rx_br_cmd_height),
-    .rx_br_cmd_width      (rx_br_cmd_width),
 
     .pix_wr_seen_sticky   (pix_wr_seen_sticky),
-    .cmd_ovf_sticky       (cmd_ovf_sticky)
+    .burst_err_sticky     (burst_err_sticky)
 );
 
-// Explicit width is required for the 48-bit {address, pixel} command.
-async_fifo #(
-    .DW (CMD_FIFO_W)
-) u_cmd_fifo (
-    .wr_clk       (pll_clk_out),
-    .wr_rst_n     (sync_pll_rst_n),
-    .wr_en        (cmd_fifo_wr_en),
-    .wr_data      (cmd_fifo_wr_data),
-    .full         (cmd_fifo_full),
-    .almost_full  (),                  // OPEN: intended -> UART_CTS backpressure
-    .rd_clk       (CLK100MHZ),
-    .rd_rst_n     (sync_rst_n),
-    .rd_en        (cmd_fifo_rd_en),
-    .rd_data      (cmd_fifo_rd_data),
-    .empty        (cmd_fifo_empty),
-    .almost_empty ()                   // unused
+// -----------------------------------------------------------------------------
+// MESSAGE CROSSING, 130 MHz -> 100 MHz
+//
+// Replaces the 16-deep asynchronous command FIFO. There was no rate mismatch
+// to absorb: at 8.125 Mbaud a message takes ~2816 receive clocks and carries
+// four pixels, against a memory side at 100 MHz. There was also nothing to
+// buffer into -- the RX side holds no image data.
+//
+// The FIFO's real function was hiding a missing back-pressure path. It turned
+// "lose the next command" into "lose the seventeenth", and cmd_ovf_sticky
+// existed to report when that happened. This crossing stalls instead:
+// msg_ready propagates to rx_classifier, rx_mac and UART_CTS.
+//
+// ~105 flops against roughly 800.
+//
+// XDC: the data register inside needs a false path or max-delay constraint.
+// Without one the tool tries to close it as a single-cycle path between
+// asynchronous clocks and reports a failure that is not real.
+// -----------------------------------------------------------------------------
+cdc_msg_sync #(
+    .WIDTH ($bits(msg_format_pkg::msg_kind_t) +
+            $bits(msg_format_pkg::msg_payload_t))
+) u_msg_cdc (
+    .src_clk   (pll_clk_out),
+    .src_rst_n (sync_pll_rst_n),
+    .src_valid (rx_msg_valid),
+    .src_ready (rx_msg_ready),
+    .src_data  ({rx_msg_kind, rx_msg_payload}),
+
+    .dst_clk   (CLK100MHZ),
+    .dst_rst_n (sync_rst_n),
+    .dst_valid (mem_msg_valid),
+    .dst_ready (mem_msg_ready),
+    .dst_data  ({mem_msg_kind, mem_msg_payload})
 );
 
 // -----------------------------------------------------------------------------
@@ -351,23 +360,11 @@ cdc_level_sync u_cdc_burst_active (
 // -----------------------------------------------------------------------------
 // Pixel-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
-cdc_cmd_sync #(
-    .ADDR_W (1),
-    .DATA_W (20)
-) u_cdc_pix_req (
-    .src_clk      (pll_clk_out),
-    .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rx_pr_cmd_valid),
-    .src_is_write (1'b0),
-    .src_addr     (1'b0),
-    .src_wdata    ({rx_pr_cmd_row, rx_pr_cmd_col}),
-    .dst_valid    (pix_req_valid_100),
-    .dst_is_write (),
-    .dst_addr     (),
-    .dst_wdata    (pix_req_data_100),
-    .dst_clk      (CLK100MHZ),
-    .dst_rst_n    (sync_rst_n)
-);
+// u_cdc_pix_req deleted. A single pixel read request is a MESSAGE now and
+// crosses on cdc_msg_sync with everything else, in order. It used to have
+// its own crossing running in parallel with the command FIFO, which meant
+// nothing ordered a read against the writes around it.
+
 
 // -----------------------------------------------------------------------------
 // Pixel-read reply CDC (100 MHz -> 130 MHz)
@@ -402,24 +399,9 @@ cdc_pulse_sync u_cdc_pix_rpy_accept (
 // -----------------------------------------------------------------------------
 // Burst-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
-cdc_cmd_sync #(
-    .ADDR_W (1),
-    .DATA_W (40)
-) u_cdc_brd_req (
-    .src_clk      (pll_clk_out),
-    .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rx_br_cmd_valid),
-    .src_is_write (1'b0),
-    .src_addr     (1'b0),
-    .src_wdata    ({rx_br_cmd_base_row, rx_br_cmd_base_col,
-                    rx_br_cmd_height,   rx_br_cmd_width}),
-    .dst_valid    (brd_req_valid_100),
-    .dst_is_write (),
-    .dst_addr     (),
-    .dst_wdata    (brd_req_data_100),
-    .dst_clk      (CLK100MHZ),
-    .dst_rst_n    (sync_rst_n)
-);
+// u_cdc_brd_req deleted. Same reason: an image burst read request is a
+// message. mem_msg_router dispatches it on the memory side.
+
 
 // -----------------------------------------------------------------------------
 // Burst-read reply CDC (100 MHz -> 130 MHz)
@@ -454,63 +436,20 @@ cdc_pulse_sync u_cdc_brd_accept (
 // -----------------------------------------------------------------------------
 // Register command path
 // -----------------------------------------------------------------------------
-logic        rgf_cmd_valid_100;
-logic        rgf_cmd_is_write_100;
-logic [7:0]  rgf_cmd_addr_100;
-logic [31:0] rgf_cmd_wdata_100;
+// There is no mux here any more. Register reads, register writes and the
+// legacy {Rnnn,Cnnn,Vnnn} form all arrive as MESSAGES and are decoded by
+// mem_msg_router on the memory side, which drives register_subsystem
+// directly. The 130 MHz command mux and its crossing are both gone.
 
-// Register-command mux (130 MHz)
-logic        rgf_src_valid, rgf_src_is_write;
-logic [7:0]  rgf_src_addr;
-logic [31:0] rgf_src_wdata;
+// u_cdc_rgf_cmd deleted. Register reads and writes, and the legacy
+// {Rnnn,Cnnn,Vnnn} form, are messages. mem_msg_router decodes them and
+// drives register_subsystem directly.
+//
+// This one mattered most for ordering: a register write that enables
+// something, followed by a read that depends on it, used to cross on a
+// DIFFERENT path from the writes around them. Only similar latencies made
+// that appear to work.
 
-assign rgf_src_valid    = rx_classifier_valid || rx_rw_cmd_valid ||
-                          rx_rr_cmd_valid;
-
-assign rgf_src_is_write = rx_classifier_valid ? !rx_col_q[0]
-                        : rx_rw_cmd_valid     ? 1'b1
-                        :                       1'b0;
-
-// rx_rw_cmd_addr / rx_rr_cmd_addr are now rgf_pkg::ADDR_WIDTH wide and need
-// no padding. The legacy path still forms a word address from the row field.
-assign rgf_src_addr     = rx_classifier_valid ? {rx_row_q[5:0], 2'b00}
-                        : rx_rw_cmd_valid     ? rx_rw_cmd_addr
-                        :                       rx_rr_cmd_addr;
-
-assign rgf_src_wdata    = rx_classifier_valid ? {8'b0, rx_pixel_q}
-                        : rx_rw_cmd_valid     ? rx_rw_cmd_data
-                        :                       32'd0;
-
-`ifndef SYNTHESIS
-    a_one_rgf_producer_top: assert property (
-        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
-        $onehot0({rx_classifier_valid, rx_rw_cmd_valid, rx_rr_cmd_valid})
-    ) else $error("chip_top: more than one RGF command producer asserted");
-
-    a_regwr_is_write: assert property (
-        @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
-        rx_rw_cmd_valid |-> (rgf_src_is_write && rgf_src_valid)
-    ) else $error("chip_top: Register Write did not present a write command");
-`endif
-
-cdc_cmd_sync #(
-    .ADDR_W    (8),
-    .DATA_W    (32),
-    .IDLE_ADDR (8'hFF)
-) u_cdc_rgf_cmd (
-    .src_clk      (pll_clk_out),
-    .src_rst_n    (sync_pll_rst_n),
-    .src_valid    (rgf_src_valid),
-    .src_is_write (rgf_src_is_write),
-    .src_addr     (rgf_src_addr),
-    .src_wdata    (rgf_src_wdata),
-    .dst_valid    (rgf_cmd_valid_100),
-    .dst_is_write (rgf_cmd_is_write_100),
-    .dst_addr     (rgf_cmd_addr_100),
-    .dst_wdata    (rgf_cmd_wdata_100),
-    .dst_clk      (CLK100MHZ),
-    .dst_rst_n    (sync_rst_n)
-);
 
 // Event CDCs (130 MHz -> 100 MHz)
 logic rx_parity_err_100;
@@ -544,10 +483,13 @@ register_subsystem u_register_subsystem (
     .clk               (CLK100MHZ),
     .rst_n             (sync_rst_n),
 
-    .cmd_valid         (rgf_cmd_valid_100),
-    .cmd_is_write      (rgf_cmd_is_write_100),
-    .cmd_addr          (rgf_cmd_addr_100),
-    .cmd_wdata         (rgf_cmd_wdata_100),
+    // Routed from the message stream by mem_msg_router, inside
+    // memory_subsystem. These used to come from a dedicated cdc_cmd_sync
+    // that no longer exists.
+    .cmd_valid         (mem_rgf_cmd_valid),
+    .cmd_is_write      (mem_rgf_cmd_is_write),
+    .cmd_addr          (mem_rgf_cmd_addr),
+    .cmd_wdata         (mem_rgf_cmd_wdata),
 
     .tx_img_done       (tx_img_done_100),
     .tx_row            (tx_row),
@@ -588,13 +530,28 @@ assign start_pulse = rgf_start_img_read;
 // -----------------------------------------------------------------------------
 // UART flow control
 // -----------------------------------------------------------------------------
-assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy);
+// rr_reply_pending belongs here as much as the other three. The reply path
+// has a SINGLE slot: while one reply is queued, a request arriving behind it
+// has nowhere to put its answer. Advertising readiness in that state invites
+// the host to send a request whose reply is then lost -- silently, because
+// the request itself was accepted and parsed perfectly well.
+//
+// This matters only once the transmitter can actually be held off. Before
+// cts gating existed, `pending` cleared within a message time (~20 us) and
+// the window was too narrow to hit; a host that stalls the link now holds it
+// open for as long as it likes.
+assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy ||
+                   rr_reply_pending);
 
 // -----------------------------------------------------------------------------
 // LEDs
 // -----------------------------------------------------------------------------
 assign LED[14] = tx_done_sticky;
-assign LED[13] = cmd_ovf_sticky || sram_wr_rejected;
+// cmd_ovf_sticky went with the command FIFO: overflow was its failure
+// mode, and the crossing back-pressures instead of dropping. What remains
+// worth reporting is a write addressed outside the image, and a burst data
+// frame arriving with no burst armed.
+assign LED[13] = sram_wr_rejected || burst_err_sticky;
 assign LED[15] = img_fifo_ovf_sticky;
 assign LED[12] = heartbeat;
 assign LED[11] = clk_sel;
@@ -603,7 +560,9 @@ assign LED[9] = UART_CTS;
 assign LED[8] = start_pulse;
 assign LED[7] = rx_phy_busy;
 assign LED[6] = rx_classifier_error;
-assign LED[5] = rx_classifier_valid;
+// rx_classifier_valid is gone with the six-channel output. A message
+// leaving the RX side is the equivalent indication.
+assign LED[5] = rx_msg_valid;
 assign LED[4] = rx_mac_busy;
 assign LED[3] = ~fifo_empty;
 assign LED[2] = tx_seq_busy;

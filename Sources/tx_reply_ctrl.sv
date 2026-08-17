@@ -129,6 +129,7 @@ module tx_reply_ctrl
     // ---- transmit path status -----------------------------------------
     input  logic         tx_seq_busy,    // image transfer in progress
     input  logic         mac_busy,       // tx_mac occupied
+    input  logic         cts,            // active-low: 0 = clear to send
 
     // ---- request to drive tx_mac (muxed in chip_top) ------------------
     output logic         reply_req,      // hold high until accepted
@@ -182,8 +183,22 @@ module tx_reply_ctrl
     logic take_brd;
     assign take_brd = brd_valid && !brd_hold && !pending && !rd_valid && !take_pix;
 
-    // Drive the MAC only when the transmit path is completely idle.
-    assign reply_req = pending && !tx_seq_busy && !mac_busy;
+    // Drive the MAC only when the transmit path is completely idle AND the
+    // host is accepting bytes.
+    //
+    // cts is the host's RTS, active low. Adding it here rather than further
+    // down the transmit path is deliberate: reply_req is a combinational
+    // LEVEL held while `pending` is set, so a deasserted RTS merely extends
+    // the wait -- pending stays set, msg_q and len_q stay stable, and the
+    // frame is neither dropped nor re-sent. Gating tx_phy instead would have
+    // met a one-cycle phy_valid pulse with no way to hold it, and declining
+    // that pulse loses the byte outright.
+    //
+    // Backpressure reaches the memory side through the existing handshake:
+    // pending stays high, so take_pix and take_brd both fail on !pending,
+    // so pix_accept/brd_accept never fire and their producers hold. A burst
+    // read stalls its walker rather than reading pixels onto the floor.
+    assign reply_req = pending && !tx_seq_busy && !mac_busy && !cts;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -257,6 +272,23 @@ module tx_reply_ctrl
     end
 
 `ifndef SYNTHESIS
+    // A reply is never offered while the host is holding the link off.
+    // This restates the reply_req assign, so it is a regression guard: it
+    // fires if a later edit drops the cts term rather than catching a
+    // dynamic condition.
+    a_reply_respects_cts: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        reply_req |-> !cts
+    ) else $error("%m: reply offered while the host deasserted RTS");
+
+    // There is deliberately NO assertion that pending survives while cts is
+    // high. a_no_loss below already covers it -- pending may fall only on a
+    // genuine handoff, whatever cts is doing -- and the naive form
+    // ((pending && cts) |=> pending) would FALSE-FIRE on the legal case
+    // where cts rises in the same cycle mac_busy does, after the MAC has
+    // already captured the frame. That message is in flight and completes
+    // correctly; it is the ~16-byte tail after a hold-off, not a loss.
+
     // A reply must never be offered while the image path is active.
     a_no_overlap: assert property (
         @(posedge clk) disable iff (!rst_n)

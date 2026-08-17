@@ -335,7 +335,11 @@ module burst_rd_ctrl
             ncol = burst_col + DIM_W'(1);
             nrow = burst_row;
         end
-        nidx = 16'(base_row_q + nrow) * 16'(IMG_W) + 16'(base_col_q + ncol);
+        // Each operand is widened BEFORE the addition. Casting the sum
+        // instead makes the add itself 16 bits wide against 10-bit operands,
+        // which the tool warns about at every term.
+        nidx = (16'(base_row_q) + 16'(nrow)) * 16'(IMG_W)
+             + (16'(base_col_q) + 16'(ncol));
         return nidx[1:0];
     endfunction
 

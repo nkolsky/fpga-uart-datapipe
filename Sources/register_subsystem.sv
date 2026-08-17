@@ -58,7 +58,14 @@ assign rgf_pc_addr  = cmd_addr;
 assign rgf_pc_wdata = cmd_wdata;
 
 // Capture a read result in the same cycle that the RGF sees the read address.
-// The forward CDC parks cmd_addr at 8'hFF outside cmd_valid.
+//
+// cmd_addr is parked at rgf_pkg::IDLE_ADDR outside cmd_valid. That parking
+// is MEM_MSG_ROUTER's job now -- it used to be done by the forward
+// cdc_cmd_sync, which drove dst_addr to its IDLE_ADDR parameter whenever
+// dst_valid was low, but that crossing was deleted when register commands
+// became messages. It matters because rgf's IMG_TX_MON read-to-clear is a
+// level-sensitive decode with no valid qualifier, so a held address clears
+// img_send_complete/img_send_error on every idle cycle.
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         rd_strobe <= 1'b0;

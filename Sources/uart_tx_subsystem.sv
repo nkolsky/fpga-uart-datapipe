@@ -82,7 +82,20 @@ logic         phy_valid;
 logic [7:0]   phy_data;
 logic         phy_ready;
 
-tx_sequencer u_tx_sequencer (
+// tx_sequencer declares its OWN IMG_WIDTH / IMG_HEIGHT parameters with
+// 256x256 defaults and does not import memory_pkg, so without these
+// overrides its end-of-image test was pinned at 256x256 regardless of the
+// build. Under -DSIMULATION the geometry is 8x8: the sequencer would wait
+// for last_pixel at (255,255) while rom_sequencer pushes only 64 pixels, so
+// tx_img_done never fires, IMG_TX_MON is never written and img_in_flight in
+// mem_interlock never clears. Harmless in the hardware build only because
+// 256 happens to be the right answer there.
+//
+// Same failure and same fix as rom_sequencer in memory_subsystem.sv.
+tx_sequencer #(
+    .IMG_WIDTH  (memory_pkg::IMG_WIDTH),
+    .IMG_HEIGHT (memory_pkg::IMG_HEIGHT)
+) u_tx_sequencer (
     .clk          (clk),
     .rst_n        (rst_n),
     .fifo_empty   (fifo_empty),
@@ -153,6 +166,7 @@ tx_reply_ctrl u_tx_reply_ctrl (
     .brd_accept    (burst_reply_accept),
     .tx_seq_busy   (tx_seq_busy),
     .mac_busy      (mac_busy),
+    .cts           (cts),
     .reply_req     (reply_req),
     .reply_msg     (reply_msg),
     .reply_len     (reply_len),

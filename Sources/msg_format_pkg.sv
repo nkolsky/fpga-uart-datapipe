@@ -92,9 +92,6 @@ package msg_format_pkg;
     localparam logic [7:0] CHAR_I           = 8'h49;  // 'I'  image burst write
     localparam logic [7:0] CHAR_H           = 8'h48;  // 'H'  height
 
-    // Retained for the legacy {Rnnn,Cnnn,Vnnn} path, whose payload is three
-    // ASCII decimal digits rather than three raw bytes.
-    localparam logic [7:0] ASCII_ZERO       = 8'h30;  // '0'
 
     // -----------------------------------------------------------------
     // Stride model
@@ -177,7 +174,6 @@ package msg_format_pkg;
     // -----------------------------------------------------------------
     typedef enum logic [3:0] {
         MSG_UNKNOWN    = 4'd0,  // unrecognised / malformed
-        MSG_LEGACY_RGF = 4'd1,  // {Rnnn,Cnnn,Vnnn}          16, ASCII payload
         MSG_REG_WRITE  = 4'd2,  // {W<A>, V<..>, V<..>}      16
         MSG_REG_READ   = 4'd3,  // {R<A>}                     6
         MSG_PIX_WRITE  = 4'd4,  // {W<A>, P<R,G,B>}          11
@@ -185,6 +181,13 @@ package msg_format_pkg;
         MSG_BURST_HDR  = 4'd6,  // {I<..>, H<..>, W<..>}     16
         MSG_BURST_READ = 4'd7,  // {R<A>, H<..>, W<..>}      16
         MSG_BURST_DATA = 4'd8   // {<4 px>,<4 px>,<4 px>}    16, no opcodes
+
+        // 4'd1 was MSG_LEGACY_RGF, the {Rnnn,Cnnn,Vnnn} form carried over
+        // from earlier labs. It is NOT in the final project message set, and
+        // its ASCII decimal payload -- two multiplies and a three-term sum
+        // per field -- was the critical path at 130 MHz. Removed rather than
+        // pipelined, since nothing in the spec asks for it. The encoding is
+        // left unused so the others keep their values.
     } msg_kind_t;
 
     // Group count for each kind. This is the ONLY place message length is
@@ -202,6 +205,103 @@ package msg_format_pkg;
 
     function automatic int len_for_kind(input msg_kind_t k);
         return len_for_groups(groups_for_kind(k));
+    endfunction
+
+    // =================================================================
+    // CROSSING PAYLOAD LAYOUT
+    //
+    // Every message crosses to the memory domain on ONE shared interface:
+    //
+    //     { msg_kind[3:0], payload[95:0] }
+    //
+    // The payload is sized for the widest message -- burst data, four pixels
+    // at 24 bits -- and every other kind occupies the low bits with the rest
+    // zero. Narrow messages waste wire, not flops: the registers are shared,
+    // so a register read costs nothing extra over a burst data frame.
+    //
+    // WHY ONE CROSSING RATHER THAN ONE PER MESSAGE TYPE
+    //   AREA      each separate crossing carried its own data registers on
+    //             both sides plus its own synchroniser chain. One shared
+    //             crossing reuses the same flops for every kind.
+    //   ORDERING  separate paths have no defined order between them. A burst
+    //             header and its data could cross out of order, and only
+    //             similar latencies made it work. One crossing makes order
+    //             structural.
+    //   COST      messages serialise instead of crossing in parallel. At
+    //             ~2816 clocks between messages against a ~5 clock handshake
+    //             the crossing is under 0.2% utilised.
+    //
+    // STRUCTS, NOT BIT RANGES.
+    // These are packed structs so both sides name fields instead of slicing
+    // by hand. Hand-written ranges are how a single pixel write ends up
+    // reading payload[95:72] -- zeros -- and writing a black pixel with a
+    // perfectly correct address and byte enable. Every signal you would
+    // normally check looks right. First field declared is the MOST
+    // significant.
+    // =================================================================
+
+    // Register address width. Kept as a local constant rather than an
+    // import so this package stays dependency-free; it must match
+    // rgf_pkg::ADDR_WIDTH, and rx_classifier asserts that it does.
+    localparam int ADDR_W_RGF = 8;
+
+    localparam int MSG_PAYLOAD_W = 96;
+
+    typedef logic [MSG_PAYLOAD_W-1:0] msg_payload_t;
+
+    // {W<A>, P<R,G,B>}
+    typedef struct packed {
+        logic [23:0] addr;
+        logic [23:0] pixel;
+    } pl_pix_write_t;                                    // 48
+
+    // {I<..>, H<..>, W<..>}  -- opens a rectangle
+    typedef struct packed {
+        logic [9:0]  width;
+        logic [9:0]  height;
+        logic [23:0] base_addr;
+    } pl_burst_hdr_t;                                    // 44
+
+    // Four pixels. px0 is the most significant, matching arrival order.
+    typedef struct packed {
+        logic [23:0] px0;
+        logic [23:0] px1;
+        logic [23:0] px2;
+        logic [23:0] px3;
+    } pl_burst_data_t;                                   // 96, the widest
+
+    // {W<A>, V<..>, V<..>}
+    typedef struct packed {
+        logic [ADDR_W_RGF-1:0] addr;
+        logic [31:0]           data;
+    } pl_reg_write_t;                                    // 40
+
+    // {R<A>}
+    typedef struct packed {
+        logic [ADDR_W_RGF-1:0] addr;
+    } pl_reg_read_t;                                     // 8
+
+    // {R<row>, C<col>, P<..>}
+    typedef struct packed {
+        logic [9:0] row;
+        logic [9:0] col;
+    } pl_pix_read_t;                                     // 20
+
+    // {R<A>, H<..>, W<..>}
+    typedef struct packed {
+        logic [9:0]  width;
+        logic [9:0]  height;
+        logic [23:0] base_addr;
+    } pl_burst_read_t;                                   // 44
+
+    // Zero-extend any of the above into the shared payload.
+    function automatic msg_payload_t pl_pack(input logic [MSG_PAYLOAD_W-1:0] v,
+                                             input int bits);
+        msg_payload_t r;
+        r = '0;
+        for (int i = 0; i < MSG_PAYLOAD_W; i++)
+            if (i < bits) r[i] = v[i];
+        return r;
     endfunction
 
     // -----------------------------------------------------------------

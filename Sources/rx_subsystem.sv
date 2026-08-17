@@ -1,25 +1,50 @@
 // rx_subsystem.sv
 // ---------------
-// Complete 130 MHz receive path: serial line in, command-FIFO write port out.
+// Complete 130 MHz receive path: serial line in, ONE message out.
 //
-//   rx_in -> rx_phy -> rx_mac -> rx_msg_parser -> rx_classifier -> cmd mux
-//                                      |                              ^
-//                                      +----> rx_burst_ctrl ----------+
-//                                                   |
-//                                                   +-> bypass_active
-//                                                       (back to the parser)
+//   rx_in -> rx_phy -> rx_mac -> rx_msg_parser -> rx_classifier -> msg out
+//                        ^            |                  |
+//                        |            +-> rx_burst_ctrl --+
+//                        |                     |
+//                        |                     +-> bypass_active
+//                        +---- stall ----------------+
 //
 // -----------------------------------------------------------------------
 // WHO OWNS WHICH BYTE
 // -----------------------------------------------------------------------
 //   rx_mac         bytes 0, 5, 10, 15 -- '{', ',' and '}'. Framing only.
 //   rx_msg_parser  bytes 1, 6, 11 -- opcodes. Extracts 2-4, 7-9, 12-14.
-//   rx_classifier  no bytes at all. Range-checks the extracted fields.
+//   rx_classifier  no bytes at all. Range-checks the extracted fields and
+//                  packs one message.
 //
-// Dataflow is strictly one-directional. rx_mac finds the frame boundaries
-// itself from the delimiter positions, so nothing feeds back into it: the
-// parser no longer supplies expected_len, and bypass_active reaches only the
-// parser, never the MAC.
+// -----------------------------------------------------------------------
+// ONE MESSAGE OUT, NOT SIX COMMAND CHANNELS
+// -----------------------------------------------------------------------
+// This module used to expose six command channels -- legacy RGF, pixel
+// write, register read, register write, pixel read, burst read -- plus a
+// 48-bit command FIFO write port, each with its own crossing in chip_top.
+// They are now one:
+//
+//     msg_valid / msg_ready / msg_kind / msg_payload
+//
+// Every message frame crosses, in order, on one interface. Burst data frames
+// cross as data rather than being unpacked here into pixel commands: the
+// memory side owns addresses because it owns the geometry.
+//
+// -----------------------------------------------------------------------
+// BACK-PRESSURE RUNS THE WHOLE WAY BACK
+// -----------------------------------------------------------------------
+// The memory side can block for far longer than the gap between messages --
+// mem_interlock gives writes to reads, and an image burst read is UART
+// transmitter rate limited. So every stage waits:
+//
+//     msg_ready low -> classifier holds its message -> out_busy
+//                   -> rx_mac stalls a completed frame in its buffer
+//                   -> mac_busy stays high -> UART_CTS -> PC pauses
+//
+// Each link is ONE REGISTER DEEP. No queue is needed anywhere, because UART
+// with RTS/CTS is a stallable source. The old design instead had a 16-deep
+// FIFO and cmd_ovf_sticky on LED[13] to report when it overflowed.
 //
 // -----------------------------------------------------------------------
 // SINGLE CLOCK DOMAIN -- 130 MHz
@@ -27,15 +52,7 @@
 // Everything here runs on pll_clk_out and resets from sync_pll_rst_n. There
 // is NO clock-domain crossing inside this module and none may ever be added:
 // every crossing in this design lives at chip_top, deliberately, so the whole
-// CDC map is visible in one file. Both async FIFOs also remain in chip_top.
-//
-// -----------------------------------------------------------------------
-// ONE FRAME BUFFER, NO COPY
-// -----------------------------------------------------------------------
-// rx_mac exposes frame_buf directly rather than publishing a latched copy.
-// It is both the live tap the parser sees as a frame fills and the completed
-// frame the classifier reads while frame_done is high. Consumers sample only
-// on frame_done, at which point byte_cnt bounds exactly which bytes are real.
+// CDC map is visible in one file.
 
 `timescale 1ns/1ps
 
@@ -43,90 +60,53 @@ module rx_subsystem
     import msg_format_pkg::*;
 (
     // ---- 130 MHz UART domain -------------------------------------------
-    input  logic                        clk,             // pll_clk_out
-    input  logic                        rst_n,           // sync_pll_rst_n
+    input  logic                 clk,             // pll_clk_out
+    input  logic                 rst_n,           // sync_pll_rst_n
 
-    // ---- serial input --------------------------------------------------
-    input  logic                        rx_in,           // UART_TXD_IN
+    // ---- serial input ---------------------------------------------------
+    input  logic                 rx_in,           // UART_TXD_IN
 
-    // ---- command output: plain ready/valid ----------------------------
-    //
-    // Deliberately NOT named after a FIFO. This module produces commands; how
-    // they reach the 100 MHz domain is chip_top's business, and that crossing
-    // is expected to change. cmd_ready is a handshake, not a FIFO status, so
-    // these names survive the crossing being replaced.
-    input  logic                        cmd_ready,
-    output logic                        cmd_valid,
-    output logic [BURST_ADDR_W + BURST_PIX_W - 1:0] cmd_data,
+    // ---- message out, towards cdc_msg_sync ------------------------------
+    output logic                 msg_valid,
+    input  logic                 msg_ready,
+    output msg_kind_t            msg_kind,
+    output msg_payload_t         msg_payload,
 
-    // ---- PHY / MAC status ----------------------------------------------
-    output logic                        rx_phy_busy,
-    output logic                        rx_parity_err_pulse,
-    output logic                        rx_mac_busy,
+    // ---- status ----------------------------------------------------------
+    output logic                 rx_phy_busy,
+    output logic                 rx_parity_err_pulse,
+    output logic                 rx_mac_busy,
+    output logic                 rx_burst_active,
+    output logic                 rx_classifier_error,
 
-    // ---- burst mode ----------------------------------------------------
-    output logic                        rx_burst_active,
-
-    // ---- legacy RGF control path ---------------------------------------
-    output logic                        rx_classifier_valid,
-    output logic                        rx_classifier_error,
-    output logic [9:0]                  rx_row_q,
-    output logic [9:0]                  rx_col_q,
-    output logic [PAYLOAD_W-1:0]        rx_pixel_q,
-
-    // ---- register read / write commands --------------------------------
-    output logic                        rx_rr_cmd_valid,
-    output logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rr_cmd_addr,
-    output logic                        rx_rw_cmd_valid,
-    output logic [rgf_pkg::ADDR_WIDTH-1:0] rx_rw_cmd_addr,
-    output logic [rgf_pkg::DATA_WIDTH-1:0] rx_rw_cmd_data,
-
-    // ---- single pixel read command -------------------------------------
-    output logic                        rx_pr_cmd_valid,
-    output logic [9:0]                  rx_pr_cmd_row,
-    output logic [9:0]                  rx_pr_cmd_col,
-
-    // ---- image burst read command --------------------------------------
-    output logic                        rx_br_cmd_valid,
-    output logic [9:0]                  rx_br_cmd_base_row,
-    output logic [9:0]                  rx_br_cmd_base_col,
-    output logic [9:0]                  rx_br_cmd_height,
-    output logic [9:0]                  rx_br_cmd_width,
-
-    // ---- diagnostics ---------------------------------------------------
-    output logic                        pix_wr_seen_sticky,
-    output logic                        cmd_ovf_sticky
+    // ---- diagnostics -----------------------------------------------------
+    output logic                 pix_wr_seen_sticky,
+    output logic                 burst_err_sticky
 );
-
 
 // -------------------------------------------------------------------------
 // Internal interconnect
 // -------------------------------------------------------------------------
-logic [7:0]                  rx_byte_val;
-logic                        rx_byte_valid;
+logic [7:0]            rx_byte_val;
+logic                  rx_byte_valid;
 
-logic [FRAME_W-1:0]          rx_frame_buf;    // live tap AND completed frame
-logic [BYTE_CNT_W-1:0]       rx_byte_cnt;
-logic                        rx_frame_done;
-logic                        rx_frame_err;
+logic [FRAME_W-1:0]    rx_frame_buf;    // live tap AND completed frame
+logic [BYTE_CNT_W-1:0] rx_byte_cnt;
+logic                  rx_frame_done;
+logic                  rx_frame_err;
 
-msg_kind_t                   rx_msg_kind;
-logic [PAYLOAD_W-1:0]        rx_field0, rx_field1, rx_field2;
+msg_kind_t             rx_msg_kind;
+logic [PAYLOAD_W-1:0]  rx_field0, rx_field1, rx_field2;
 logic [BURST_PIX_PER_MSG-1:0][BURST_PIX_W-1:0] rx_burst_pixels;
 
-logic                        rx_bypass_active;
-
-logic                        rx_cmd_valid;
-logic [BURST_ADDR_W-1:0]     rx_cmd_addr;
-logic [BURST_PIX_W-1:0]      rx_cmd_pixel;
-
-logic                        rx_burst_cmd_valid;
-logic [BURST_ADDR_W-1:0]     rx_burst_cmd_addr;
-logic [BURST_PIX_W-1:0]      rx_burst_cmd_pixel;
-
-logic                        rx_burst_done;
-logic                        rx_burst_err_hdr, rx_burst_err_data,
-                             rx_burst_err_unexp;
+logic                  rx_bypass_active;
+logic                  rx_hdr_accept;
+// Dimensions travel WITH hdr_accept out of the classifier: they are
+// registered there, so taking them from the parser would give rx_burst_ctrl
+// values that had already moved on.
+logic [9:0]            rx_hdr_height, rx_hdr_width;
+logic                  rx_out_busy;
+logic                  rx_burst_done;
 
 // =========================================================================
 // PHY -- bit recovery, parity, byte assembly. No protocol knowledge.
@@ -143,6 +123,9 @@ rx_phy u_rx_phy (
 
 // =========================================================================
 // MAC -- framing. Owns bytes 0, 5, 10 and 15.
+//
+// stall holds a COMPLETED frame in the buffer rather than announcing it, so
+// the classifier's held message cannot be overwritten.
 // =========================================================================
 rx_mac u_rx_mac (
     .clk         (clk),
@@ -150,6 +133,7 @@ rx_mac u_rx_mac (
     .byte_valid  (rx_byte_valid),
     .rx_byte     (rx_byte_val),
     .par_val_rst (rx_parity_err_pulse),
+    .stall       (rx_out_busy),
     .frame_buf   (rx_frame_buf),
     .byte_cnt    (rx_byte_cnt),
     .frame_done  (rx_frame_done),
@@ -175,110 +159,82 @@ rx_msg_parser u_rx_msg_parser (
 );
 
 // =========================================================================
-// CLASSIFIER -- routing and range checks.
+// CLASSIFIER -- range checks, payload packing, and the message register.
 // =========================================================================
 rx_classifier u_rx_classifier (
-    .clk                 (clk),
-    .rst_n               (rst_n),
-
-    .msg_valid           (rx_frame_done),
-    .frame_err           (rx_frame_err),
-    .msg_kind            (rx_msg_kind),
-    .field0              (rx_field0),
-    .field1              (rx_field1),
-    .field2              (rx_field2),
-
-    .burst_active        (rx_burst_active),
-
-    .classifier_valid    (rx_classifier_valid),
-    .classifier_error    (rx_classifier_error),
-    .row_q               (rx_row_q),
-    .col_q               (rx_col_q),
-    .pixel_q             (rx_pixel_q),
-
-    .cmd_valid           (rx_cmd_valid),
-    .cmd_addr            (rx_cmd_addr),
-    .cmd_pixel           (rx_cmd_pixel),
-
-    .rr_cmd_valid        (rx_rr_cmd_valid),
-    .rr_cmd_addr         (rx_rr_cmd_addr),
-    .rw_cmd_valid        (rx_rw_cmd_valid),
-    .rw_cmd_addr         (rx_rw_cmd_addr),
-    .rw_cmd_data         (rx_rw_cmd_data),
-
-    .pr_cmd_valid        (rx_pr_cmd_valid),
-    .pr_cmd_row          (rx_pr_cmd_row),
-    .pr_cmd_col          (rx_pr_cmd_col),
-
-    .br_cmd_valid        (rx_br_cmd_valid),
-    .br_cmd_base_row     (rx_br_cmd_base_row),
-    .br_cmd_base_col     (rx_br_cmd_base_col),
-    .br_cmd_height       (rx_br_cmd_height),
-    .br_cmd_width        (rx_br_cmd_width)
-);
-
-// =========================================================================
-// BURST CONTROLLER -- owns burst mode and generates addresses.
-//
-// height and width come from the header's second and third payload slots;
-// pixels from the parser's dedicated burst output, since burst payload spans
-// the delimiters and does not fit the three-field model.
-// =========================================================================
-rx_burst_ctrl u_rx_burst_ctrl (
     .clk              (clk),
     .rst_n            (rst_n),
+
     .msg_valid        (rx_frame_done),
-    .msg_kind         (rx_msg_kind),
-    .height           (rx_field1),
-    .width            (rx_field2),
-    .pixels           (rx_burst_pixels),
     .frame_err        (rx_frame_err),
-    .burst_abort      (1'b0),
-    .cmd_ready        (cmd_ready),
-    .cmd_valid        (rx_burst_cmd_valid),
-    .cmd_addr         (rx_burst_cmd_addr),
-    .cmd_pixel        (rx_burst_cmd_pixel),
-    .bypass_active    (rx_bypass_active),
-    .burst_active     (rx_burst_active),
-    .burst_done       (rx_burst_done),
-    .err_hdr_invalid  (rx_burst_err_hdr),
-    .err_data_invalid (rx_burst_err_data),
-    .err_unexpected   (rx_burst_err_unexp)
+    .msg_kind         (rx_msg_kind),
+    .field0           (rx_field0),
+    .field1           (rx_field1),
+    .field2           (rx_field2),
+    .burst_pixels     (rx_burst_pixels),
+
+    .out_valid        (msg_valid),
+    .out_ready        (msg_ready),
+    .out_kind         (msg_kind),
+    .out_payload      (msg_payload),
+    .out_busy         (rx_out_busy),
+    .hdr_accept       (rx_hdr_accept),
+    .hdr_height       (rx_hdr_height),
+    .hdr_width        (rx_hdr_width),
+
+    .classifier_error (rx_classifier_error)
 );
 
 // =========================================================================
-// COMMAND FIFO WRITE MUX
+// BURST CONTROLLER -- burst mode only.
 //
-// Two producers of 48-bit {address, pixel} commands: rx_classifier (single
-// pixel write) and rx_burst_ctrl (burst write, one pixel per clock). They
-// are mutually exclusive by construction -- the classifier goes inert
-// whenever burst_active is high -- and the assertion below checks it.
+// Arms on a header the classifier has already validated, counts pixels down,
+// and drops bypass after the last data frame. It generates no addresses:
+// pixel_word_packer on the memory side does that, because that is where the
+// image geometry lives.
 // =========================================================================
-assign cmd_valid = rx_burst_cmd_valid || rx_cmd_valid;
-assign cmd_data  = rx_burst_cmd_valid
-                 ? {rx_burst_cmd_addr, rx_burst_cmd_pixel}
-                 : {rx_cmd_addr,       rx_cmd_pixel};
+rx_burst_ctrl u_rx_burst_ctrl (
+    .clk            (clk),
+    .rst_n          (rst_n),
+    .msg_valid      (rx_frame_done),
+    .msg_kind       (rx_msg_kind),
+    .hdr_accept     (rx_hdr_accept),
+    .height         (BURST_DIM_W'(rx_hdr_height)),
+    .width          (BURST_DIM_W'(rx_hdr_width)),
+   // .burst_abort    (1'b0),
+    .bypass_active  (rx_bypass_active),
+    .burst_active   (rx_burst_active),
+    .burst_done     (rx_burst_done),
+    .err_unexpected (burst_err_sticky)
+);
 
+// =========================================================================
+// DIAGNOSTICS
+//
+// cmd_ovf_sticky is gone with the FIFO. Overflow was its failure mode; with
+// back-pressure the design stalls instead, so there is nothing to report.
+// =========================================================================
 always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n)                  pix_wr_seen_sticky <= 1'b0;
-    else if (rx_cmd_valid)       pix_wr_seen_sticky <= 1'b1;
-end
-
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n)                                  cmd_ovf_sticky <= 1'b0;
-    else if (cmd_valid && !cmd_ready)            cmd_ovf_sticky <= 1'b1;
+    if (!rst_n)
+        pix_wr_seen_sticky <= 1'b0;
+    else if (msg_valid && msg_ready && (msg_kind == MSG_PIX_WRITE))
+        pix_wr_seen_sticky <= 1'b1;
 end
 
 `ifndef SYNTHESIS
-    a_no_cmd_overlap: assert property (
+    // The stall contract: rx_mac must never announce a frame while the
+    // classifier is holding one. This is the property the whole
+    // back-pressure chain rests on.
+    a_no_frame_while_held: assert property (
         @(posedge clk) disable iff (!rst_n)
-        !(rx_burst_cmd_valid && rx_cmd_valid)
-    ) else $error("%m: burst and single-pixel commands overlapped");
+        rx_out_busy |-> !rx_frame_done
+    ) else $error("%m: frame announced while a message was still held");
 
-    a_cls_cmd_not_dropped: assert property (
+    // Burst data only ever appears while a burst is armed.
+    a_data_needs_burst: assert property (
         @(posedge clk) disable iff (!rst_n)
-        rx_cmd_valid |-> cmd_ready
-    ) else $error("%m: single-pixel command presented while cmd_ready was low");
+        (rx_frame_done && (rx_msg_kind == MSG_BURST_DATA)) |-> rx_burst_active
+    ) else $error("%m: burst data frame with no burst armed");
 `endif
 
 endmodule : rx_subsystem

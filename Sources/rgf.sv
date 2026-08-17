@@ -61,6 +61,17 @@
 
 import rgf_pkg::*;
 
+// ADDR_WIDTH IS QUALIFIED EVERYWHERE IN THIS FILE, DELIBERATELY.
+//
+// The name is defined in BOTH fifo_pkg (6, from $clog2(DEPTH)) and rgf_pkg
+// (8). Both are wildcard-imported into the shared compilation unit, so an
+// unqualified ADDR_WIDTH resolves by COMPILE ORDER -- and fifo_pkg comes
+// first, which silently made these address ports 6 bits instead of 8.
+//
+// The symptom was a width warning at every address comparison in this file,
+// since the register addresses in rgf_pkg are declared 8 bits wide. The
+// effect on hardware would be truncation of any address at or above 64.
+
 module rgf (
     input  logic clk,
     input  logic rst_n,
@@ -69,7 +80,7 @@ module rgf (
     // PC-facing port - driven by Sequencer on behalf of parsed PC commands
     // -----------------------------------------------------------------
     input  logic                  pc_wen,
-    input  logic [ADDR_WIDTH-1:0] pc_addr,
+    input  logic [rgf_pkg::ADDR_WIDTH-1:0] pc_addr,
     input  logic [DATA_WIDTH-1:0] pc_wdata,
     output logic [DATA_WIDTH-1:0] pc_rdata,
 
@@ -81,7 +92,7 @@ module rgf (
     // through this port.
     // -----------------------------------------------------------------
     input  logic                  status_wen,
-    input  logic [ADDR_WIDTH-1:0] status_addr,
+    input  logic [rgf_pkg::ADDR_WIDTH-1:0] status_addr,
     input  logic [DATA_WIDTH-1:0] status_wdata,
 
     // -----------------------------------------------------------------

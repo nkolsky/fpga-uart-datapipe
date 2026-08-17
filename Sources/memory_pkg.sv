@@ -97,6 +97,30 @@ package memory_pkg;
 `endif
 
     // -----------------------------------------------------------------
+    // SRAM INITIALISATION FILES
+    //
+    // The file must contain exactly SRAM_DEPTH words, and SRAM_DEPTH is
+    // derived from the geometry above -- 16384 for hardware, 16 for
+    // simulation. A hardware-sized file loaded into a 16-deep array is a
+    // silent mismatch, so the NAME is selected by the same define that
+    // selects the geometry.
+    //
+    // Both sets are produced by tools/gen_sram_init.py from these
+    // parameters. Do not hand-edit them: a file that disagrees with
+    // SRAM_DEPTH is exactly the "parameterised in name only" failure that
+    // already bit rom_sequencer and the [13:0] address literals.
+    // -----------------------------------------------------------------
+`ifdef SIMULATION
+    localparam string SRAM_INIT_R = "red_hex_sim.mem";
+    localparam string SRAM_INIT_G = "green_hex_sim.mem";
+    localparam string SRAM_INIT_B = "blue_hex_sim.mem";
+`else
+    localparam string SRAM_INIT_R = "red_hex.mem";
+    localparam string SRAM_INIT_G = "green_hex.mem";
+    localparam string SRAM_INIT_B = "blue_hex.mem";
+`endif
+
+    // -----------------------------------------------------------------
     // Pixel packing
     // -----------------------------------------------------------------
     localparam int CHANNEL_WIDTH   = 8;     // bits per colour channel sample

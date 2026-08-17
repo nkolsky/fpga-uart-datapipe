@@ -158,8 +158,6 @@ module rx_msg_parser
                         msg_kind = MSG_REG_WRITE;
                     else if (b1 == CHAR_R && b6 == CHAR_C && b11 == CHAR_P)
                         msg_kind = MSG_PIX_READ;
-                    else if (b1 == CHAR_R && b6 == CHAR_C && b11 == CHAR_V)
-                        msg_kind = MSG_LEGACY_RGF;
                     else if (b1 == CHAR_I && b6 == CHAR_H && b11 == CHAR_W)
                         msg_kind = MSG_BURST_HDR;
                     else if (b1 == CHAR_R && b6 == CHAR_H && b11 == CHAR_W)
