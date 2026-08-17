@@ -170,6 +170,29 @@ always_ff @(posedge wr_clk or negedge wr_rst_n) begin
 end
 
 // -----------------------------------------------------------
+// Third stage: the synchronised pointer converted to binary,
+// REGISTERED.
+//
+// gray2bin is a prefix-XOR chain -- bin[0] is the XOR of all
+// PTR_WIDTH gray bits, two LUT levels on its own. Leaving it in
+// the same cycle as the subtract and the threshold compare put
+// five logic levels behind the synchroniser, and the mirror of
+// this path on the read side was the WNS violation at -0.871 ns.
+//
+// Registering it costs one cycle of staleness on an ADVISORY
+// flag, and staleness is in the conservative direction: a stale
+// read pointer over-estimates occupancy, so almost_full asserts
+// slightly early. full is combinational and exact, and is what
+// actually prevents overflow.
+// -----------------------------------------------------------
+logic [PTR_WIDTH-1:0] rd_bin_sync;
+
+always_ff @(posedge wr_clk or negedge wr_rst_n) begin
+    if (!wr_rst_n) rd_bin_sync <= '0;
+    else           rd_bin_sync <= PTR_WIDTH'(gray2bin(rd_ptr_gray_sync));
+end
+
+// -----------------------------------------------------------
 // full: combinational, gray pointer comparison (top two MSBs
 // inverted relative to the synchronized read pointer).
 // -----------------------------------------------------------
@@ -189,8 +212,12 @@ always_ff @(posedge wr_clk or negedge wr_rst_n) begin
         // Cast to the pointer width before subtracting. Without it the
         // operands widen to 32 bits against a 7-bit function result and the
         // tool warns at every occurrence.
-        almost_full <= ((PTR_WIDTH'(gray2bin(wr_ptr_gray)) -
-                         PTR_WIDTH'(gray2bin(rd_ptr_gray_sync))) >= PTR_WIDTH'(AF_THRESHOLD));
+        // wr_ptr_bin, NOT gray2bin(wr_ptr_gray). Both are written in
+        // the same always_ff from the same value, so they are equal by
+        // construction -- converting to gray and straight back was a
+        // same-domain round trip that bought nothing and cost two LUT
+        // levels in the flag cone.
+        almost_full <= ((wr_ptr_bin - rd_bin_sync) >= PTR_WIDTH'(AF_THRESHOLD));
     end
 end
 
@@ -254,6 +281,23 @@ always_ff @(posedge rd_clk or negedge rd_rst_n) begin
 end
 
 // -----------------------------------------------------------
+// Third stage: synchronised write pointer in binary, REGISTERED.
+// See the rd_bin_sync comment in the write domain -- this is the
+// side that was actually failing.
+//
+// A stale write pointer under-estimates occupancy, so
+// almost_empty asserts slightly early and rom_sequencer resumes
+// filling slightly early. empty is combinational and exact, and
+// is what actually prevents underflow.
+// -----------------------------------------------------------
+logic [PTR_WIDTH-1:0] wr_bin_sync;
+
+always_ff @(posedge rd_clk or negedge rd_rst_n) begin
+    if (!rd_rst_n) wr_bin_sync <= '0;
+    else           wr_bin_sync <= PTR_WIDTH'(gray2bin(wr_ptr_gray_sync));
+end
+
+// -----------------------------------------------------------
 // empty: combinational, gray pointer comparison - direct
 // equality (no bit inversion, unlike full). Pointers fully
 // equal means no wrap-lap difference exists, i.e. genuinely empty.
@@ -270,8 +314,9 @@ always_ff @(posedge rd_clk or negedge rd_rst_n) begin
     if (!rd_rst_n) begin
         almost_empty <= 1'b0;
     end else begin
-        almost_empty <= ((PTR_WIDTH'(gray2bin(wr_ptr_gray_sync)) -
-                          PTR_WIDTH'(gray2bin(rd_ptr_gray))) <= PTR_WIDTH'(AE_THRESHOLD));
+        // rd_ptr_bin, NOT gray2bin(rd_ptr_gray) -- same-domain round
+        // trip, see almost_full.
+        almost_empty <= ((wr_bin_sync - rd_ptr_bin) <= PTR_WIDTH'(AE_THRESHOLD));
     end 
 end
 

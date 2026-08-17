@@ -201,7 +201,7 @@ rx_burst_ctrl u_rx_burst_ctrl (
     .hdr_accept     (rx_hdr_accept),
     .height         (BURST_DIM_W'(rx_hdr_height)),
     .width          (BURST_DIM_W'(rx_hdr_width)),
-    .burst_abort    (1'b0),
+   // .burst_abort    (1'b0),
     .bypass_active  (rx_bypass_active),
     .burst_active   (rx_burst_active),
     .burst_done     (rx_burst_done),
