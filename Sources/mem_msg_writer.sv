@@ -1,63 +1,16 @@
+// -----------------------------------------------------------------------------
 // mem_msg_writer.sv
-// =================
-// Turns received MESSAGES into rectangles and pixel streams for
-// pixel_word_packer. Sits between the clock crossing and the packer.
 //
-//   crossing -> mem_msg_writer -> pixel_word_packer -> masked word write
+// Converts incoming memory messages into rectangles and pixel streams for the
+// image write packer. Single-pixel writes become a 1x1 rectangle; burst
+// headers open an HxW rectangle; following data messages feed pixels into that
+// open rectangle.
 //
-// -----------------------------------------------------------------------
-// WHAT IT DOES
-// -----------------------------------------------------------------------
-//   MSG_PIX_WRITE   start a 1x1 rectangle, feed one pixel
-//   MSG_BURST_HDR   start an H x W rectangle, feed nothing
-//   MSG_BURST_DATA  feed up to four pixels into the rectangle already open
-//   anything else   accepted and ignored -- reads and register writes are
-//                   handled elsewhere on the memory side
-//
-// A single pixel write and a burst are the same operation downstream. The
-// only difference is the rectangle size and where the pixels come from.
-//
-// -----------------------------------------------------------------------
-// THE PACKER OWNS THE RECTANGLE, NOT THIS MODULE
-// -----------------------------------------------------------------------
-// A burst arrives as SEVERAL data messages but is ONE rectangle. This module
-// therefore calls start exactly once, on the header, and never again for the
-// data messages that follow. The packer holds position, the accumulated word
-// and the remaining count across every message boundary.
-//
-// That matters for unaligned bursts. A rectangle starting at linear 2 with
-// width 6 flushes a partial word after pixels 2 and 3, then holds pixels 4
-// and 5 in the accumulator when the first message ENDS, merging them with
-// pixels 6 and 7 from the next message into a single full-word write.
-// Restarting per message would lose them.
-//
-// -----------------------------------------------------------------------
-// PADDING MUST BE REFUSED, NOT WRITTEN
-// -----------------------------------------------------------------------
-// A burst data message always carries four pixels. When H*W is not a multiple
-// of four, the final message is partly padding. The packer refuses it --
-// pixel_ready falls the moment the rectangle completes -- so this module
-// CHECKS pack_busy BEFORE EVERY PIXEL and abandons the rest of the message
-// once the rectangle is done. Pushing all four regardless would deadlock
-// waiting for a ready that never arrives.
-//
-// -----------------------------------------------------------------------
-// PAYLOAD LAYOUT
-// -----------------------------------------------------------------------
-// The crossing carries msg_kind plus a 96-bit payload, sized for the widest
-// message. Fields are right-aligned so narrow messages ignore the top bits.
-//
-//   MSG_PIX_WRITE    [47:24] pixel address      [23:0] pixel {R,G,B}
-//   MSG_BURST_HDR    [43:34] width   [33:24] height   [23:0] base address
-//   MSG_BURST_DATA   four pixels, pixel 0 in the MOST significant bits:
-//                      pixel 0 [95:72]   pixel 1 [71:48]
-//                      pixel 2 [47:24]   pixel 3 [23: 0]
-//
-// Burst data is the DELIMITER-STRIPPED payload, so the four pixels are simply
-// consecutive. The straddle in the wire format -- where one pixel spans the
-// comma at byte 5 -- is resolved by rx_msg_parser before the crossing. If the
-// raw frame were crossed instead, that unpacking would have to be repeated
-// here.
+// This block also sanity-checks single-pixel addresses against the image size
+// and rejects out-of-range writes. The packer owns the active rectangle state,
+// so the writer only has to hold the current payload and stream pixels while the
+// packer is ready.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 

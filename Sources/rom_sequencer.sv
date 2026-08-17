@@ -1,37 +1,15 @@
+// -----------------------------------------------------------------------------
 // rom_sequencer.sv
-// ----------------
-// Full-frame image reader. Walks every word of the three channel
-// memories in address order, unpacks four pixels per word, and pushes
-// them one at a time into the image FIFO with almost_full backpressure.
 //
-// -----------------------------------------------------------------------
-// THE "ROM" NAMING IS HISTORICAL -- THE SOURCE IS SRAM
-// -----------------------------------------------------------------------
-// This module, its ports (rom_addr, rom_rd_en), its parameters
-// (ROM_DEPTH, ROM_DATA_WIDTH, ROM_LATENCY) and its states (READ_ROM,
-// WAIT_ROM) all still say ROM. The memory they address is now rgb_sram,
-// which is read-write. The names are retained deliberately, not by
-// oversight: rgb_sram was built as a cycle-exact drop-in for the read
-// side of rgb_rom, so this module did not have to change at all, and
-// keeping the identifiers stable kept that diff empty and auditable.
-// chip_top.sv makes the same choice for the same reason (see the note
-// above its rom_addr / rom_rd_en declarations).
+// Reads the RGB SRAM image data in address order and pushes the pixels into the
+// image FIFO. The read side still uses rom_* naming for compatibility, but the
+// actual source is the 100 MHz SRAM memory domain.
 //
-// What this module does NOT know about, and must not be assumed to
-// coordinate with:
-//   - the write port on those SRAMs (sram_wr_ctrl)
-//   - the other two read clients (pixel_rd_ctrl, burst_rd_ctrl)
-// Exclusion between all of them is mem_interlock's job. This module
-// simply asserts rom_rd_en when its FSM says to, and is only ever
-// started via mem_interlock's read_go -- never directly from the RGF.
-//
-// -----------------------------------------------------------------------
-// CLOCK DOMAIN
-// -----------------------------------------------------------------------
-// Runs on CLK100MHZ, the memory domain. The image FIFO it writes into is
-// a genuine CDC FIFO whose read side is on the 130 MHz UART domain, so
-// almost_full arrives here already synchronised; almost_empty is
-// likewise synchronised into this domain by chip_top before use.
+// The sequencer waits for each read to complete, latches the four-pixel word,
+// and emits pixels one at a time while the FIFO keeps backpressure on
+// almost_full. It is started by mem_interlock.read_go and is gated by the
+// memory-domain arbitration.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 import rom_sequencer_pkg::*;

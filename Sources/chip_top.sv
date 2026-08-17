@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------------
 // chip_top.sv
-// Top-level wrapper for the full-duplex RGB image data exchange system.
+// Top-level wrapper for the RGB image transport and register/control path.
 // -----------------------------------------------------------------------------
 
 import uart_pkg::*;
@@ -286,9 +286,8 @@ logic        pix_wr_seen_sticky;
 // -----------------------------------------------------------------------------
 // RX subsystem (130 MHz)
 //
-// Merged from uart_rx_subsystem + command_processing_subsystem. rx_mac_msg_valid,
-// rx_mac_msg_data, rx_msg_kind_q and rx_bypass_active were only ever wires
-// between those two modules and are now internal to this one.
+// This block receives UART data, decodes frames, and emits one message at a
+// time for the memory side.
 // -----------------------------------------------------------------------------
 rx_subsystem u_rx_subsystem (
     .clk                  (pll_clk_out),
@@ -313,21 +312,12 @@ rx_subsystem u_rx_subsystem (
 // -----------------------------------------------------------------------------
 // MESSAGE CROSSING, 130 MHz -> 100 MHz
 //
-// Replaces the 16-deep asynchronous command FIFO. There was no rate mismatch
-// to absorb: at 8.125 Mbaud a message takes ~2816 receive clocks and carries
-// four pixels, against a memory side at 100 MHz. There was also nothing to
-// buffer into -- the RX side holds no image data.
+// RX messages are handed to the memory side with back-pressure. The source
+// stalls when the destination is busy, so the receiver does not silently drop
+// commands or frames.
 //
-// The FIFO's real function was hiding a missing back-pressure path. It turned
-// "lose the next command" into "lose the seventeenth", and cmd_ovf_sticky
-// existed to report when that happened. This crossing stalls instead:
-// msg_ready propagates to rx_classifier, rx_mac and UART_CTS.
-//
-// ~105 flops against roughly 800.
-//
-// XDC: the data register inside needs a false path or max-delay constraint.
-// Without one the tool tries to close it as a single-cycle path between
-// asynchronous clocks and reports a failure that is not real.
+// The CDC data path inside cdc_msg_sync needs a false-path or max-delay
+// constraint in the XDC.
 // -----------------------------------------------------------------------------
 cdc_msg_sync #(
     .WIDTH ($bits(msg_format_pkg::msg_kind_t) +
@@ -360,11 +350,8 @@ cdc_level_sync u_cdc_burst_active (
 // -----------------------------------------------------------------------------
 // Pixel-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
-// u_cdc_pix_req deleted. A single pixel read request is a MESSAGE now and
-// crosses on cdc_msg_sync with everything else, in order. It used to have
-// its own crossing running in parallel with the command FIFO, which meant
-// nothing ordered a read against the writes around it.
-
+// Single-pixel reads are carried as messages and ordered with the rest of the
+// request stream.
 
 // -----------------------------------------------------------------------------
 // Pixel-read reply CDC (100 MHz -> 130 MHz)
@@ -399,9 +386,8 @@ cdc_pulse_sync u_cdc_pix_rpy_accept (
 // -----------------------------------------------------------------------------
 // Burst-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
-// u_cdc_brd_req deleted. Same reason: an image burst read request is a
-// message. mem_msg_router dispatches it on the memory side.
-
+// Burst requests are also sent as messages, then dispatched by the memory-side
+// router.
 
 // -----------------------------------------------------------------------------
 // Burst-read reply CDC (100 MHz -> 130 MHz)
@@ -436,20 +422,8 @@ cdc_pulse_sync u_cdc_brd_accept (
 // -----------------------------------------------------------------------------
 // Register command path
 // -----------------------------------------------------------------------------
-// There is no mux here any more. Register reads, register writes and the
-// legacy {Rnnn,Cnnn,Vnnn} form all arrive as MESSAGES and are decoded by
-// mem_msg_router on the memory side, which drives register_subsystem
-// directly. The 130 MHz command mux and its crossing are both gone.
-
-// u_cdc_rgf_cmd deleted. Register reads and writes, and the legacy
-// {Rnnn,Cnnn,Vnnn} form, are messages. mem_msg_router decodes them and
-// drives register_subsystem directly.
-//
-// This one mattered most for ordering: a register write that enables
-// something, followed by a read that depends on it, used to cross on a
-// DIFFERENT path from the writes around them. Only similar latencies made
-// that appear to work.
-
+// Register reads/writes arrive as messages and are decoded on the memory side
+// before driving the register subsystem.
 
 // Event CDCs (130 MHz -> 100 MHz)
 logic rx_parity_err_100;
@@ -479,6 +453,8 @@ logic        rgf_rd_strobe;
 logic [31:0] rgf_rd_value;
 logic        rgf_start_img_read;
 
+// The register path is fed from the message stream after routing on the memory
+// side.
 register_subsystem u_register_subsystem (
     .clk               (CLK100MHZ),
     .rst_n             (sync_rst_n),
@@ -530,16 +506,9 @@ assign start_pulse = rgf_start_img_read;
 // -----------------------------------------------------------------------------
 // UART flow control
 // -----------------------------------------------------------------------------
-// rr_reply_pending belongs here as much as the other three. The reply path
-// has a SINGLE slot: while one reply is queued, a request arriving behind it
-// has nowhere to put its answer. Advertising readiness in that state invites
-// the host to send a request whose reply is then lost -- silently, because
-// the request itself was accepted and parsed perfectly well.
-//
-// This matters only once the transmitter can actually be held off. Before
-// cts gating existed, `pending` cleared within a message time (~20 us) and
-// the window was too narrow to hit; a host that stalls the link now holds it
-// open for as long as it likes.
+// The transmit path stalls while the memory side is busy, the TX sequencer is
+// active, the RX MAC is busy, or a reply is waiting for its single-slot output
+// buffer.
 assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy ||
                    rr_reply_pending);
 
@@ -547,10 +516,6 @@ assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy ||
 // LEDs
 // -----------------------------------------------------------------------------
 assign LED[14] = tx_done_sticky;
-// cmd_ovf_sticky went with the command FIFO: overflow was its failure
-// mode, and the crossing back-pressures instead of dropping. What remains
-// worth reporting is a write addressed outside the image, and a burst data
-// frame arriving with no burst armed.
 assign LED[13] = sram_wr_rejected || burst_err_sticky;
 assign LED[15] = img_fifo_ovf_sticky;
 assign LED[12] = heartbeat;
@@ -560,8 +525,6 @@ assign LED[9] = UART_CTS;
 assign LED[8] = start_pulse;
 assign LED[7] = rx_phy_busy;
 assign LED[6] = rx_classifier_error;
-// rx_classifier_valid is gone with the six-channel output. A message
-// leaving the RX side is the equivalent indication.
 assign LED[5] = rx_msg_valid;
 assign LED[4] = rx_mac_busy;
 assign LED[3] = ~fifo_empty;

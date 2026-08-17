@@ -1,196 +1,13 @@
+// -----------------------------------------------------------------------------
 // mem_interlock.sv
-// ----------------
-// Sole arbiter of the three channel SRAMs on the 100 MHz memory domain.
-// Every access to that memory is granted here; nothing reaches it any
-// other way.
 //
-// This began as a minimal read/write interlock and has since grown to
-// cover every client. It now arbitrates THREE:
+// Memory-port arbiter for the 100 MHz SRAM domain. The read sequencer, the
+// write path, and the shared read-borrower all funnel through here so the SRAM
+// never sees a read and a write to the same address in one cycle.
 //
-//   1. Full-frame image read   rom_sequencer, via read_go.
-//                              Owns the read port for a whole frame.
-//   2. Write path              mem_write_subsystem, via wr_port_grant.
-//                              Serves BOTH Single Pixel Write and Image
-//                              Burst Write -- mem_msg_writer turns each
-//                              into a rectangle (1x1 or HxW) and
-//                              pixel_word_packer issues masked word
-//                              writes, so there is no separate burst-write
-//                              client here.
-//
-//                              NAMED sram_rmw AND sram_wr_ctrl IN EARLIER
-//                              REVISIONS. Both are gone, and so is the
-//                              48-bit command FIFO they drained. The name
-//                              sram_rmw is actively misleading now: there
-//                              is no read-modify-write anywhere in this
-//                              design, because rgb_sram has a per-byte
-//                              write enable and a single pixel is exactly
-//                              one byte lane.
-//   3. Read-port borrower      pixel_rd_ctrl OR burst_rd_ctrl, via
-//                              pix_rd_req / pix_rd_gnt / pix_rd_done.
-//                              These two are arbitrated against each other
-//                              in memory_subsystem BEFORE this module sees them,
-//                              and arrive as one shared request. The port
-//                              names still say "pix" for that reason -- see
-//                              the port comments below.
-//
-// Burst handling IS present: burst_active closes the inter-frame gaps in an
-// Image Burst Write (see the STAGE 3 / M4 section below). What is still
-// absent is a drain barrier and CTS hold-off -- writes retain priority over
-// a pending read, so a saturating write stream could in principle starve
-// reads. See LIVENESS at the end for why that cannot happen at UART rates.
-//
-// -----------------------------------------------------------------------
-// WHAT IT PREVENTS
-// -----------------------------------------------------------------------
-// rgb_sram is a simple dual-port memory. A same-address access where one
-// port writes yields INVALID READ DATA on 7-series block RAM -- the stored
-// contents stay safe, but the outgoing image word is corrupted.
-//
-// Gating writes on !rom_seq_busy alone is not sufficient. rom_seq_busy
-// asserts one cycle before rom_rd_en, but the write pipeline is two deep, so
-// a pop issued in the same cycle a start arrives still lands its write while
-// the first read is active:
-//
-//   cycle N    pop issued (rom_seq_busy still low), start_pulse arrives
-//   cycle N+1  rom_seq_busy = 1, pop_q = 1
-//   cycle N+2  rom_rd_en = 1  AND  wr_en = 1     <-- collision
-//
-// And this is not a rare address coincidence: rom_sequencer always begins at
-// address 0, so a queued write to word 0 collides deterministically. The
-// Stage 2C test writes pixel index 0, which is word 0.
-//
-// The realistic trigger is the host sending pixel writes during a capture.
-// They queue (blocked by the interlock), the capture ends, the controller
-// starts draining, and a new start arrives mid-drain.
-//
-// -----------------------------------------------------------------------
-// HOW IT WORKS
-// -----------------------------------------------------------------------
-//   wr_pending  = commands queued OR a command in the write pipeline
-//   read_go     = a start is pending AND nothing is writing
-//   read_active = read_go OR rom_seq_busy
-//   wr_port_grant  = NOT read_active
-//
-// read_go can only fire when the write pipeline is completely empty, and
-// once it fires wr_port_grant drops immediately, so no new pop can begin. The
-// write port is therefore provably quiet before rom_rd_en asserts.
-//
-// The read_go/rom_seq_busy handover is contiguous with no gap, because
-// rom_sequencer registers busy from the NEXT state:
-//
-//     busy <= (next_state != IDLE);   // rom_sequencer.sv, final always_ff
-//
-// so busy is already high in the cycle after read_go. Were it registered
-// from the CURRENT state there would be a one-cycle hole here needing an
-// extra delay stage.
-//
-// -----------------------------------------------------------------------
-// WHY rom_seq_busy CANNOT GATE read_go
-// -----------------------------------------------------------------------
-// rom_seq_busy tracks the ADDRESS WALK, not the transfer. It drops as soon
-// as the last word is pushed, while up to 64 pixels remain in the pixel FIFO
-// and tx_sequencer is still shifting them out -- roughly 1.4 ms of image
-// still to go.
-//
-// Gating read_go on !rom_seq_busy would therefore launch a queued start the
-// instant the walk ended, restarting rom_sequencer at address 0 while the
-// previous image was still draining. The two images would interleave in the
-// FIFO and both would be corrupted.
-//
-// Conversely, NOT gating it at all lets read_go assert while the sequencer
-// is mid-walk: rom_sequencer ignores a start unless it is in IDLE, so the
-// pulse does nothing, but start_pending is cleared anyway and the request is
-// silently lost.
-//
-// Both failures come from the same mistake -- treating the address walk as
-// the transfer. img_in_flight uses the real completion event instead:
-// tx_img_done, recovered into this clock domain by the Change B toggle
-// synchroniser.
-//
-// -----------------------------------------------------------------------
-// DUPLICATE STARTS ARE REJECTED, NOT QUEUED
-// -----------------------------------------------------------------------
-// rgf.sv gates IMG_CTRL.start on (!complete && !error). Both are only SET
-// at the end of a transfer by status_wen, so during a transfer they are
-// still clear and the interlock PASSES -- a mid-transfer start really does
-// reach this module as a start_req pulse. The RGF interlock guards the
-// post-transfer retry, not the mid-transfer duplicate.
-//
-// Pre-Stage-2C that pulse went straight to rom_sequencer, which only
-// samples `start` in IDLE, so it was silently ignored. That is the
-// established Lab 10 semantic and it is preserved here: start_pending is
-// only set when img_in_flight is low.
-//
-// Queueing such a start would be actively wrong. It would launch on
-// tx_img_done -- the very event that SETS complete -- so the second
-// transfer would run with complete set, having never been cleared by the
-// host. That is exactly the condition the RGF interlock exists to forbid,
-// and honouring it in the RGF while routing around it here would make the
-// two disagree.
-//
-// start_pending therefore exists for one legitimate case only: a start
-// that arrives with no transfer in flight but with pixel writes still
-// draining. That request is genuinely deferred, not rejected, because
-// start_req is a one-cycle pulse and would otherwise be lost.
-//
-// -----------------------------------------------------------------------
-// WHY start_pending MUST BE STICKY
-// -----------------------------------------------------------------------
-// start_req is a single-cycle pulse from the RGF. If a start arrives while
-// writes are draining, read_go cannot fire that cycle and an unlatched pulse
-// would be lost outright -- the transfer would simply never happen and the
-// host would sit waiting for a completion that never comes.
-//
-// -----------------------------------------------------------------------
-// NO COMBINATIONAL LOOP
-// -----------------------------------------------------------------------
-// Both write-side inputs are registered at their source, so nothing here
-// feeds back into wr_port_grant:
-//
-//   wr_busy      is mem_write_subsystem's rect_busy, which is
-//                pixel_word_packer's `busy` FLOP -- set on start, cleared
-//                when the rectangle completes.
-//   wr_port_req  is mem_msg_router's wr_msg_valid = msg_valid && to_write,
-//                and msg_valid is cdc_msg_sync's dst_valid, also a flop.
-//
-// wr_port_grant therefore depends only on registered state. It reaches the
-// packer as its wr_ready, and the resulting stall propagates back through
-// pixel_ready and the writer's msg_ready -- all of which are decodes of
-// registered FSM state, not of the grant. That breaks what would otherwise
-// be a loop.
-//
-// An earlier version of this note argued the same point in terms of
-// sram_wr_ctrl's pop_q / wr_en / cmd_rd_en and the command FIFO being
-// non-empty. That module and that FIFO are both gone.
-//
-// -----------------------------------------------------------------------
-// STAGE 3 / M4: burst_active
-// -----------------------------------------------------------------------
-// An Image Burst Write arrives as many separate 16-byte frames. Each frame
-// yields four commands that the write path drains in a handful of cycles,
-// then ~2816 receive-clock cycles pass before the next frame. So wr_port_req
-// genuinely goes HIGH between frames, and wr_busy with it.
-//
-// Without burst_active, a start_req arriving in one of those gaps would see
-// wr_pending low, fire read_go, and launch rom_sequencer over an image that
-// is only half written -- producing a torn capture with no error anywhere.
-//
-// burst_active closes the gaps. It appears ONLY in wr_pending, which gates
-// the start of a READ. It deliberately does NOT appear in read_active, which
-// gates writes: including it there would make a burst block its own writes
-// and deadlock immediately.
-//
-// -----------------------------------------------------------------------
-// LIVENESS
-// -----------------------------------------------------------------------
-// Writes drain at one command per clock, so wr_pending clears within at most
-// DEPTH+2 cycles and a pending read always proceeds. A read always completes
-// and releases wr_port_grant. Neither side can deadlock.
-//
-// Writes have priority over a pending read, so a saturating write stream
-// could in principle starve reads. It cannot happen at UART rates -- one
-// command per ~15 us against a one-cycle drain -- and the later arbiter
-// addresses it properly with a drain barrier.
+// The key rule is simple: a read can start only when no write is active, and a
+// burst write keeps a new read deferred until the write traffic is done.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 
@@ -224,27 +41,16 @@ module mem_interlock (
 
     // -----------------------------------------------------------------
     // READ-PORT BORROWER: third client of the memory. It borrows the SRAM
-    // READ port, so it must exclude both the image reader (same port) and
-    // the writer (same memory).
+    // read port, so it must exclude both the image reader and the writer.
     //
-    // THE "pix" PREFIX IS HISTORICAL. This port pair was added for
-    // pixel_rd_ctrl alone, but burst_rd_ctrl is now a second borrower with
-    // identical needs. The two are arbitrated against each other inside
-    // memory_subsystem and presented here as ONE shared request -- see
-    // shared_rd_req / shared_rd_gnt / shared_rd_done at the instantiation.
-    // This module deliberately does not know which of the two it is
-    // granting; from here they are one client, which is why no fourth
-    // port pair was added.
+    // The borrower request is a shared one: pixel_rd_ctrl and burst_rd_ctrl
+    // are arbitrated upstream and presented here as a single read-borrower
+    // request. This block only cares that the port is free and that the request
+    // stays active until the borrower is done.
     //
-    // Duration differs sharply between them and that is fine: a single
-    // pixel read holds the port for a handful of cycles, while a Burst
-    // Read holds it for the whole rectangle -- deliberately, so the
-    // returned region is a coherent snapshot (see burst_rd_ctrl.sv). Both
-    // are just "granted until done" from this module's point of view.
-    //
-    // The request is a LEVEL, held by the borrower until granted. A grant
-    // latches pix_rd_active, which blocks read_go and wr_port_grant until
-    // done is asserted.
+    // The request is a level, held by the borrower until it is granted. Once a
+    // grant is latched, it blocks both read_go and wr_port_grant until the
+    // borrower clears its done signal.
     // -----------------------------------------------------------------
     input  logic pix_rd_req,
     input  logic pix_rd_done,

@@ -1,46 +1,12 @@
 // mem_msg_router.sv
 // =================
-// Routes each arriving message to the one thing on the memory side that
-// handles it, and holds the message until that destination can take it.
+// Dispatches each incoming message to the correct memory-side destination and
+// holds the message until that destination is ready.
 //
-//                        +-> write path      pixel write, burst header/data
-//   msg -> mem_msg_router+-> pixel_rd_ctrl   single pixel read
-//                        +-> burst_rd_ctrl   image burst read
-//                        +-> register file   register read and write
-//
-// -----------------------------------------------------------------------
-// WHY IT HOLDS
-// -----------------------------------------------------------------------
-// Both read controllers take a ONE-CYCLE STROBE and expose a `busy` flag,
-// and each carries a `req_overrun` sticky meaning "a request arrived while I
-// was busy and I dropped it". Firing a strobe blindly is therefore a silent
-// data-loss path -- the same shape as the command FIFO overflow this rework
-// removed.
-//
-// So the router presents a message to its destination and does not accept
-// the next one until it has been taken. Because everything upstream is
-// ready/valid, that stall propagates: router -> crossing -> rx_classifier
-// -> rx_mac -> UART_CTS -> the PC pauses. Nothing is dropped, transfers
-// just take longer.
-//
-// -----------------------------------------------------------------------
-// ORDERING IS NOW GUARANTEED, WHICH IT WAS NOT BEFORE
-// -----------------------------------------------------------------------
-// Reads and register commands used to reach the memory domain through their
-// OWN cdc_cmd_sync instances, in parallel with the command FIFO carrying
-// writes. Nothing ordered those paths against each other: a register write
-// enabling something and a burst read depending on it crossed independently,
-// and only similar latencies made the design appear to work.
-//
-// One crossing and one router means messages arrive and are dispatched in
-// the order the PC sent them.
-//
-// -----------------------------------------------------------------------
-// THE REGISTER FILE HAS NO BACK-PRESSURE
-// -----------------------------------------------------------------------
-// register_subsystem accepts a command every cycle, so register traffic
-// never stalls the router. Only the two read controllers and the write path
-// can hold it up.
+//                        +-> write path
+//   msg -> mem_msg_router+-> pixel_rd_ctrl
+//                        +-> burst_rd_ctrl
+//                        +-> register file
 
 `timescale 1ns/1ps
 
@@ -132,9 +98,9 @@ module mem_msg_router
         endcase
     end : select
 
-    // The destination decides whether the message can be taken this cycle.
-    // A read controller that is busy holds the whole chain, all the way back
-    // to the PC, rather than having its request silently discarded.
+    // The destination decides whether the message can be taken this cycle. If a
+    // read controller is busy, the router holds the message instead of dropping
+    // it and silently losing work.
     logic dest_ready;
 
     always_comb begin : ready_mux
@@ -184,29 +150,11 @@ module mem_msg_router
             brd_req_valid <= 1'b0;
             rgf_cmd_valid <= 1'b0;
 
-            // ADDRESS PARKING -- REQUIRED BY THE REGISTER FILE.
+            // ADDRESS PARKING.
             //
-            // rgf's IMG_TX_MON read-to-clear is a level-sensitive decode
-            // with no valid qualifier:
-            //
-            //     else if (!pc_wen && pc_sel_img_tx_mon)   // rgf.sv
-            //
-            // so holding the last address between commands clears
-            // img_send_complete/img_send_error on every idle cycle once
-            // that address has been IMG_TX_MON_ADDR, and the IMG_CTRL
-            // start interlock quietly stops working.
-            //
-            // This obligation used to be met by cdc_cmd_sync, which drove
-            // dst_addr to its IDLE_ADDR parameter whenever dst_valid was
-            // low. That crossing was deleted when register commands became
-            // messages, and the parking went with it -- rgf_cmd_addr was
-            // assigned only inside `if (fire && to_rgf)` and therefore held
-            // indefinitely. Defaulting it here restores the guarantee at
-            // the module that now owns the port.
-            //
-            // The non-blocking assignment in the to_rgf arm below overrides
-            // this on the cycle a command is actually issued, so the address
-            // is correct exactly when rgf_cmd_valid is high.
+            // The register file decodes some addresses as level-sensitive status
+            // bits. The parked IDLE_ADDR prevents stale data from being decoded as
+            // a live register access when no command is active.
             rgf_cmd_addr  <= rgf_pkg::IDLE_ADDR;
 
             if (fire) begin

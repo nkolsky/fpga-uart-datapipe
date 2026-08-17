@@ -1,32 +1,9 @@
 // -----------------------------------------------------------------------------
 // memory_subsystem.sv
 //
-// Pure hierarchy extraction of the complete 100 MHz memory domain.
-//
-// Contains:
-//   - mem_msg_router      dispatches each arriving message
-//   - mem_write_subsystem message writer, word packer
-//   - rgb_sram x3
-//   - rom_sequencer
-//   - pixel_rd_ctrl
-//   - burst_rd_ctrl
-//   - shared pixel/burst read arbiter
-//   - mem_interlock
-//   - SRAM read-port mux
-//   - image FIFO overflow sticky diagnostic
-//
-// The write path used to be sram_wr_ctrl fed by a 16-deep asynchronous
-// COMMAND FIFO. Both are gone: messages now arrive whole on one ordered
-// stream through cdc_msg_sync, and back-pressure runs from here to the PC.
-//
-// One async FIFO remains in chip_top, the IMAGE FIFO. That one is between
-// rom_sequencer and tx_sequencer and is a genuine rate buffer: the memory
-// side produces a pixel every few clocks and the UART consumes one roughly
-// every 700. The command FIFO was the opposite case -- producer three
-// orders of magnitude SLOWER than consumer -- so it buffered nothing and
-// only hid a missing back-pressure path.
-//
-// All CDC primitives remain in chip_top.
+// 100 MHz memory domain. It routes message traffic, stores image data in the
+// three SRAM banks, streams image reads, and owns the read/write arbitration
+// for the shared memory port.
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 
@@ -46,18 +23,15 @@ module memory_subsystem (
     output logic        img_fifo_wr_en,
     output logic [23:0] img_fifo_wr_data,
 
-    // Message input. Every message frame arrives here in order.
-    // ---- message in, from cdc_msg_sync ---------------------------------
-    // Replaces the command FIFO. Every message frame crosses here, in order,
-    // and back-pressure runs from this port all the way to the PC.
+    // Message input. Messages arrive here in order and are dispatched by the
+    // router. Back-pressure is carried back to the source.
     input  logic                        msg_valid,
     output logic                        msg_ready,
     input  msg_format_pkg::msg_kind_t   msg_kind,
     input  msg_format_pkg::msg_payload_t msg_payload,
 
-    // Read REQUESTS no longer arrive as separate crossings: they are
-    // messages like any other, and mem_msg_router dispatches them. Only the
-    // REPLIES still cross on their own, since they travel the other way.
+    // Read requests arrive as messages and are routed by the message router.
+    // Responses travel back on their own CDC paths.
     input  logic        pix_rpy_accept,
     output logic        pix_rpy_send,
     output logic [43:0] pix_rpy_payload,
@@ -66,8 +40,7 @@ module memory_subsystem (
     output logic        brd_msg_send,
     output logic [95:0] brd_msg_payload,
 
-    // Register file commands, routed from the same message stream. The RGF
-    // itself lives in register_subsystem at the top level.
+    // Register file commands, routed from the same message stream.
     output logic        rgf_cmd_valid,
     output logic        rgf_cmd_is_write,
     output logic [7:0]  rgf_cmd_addr,
@@ -229,29 +202,15 @@ rom_sequencer #(
 // -----------------------------------------------------------------------
 // WRITE PATH
 //
-// Replaces sram_wr_ctrl and the command FIFO. Messages arrive whole:
-//
-//   mem_msg_writer     decodes msg_kind and opens a rectangle
-//   pixel_word_packer  accumulates pixels into 32-bit words
-//   sram_rmw           writes the word, reading first only when the update
-//                      does not cover every lane
-//
-// A burst data message carries four pixels and four pixels are exactly one
-// word per channel, so burst traffic writes whole words and needs no reads.
+// Messages are decoded into writes, packed into SRAM words, and committed only
+// when the shared memory port grants access.
 // -----------------------------------------------------------------------
 // -----------------------------------------------------------------------
 // MESSAGE ROUTER
 //
-// Every message arrives on one ordered stream and is dispatched to the one
-// thing that handles it. Reads and register commands used to reach this
-// domain through their OWN cdc_cmd_sync instances, in parallel with the
-// command FIFO carrying writes, and nothing ordered those paths against each
-// other. Now dispatch follows the order the PC sent.
-//
-// The router HOLDS a message until its destination can take it. Both read
-// controllers take a one-cycle strobe and drop anything arriving while busy
-// -- each carries a req_overrun sticky saying so -- and that stall
-// propagates back through the crossing to the PC.
+// The router dispatches each incoming message to the correct handler in order.
+// If a destination is busy, it holds the message and back-pressures the input
+// stream.
 // -----------------------------------------------------------------------
 mem_msg_router u_msg_router (
     .clk              (clk),

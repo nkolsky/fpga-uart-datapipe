@@ -1,52 +1,9 @@
 // fifo_pkg.sv
 // -----------
-// Parameters and gray-code helper functions for async_fifo.sv.
+// Shared FIFO config and Gray-code helpers for the image FIFO.
 //
-// (This header was previously titled "async_fifo_pkg.sv"; the file and the
-// package are both named fifo_pkg.)
-//
-// TWO INSTANCES SHARE THESE PARAMETERS. async_fifo parameterises only its
-// data width -- DEPTH, the thresholds, the pointer width and the gray
-// helpers below are fixed for every instance, because bin2gray/gray2bin
-// bake PTR_WIDTH into their signatures. The sizing rationale that follows
-// was derived for the IMAGE FIFO (24-bit, rom_sequencer -> tx_sequencer).
-// The 48-bit command FIFO inherits the same numbers; its occupancy is
-// nowhere near them, since it drains at one command per clock against a
-// UART-limited arrival rate.
-//
-// SIZING RATIONALE -- NOTE THE ASSUMPTION IT WAS DERIVED UNDER.
-// The AF figure below was worked out when both FIFO ports were driven by
-// the same clock. That is no longer true: the image FIFO now writes on
-// CLK100MHZ and reads on the 130 MHz pll_clk_out (see async_fifo.sv).
-// The margin survives the change -- the read side is now FASTER than the
-// write side, so it drains sooner and the synchroniser lag term, measured
-// in write-clock cycles, is if anything smaller than the 1-pixel figure
-// assumed. The 8 slots of headroom below are therefore a lower bound, not
-// an estimate that needs redoing. Recorded explicitly so the derivation is
-// not read as though it still describes a synchronous FIFO.
-//   DEPTH = 64        - unchanged from the sync FIFO; burst pattern from
-//                        rom_sequencer (4 pixels per ROM word) is unchanged,
-//                        so the same buffering depth still applies.
-//   AF    = 52         - derived from worst-case overshoot past the AF
-//                        threshold before rom_sequencer reacts:
-//                          + up to 3 pixels: rom_sequencer only checks
-//                            almost_full at NEXT_ADDR, after a full 4-pixel
-//                            ROM word has already been pushed (burst
-//                            granularity overshoot, same in sync/async)
-//                          + up to 1 pixel: synchronizer lag on rd_ptr
-//                            (2 read-clock cycles @ 1 read/4 cycles ≈ 1
-//                            pixel of stale visibility on the write side)
-//                        Worst case occupancy reached = AF + 4 = 56,
-//                        leaving 8 slots of true headroom before DEPTH=64.
-//   AE    = 8           - unchanged from the sync FIFO. The read-side
-//                        equivalent lag only delays almost_empty's
-//                        assertion (a throughput cost, not a correctness
-//                        risk), so no widening was required here.
-//
-// Pointer width:
-//   Pointers are ADDR_WIDTH+1 bits wide (one extra MSB beyond the address
-//   range) to allow full/empty disambiguation when wr_ptr and rd_ptr wrap
-//   around the circular buffer - standard Cummings async FIFO technique.
+// Depth, thresholds and pointer width are fixed so the Gray/bin helpers stay
+// consistent across the dual-clock queue.
 
 `timescale 1ns/1ps
 
@@ -71,25 +28,19 @@ package fifo_pkg;
     localparam int SYNC_STAGES = 2;
 
     // -----------------------------------------------------------------
-    // Gray code conversion functions
+    // Gray-code helpers
     // -----------------------------------------------------------------
 
     // Binary to Gray: gray = binary ^ (binary >> 1)
-    // Only one bit changes between consecutive gray-coded values, making
-    // it safe to sample across an asynchronous clock-domain boundary
-    // without risking a multi-bit transition glitch (metastability-safe
-    // value, even if the sampling flop itself can still go metastable -
-    // that risk is handled by the multi-stage synchronizer, not by gray
-    // coding alone).
+    // Only one bit changes between consecutive values, so the pointer can be
+    // transferred safely across the CDC boundary.
     function automatic logic [PTR_WIDTH-1:0] bin2gray(
         input logic [PTR_WIDTH-1:0] bin
     );
         return bin ^ (bin >> 1);
     endfunction
 
-    // Gray to Binary: reconstructs the binary value via XOR-cascade.
-    // Needed when converting a synchronized gray pointer back to binary
-    // for occupancy / almost_full / almost_empty arithmetic.
+    // Gray to Binary: reconstruct the binary pointer for occupancy checks.
     function automatic logic [PTR_WIDTH-1:0] gray2bin(
         input logic [PTR_WIDTH-1:0] gray
     );

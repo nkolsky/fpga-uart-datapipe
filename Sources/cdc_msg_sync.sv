@@ -1,106 +1,32 @@
 // cdc_msg_sync.sv
 // ===============
-// Carries one message at a time across a clock domain boundary, with full
-// handshake back-pressure in both directions.
+// One-message CDC with full back-pressure.
 //
-//   src_valid / src_ready  ->  [ CDC ]  ->  dst_valid / dst_ready
-//
-// Replaces the asynchronous command FIFO between the RX and memory domains.
-//
-// -----------------------------------------------------------------------
-// WHY NOT A FIFO
-// -----------------------------------------------------------------------
-// A FIFO absorbs a rate mismatch. There is no rate mismatch here. At
-// 8.125 Mbaud a 16-byte message takes about 2816 UART-domain clocks and
-// carries four pixels, so a pixel arrives roughly every 700 clocks against a
-// memory side running at 100 MHz. The consumer is three orders of magnitude
-// faster than the producer; there is nothing to buffer.
-//
-// There is also nothing to buffer INTO. The RX side holds no image data --
-// it is protocol only -- so a FIFO there is storage in the wrong place.
-//
-// AREA. The command FIFO was 16 entries of 48 bits plus Gray-coded pointers,
-// their synchronisers and the full/empty comparators. This is one data
-// register, two toggle bits and four synchroniser flops. For a 99-bit
-// message that is roughly 105 flops against roughly 800.
-//
-// POWER. A message crosses ONCE. The previous scheme split every burst data
-// message into four pixel commands and pushed each through the FIFO
-// separately, so a burst paid four crossings per message.
-//
-// LATENCY. A two-phase handshake costs about two destination clocks out and
-// two source clocks back, so roughly four to six cycles per message. Against
-// 2816 cycles of message arrival time that is invisible.
+// src_valid/src_ready and dst_valid/dst_ready form a toggle-based handshake.
+// The source pushes a complete message only when the crossing is ready, and
+// the destination holds the message until it is accepted.
 //
 // -----------------------------------------------------------------------
-// WHY BACK-PRESSURE, GIVEN MESSAGES ARRIVE SO SLOWLY
+// Handshake
 // -----------------------------------------------------------------------
-// Not because the source is fast. It is not: ~2816 clocks between messages
-// against a ~5 clock handshake. The reason is that the DESTINATION CAN BLOCK
-// FOR FAR LONGER THAN A MESSAGE INTERVAL.
-//
-// The SRAMs have one port, arbitrated by mem_interlock:
-//
-//     wr_allowed  = !read_active && !pix_rd_active
-//     read_active = read_go || rom_seq_busy
-//
-// so a read in progress blocks writes outright. An image burst read walks the
-// whole image and its data leaves over UART, so it is TRANSMITTER rate
-// limited -- 65536 pixels at 256x256, millions of clocks. A pixel write
-// arriving while an image read streams out waits for all of it.
-//
-// The previous design had no way to say so. Its 16-deep command FIFO turned
-// "lose the next command" into "lose the seventeenth", and cmd_ovf_sticky
-// exists -- wired to LED[13] -- precisely to report when that happened. A
-// sticky bit for silent data loss is evidence the problem was known, not
-// that it was solved.
-//
-// src_ready replaces a silent overflow with an explicit stall. The intended
-// chain is
-//
-//     memory blocked -> crossing not ready -> classifier holds its command
-//                    -> MAC stops accepting frames -> RTS deasserts
-//                    -> PC pauses
-//
-// Nothing is discarded; the transfer takes longer. Every link is one register
-// deep, so no queue is needed anywhere.
-//
-// THE CHAIN IS BUILT. rx_classifier consumes src_ready: it holds out_valid
-// until out_ready, raises out_busy while either pipeline stage is occupied,
-// and rx_mac stalls a completed frame in its buffer rather than announcing
-// it (waiting in MAC_CHK, not MAC_DONE, so frame_done is not held high).
-// mac_busy therefore stays high and UART_CTS deasserts. An earlier version
-// of this note said the RX side did not yet consume src_ready and that
-// rx_classifier still pulsed its command for one cycle -- that has not been
-// true since the classifier was given its output register and second stage.
+// req_tgl flips when a new message is accepted. The destination sees that
+// toggle after the synchronizer and raises dst_valid. When dst_ready is high,
+// the destination toggles ack_tgl; the source sees that return toggle and
+// clears src_ready until the handshake is complete.
 //
 // -----------------------------------------------------------------------
-// HOW IT WORKS -- TWO-PHASE (TOGGLE) REQ/ACK
+// Data handling
 // -----------------------------------------------------------------------
-//   1. src accepts a message when src_ready is high: data is registered and
-//      req_tgl flips.
-//   2. req_tgl is synchronised into the destination domain. An edge means a
-//      new message has arrived; dst_valid rises.
-//   3. dst_valid stays high until dst_ready, then ack_tgl flips.
-//   4. ack_tgl is synchronised back. src_ready returns high when the two
-//      toggles agree.
+// data_reg captures src_data on the same edge as the request toggle. The data
+// stays stable for the whole handshake, and the destination samples it only
+// after the request has crossed. This is the usual safe pattern: synchronize
+// the control bit, then pass the payload with it.
 //
-// src_ready = (req_tgl == ack_sync), so the source cannot issue a second
-// message until the first has been taken. No message is dropped, none is
-// duplicated, and neither side needs to know the other's clock.
-//
-// THE DATA PATH IS NOT SYNCHRONISED, DELIBERATELY.
-// src_data is captured in a plain register and held UNCHANGED for the entire
-// handshake. The destination samples it only after req_tgl has passed through
-// two synchroniser flops, by which time it has been stable for at least two
-// destination clocks. This is the standard multi-cycle path formulation:
-// synchronise the control bit, let the data ride along. Putting synchronisers
-// on 99 data bits would cost 198 flops and would NOT make it safer -- each
-// bit could resolve differently and produce a word that was never sent.
-//
-// The data register needs a false path or max-delay constraint in the XDC;
-// without one the tool will try to close it as a single-cycle path between
-// asynchronous clocks and report failure.
+// -----------------------------------------------------------------------
+// Timing note
+// -----------------------------------------------------------------------
+// The data register is a real CDC path. The XDC should treat it as a
+// multi-cycle path rather than a single-cycle synchronous path.
 
 `timescale 1ns/1ps
 

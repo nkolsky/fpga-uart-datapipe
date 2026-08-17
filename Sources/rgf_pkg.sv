@@ -1,77 +1,14 @@
+// -----------------------------------------------------------------------------
 // rgf_pkg.sv
-// ----------
-// Register map and bitfield definitions for the Config RGF.
 //
-// This started as a bare-minimum pass carrying only the four registers
-// Lab 8/9 specify. It has since grown to SIX: Lab 10 added CLK_CTRL (the
-// clock-mux select the spec asks for) and PARITY_FAULT_CNT (the rx_phy
-// parity fault counter). The map is contiguous on a 4-byte stride, so
-// register index N sits at byte address N*4 -- which is exactly what
-// chip_top.sv's legacy {R###,C###,V###} dispatcher relies on when it
-// treats row_q as a register INDEX rather than an address.
+// Register map for the config register file. Addresses are byte-indexed with a
+// 32-bit stride, and the IDLE_ADDR value is used when no command is active so
+// level-sensitive decoders do not accidentally act on stale data.
 //
-// Robustness (invalid-address latching, reserved-bit write masking) is
-// still a deliberate follow-up and is NOT implemented here: the read mux
-// returns 0 for an unmapped address and a write to one is silently
-// dropped. Note that out-of-range addresses are already rejected UPSTREAM
-// by rx_reg_read_parser / rx_reg_write_parser, which refuse anything that
-// does not fit the 6-bit port or is not word aligned -- so a malformed
-// address is reported as a classifier error and never reaches this file.
-//
-// Register access-type glossary:
-//   RW    - PC reads and writes directly (mem-style pc_wen/pc_addr/pc_wdata)
-//   RO    - PC reads only; continuous passthrough from external/static
-//           inputs or from dedicated hardware ports
-//   IW    - Internally-Written: PC reads only; written by internal chip
-//           logic (the Sequencer, via status_wen/status_addr/status_wdata)
-//           and holds its value between writes
-//   IW+RC - Internally-Written AND Read-to-Clear: same as IW, but a PC
-//           READ additionally clears specific bits back to 0. Used for
-//           IMG_TX_MON.img_send_complete/img_send_error only (see rgf.sv
-//           section on the IMG_CTRL interlock for why).
-//
-// Six registers:
-//   0x00 IMG_STATUS       (RO)    - static image dimensions + ready flag
-//   0x04 IMG_TX_MON       (IW/+RC)- live progress of the TX drain;
-//                                    row_cnt/col_cnt are plain IW,
-//                                    img_send_complete/img_send_error are
-//                                    IW+RC (see rgf.sv)
-//   0x08 IMG_CTRL         (RW)    - PC writes bit 0 to trigger an image send
-//   0x0C FIFO_STATUS      (RO)    - async_fifo flag passthrough for PC-side
-//                                    debug visibility. RO, NOT IW: these are
-//                                    live hardware levels arriving on
-//                                    dedicated ports, not values written
-//                                    through the status_* bus. An earlier
-//                                    version of this header called it IW,
-//                                    which contradicted the implementation.
-//   0x10 CLK_CTRL         (RW)    - clock-mux select for the two-speed
-//                                    counter (Lab 10)
-//   0x14 PARITY_FAULT_CNT (RO)    - monotonic rx_phy parity fault count,
-//                                    incremented by a dedicated pulse input,
-//                                    not the status_* bus (Lab 10)
-//
-// Only TWO registers are writable by the PC: IMG_CTRL and CLK_CTRL. Only
-// ONE is written through the status_* bus: IMG_TX_MON. The remaining three
-// are driven by dedicated inputs.
-//
-// -----------------------------------------------------------------------
-// IMG_CTRL interlock -- resolved per the LITERAL spec wording this pass:
-//   "Initiates the image read process only if image transfer complete
-//    and image transfer error are both cleared"
-// i.e. accept a '1' write to start only when img_send_complete==0 AND
-// img_send_error==0. This is also the natural reset state (both default
-// to 0), so no reset-value override is needed to allow the first start --
-// unlike an earlier draft that required complete==1, which needed a
-// special reset hack to work at all.
-//
-// This raises the obvious follow-up question: once a transfer finishes
-// and img_send_complete gets set to 1, what clears it back to 0 so a
-// second transfer can start? Answer: IMG_TX_MON is read-to-clear on
-// those two bits specifically. The PC reads IMG_TX_MON once to observe
-// the finished/error state; that read clears both bits, which re-arms
-// IMG_CTRL.start for the next transfer. row_cnt/col_cnt are NOT cleared
-// by a read -- they're live progress counters, not one-shot event flags.
-// -----------------------------------------------------------------------
+// The register set is: IMG_STATUS, IMG_TX_MON, IMG_CTRL, FIFO_STATUS,
+// CLK_CTRL, and PARITY_FAULT_CNT. IMG_CTRL.start_img_read is gated by the
+// complete/error interlock; IMG_TX_MON complete/error bits are read-to-clear.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 

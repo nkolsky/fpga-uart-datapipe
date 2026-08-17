@@ -1,83 +1,26 @@
 // cdc_pulse_sync.sv
 // -----------------
-// Reusable single-bit PULSE clock-domain crossing, toggle style.
+// Single-bit pulse CDC using a toggle synchronizer.
 //
-// Converts a one-cycle pulse in the source domain into a one-cycle pulse
-// in the destination domain, safely and regardless of the frequency
-// ratio or phase relationship between the two clocks.
-//
+// A 1-cycle source pulse becomes a 1-cycle destination pulse without relying
+// on the pulse width landing inside a destination clock edge.
+
 // -----------------------------------------------------------------------
-// WHY A PULSE CANNOT SIMPLY BE SAMPLED
+// How it works
 // -----------------------------------------------------------------------
-// A one-cycle pulse in a 130 MHz domain is 7.69 ns wide. Sampling it
-// directly with a 100 MHz clock (10 ns period) can miss it entirely,
-// because the destination edge is not guaranteed to fall inside the
-// pulse window. Whether it lands depends on the phase relationship.
+// src_toggle flips on every source pulse. That level change is then sampled
+// across the CDC boundary and converted back to a single destination pulse by
+// XORing the synchronized toggle with its previous value.
 //
-// In this design both clocks derive from the same MMCM, so that phase
-// relationship is FIXED rather than random -- which is why the original
-// direct connection appeared to work at all. But it is fixed only for a
-// given placement: any re-place-and-route, timing change, or tool
-// version can shift it and silently start dropping pulses. That is the
-// definition of an unreliable design, and it is what this module fixes.
-//
+// The key rule is: do not send a second source pulse before the first toggle
+// has propagated through the 2-FF synchronizer. The caller must keep at least
+// about 3 destination clocks between pulses.
+
 // -----------------------------------------------------------------------
-// HOW THE TOGGLE SYNCHRONISER WORKS
+// Timing note
 // -----------------------------------------------------------------------
-// The trick is to stop transmitting a pulse and transmit a LEVEL CHANGE
-// instead. A level change cannot be missed: once the source toggle flips,
-// it STAYS flipped until the next pulse, so the destination is guaranteed
-// to observe the new value no matter when it samples.
-//
-//   1. SOURCE      src_toggle inverts on every src_pulse. The information
-//                  is now carried by an edge, not by a pulse width, so
-//                  there is no longer anything narrow to miss.
-//
-//   2. TRANSFER    src_toggle is sampled by a two-flop synchroniser in the
-//                  destination domain. The first flop may go metastable;
-//                  the second gives it a full destination clock period to
-//                  resolve, which is what makes the crossing safe.
-//
-//   3. EDGE DETECT A third destination flop delays the synchronised
-//                  toggle by one cycle. XOR of the two recreates exactly
-//                  one destination-domain cycle of pulse per source pulse.
-//
-// One source pulse in, exactly one destination pulse out. Never zero,
-// never two.
-//
-// -----------------------------------------------------------------------
-// MINIMUM PULSE SPACING -- the one constraint the caller must honour
-// -----------------------------------------------------------------------
-// The source must not issue a second pulse before the first toggle has
-// propagated, which takes roughly three destination clocks. Two pulses
-// closer than that would flip the toggle twice inside one synchroniser
-// window and the destination would see either one pulse or none.
-//
-// Required spacing: about 3 destination clocks, i.e. ~30 ns for a 100 MHz
-// destination, or ~4 source cycles at 130 MHz.
-//
-// Both users of this module in chip_top are far outside that limit:
-//   tx_img_done        fires once per whole image transfer (millions of
-//                      cycles apart)
-//   rx_parity_err_pulse at most once per received UART byte, ~1.35 us
-//                      apart at 8.125 Mbaud -- roughly 175 destination
-//                      clocks, a ~58x margin
-//
-// If a future user cannot guarantee this spacing, it needs a full
-// four-phase request/acknowledge handshake instead, not this module.
-//
-// -----------------------------------------------------------------------
-// TIMING CONSTRAINT -- REQUIRED, see the XDC note in chip_top
-// -----------------------------------------------------------------------
-// CLK100MHZ and the 130 MHz PLL output are RELATED clocks (same MMCM), so
-// Vivado will attempt to time the src_toggle -> sync_ff[0] path as an
-// ordinary synchronous path. For a 13:10 ratio the tightest launch/capture
-// relationship is only 0.769 ns, which is not achievable and will be
-// reported as a large violation.
-//
-// That path must therefore be constrained as a CDC path in the XDC. This
-// is not cosmetic: without it the tool wastes effort on an impossible
-// path and the timing report hides real violations.
+// This path is a real CDC boundary, even if both clocks come from the same
+// MMCM. Vivado still needs the proper CDC constraint in the XDC.
 
 `timescale 1ns/1ps
 

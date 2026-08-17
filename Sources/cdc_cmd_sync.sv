@@ -1,74 +1,14 @@
+// -----------------------------------------------------------------------------
 // cdc_cmd_sync.sv
-// ---------------
-// Atomic single-entry command clock-domain crossing.
 //
-// Transfers a complete bus transaction -- {is_write, addr, wdata} -- from
-// a source clock domain to a destination clock domain, delivering it as
-// exactly one destination-domain strobe with all fields valid together.
+// Single-entry command CDC. The source captures the full command word when
+// src_valid is asserted, then sends a single dst_valid pulse with the address,
+// write flag, and payload together so the destination sees one atomic command.
 //
-// Built on cdc_pulse_sync, which is already hardware-validated. No new
-// synchroniser logic is written here: this module adds the payload
-// register and the qualified destination outputs around that primitive.
-//
-// -----------------------------------------------------------------------
-// WHY A ONE-ENTRY HANDSHAKE AND NOT A FIFO
-// -----------------------------------------------------------------------
-// A FIFO earns its place when the source can burst faster than the
-// destination drains. Here the source is rate-limited by the UART: one
-// legacy RGF command per 16-byte message, ~21.7 us at 8.125 Mbaud, which
-// is ~2820 source cycles at 130 MHz. Synchroniser latency is ~3
-// destination cycles. Occupancy therefore never exceeds one.
-//
-// -----------------------------------------------------------------------
-// ATOMICITY -- the whole point of this module
-// -----------------------------------------------------------------------
-// The payload register is written on the SAME source edge that flips the
-// toggle inside cdc_pulse_sync. The toggle then needs at least two
-// destination edges to traverse the synchroniser before dst_valid can
-// assert, so by the time the destination samples the payload it has been
-// stable for >= 2 destination clocks.
-//
-// The data therefore crosses WITHOUT per-bit synchronisation, and that is
-// correct rather than a shortcut: synchronising the bits individually
-// would actively BREAK atomicity, since each bit could resolve on a
-// different edge and the destination could observe a mixture of two
-// different transactions. One toggle covers all ADDR_W + DATA_W + 1 bits.
-//
-// -----------------------------------------------------------------------
-// IDLE_ADDR -- structural protection for level-sensitive decodes
-// -----------------------------------------------------------------------
-// dst_addr presents IDLE_ADDR on every cycle where dst_valid is low.
-//
-// This is inside the module deliberately, rather than left as a mux at
-// the instantiation site. The RGF this feeds implements read-to-clear as
-// a LEVEL-SENSITIVE decode:
-//
-//     if (!pc_wen && (pc_addr == IMG_TX_MON_ADDR)) ...   // rgf.sv:134
-//
-// If dst_addr held the last command address continuously, IMG_TX_MON
-// would be cleared on every single cycle, so the completion flag could
-// never latch and the start interlock would never engage. That failure
-// is silent -- no error, no assertion, just an interlock that quietly
-// stops working. Making the idle value structural means the module
-// cannot be instantiated in a way that reintroduces it.
-//
-// IDLE_ADDR must be an address the destination decodes to nothing. For
-// the RGF it is 8'hFF, which matches none of 0x00/0x04/0x08/0x0C/0x10/0x14.
-//
-// -----------------------------------------------------------------------
-// MINIMUM SPACING
-// -----------------------------------------------------------------------
-// This is a two-phase (toggle-only) handshake with no acknowledge, so the
-// source must not issue a second command before the previous toggle has
-// propagated: about 3 destination clocks, i.e. ~4 source cycles at
-// 130 -> 100 MHz. The UART rate guarantees ~2820, a margin of ~700x.
-//
-// A four-phase request/acknowledge scheme would remove that assumption,
-// but it would also need a busy signal fed back to stall the source --
-// real plumbing for a case that cannot occur here. Instead the assumption
-// is policed by the simulation-only assertion at the bottom of this file,
-// which turns a violation into a loud failure rather than a silent
-// dropped command.
+// While dst_valid is low, dst_addr is forced to IDLE_ADDR so level-sensitive
+// decoders do not act on stale data. The source is expected to space pulses far
+// enough apart to avoid overwriting an in-flight transfer.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 

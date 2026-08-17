@@ -1,80 +1,19 @@
 // async_fifo.sv
 // -------------
-// Async FIFO - Cummings-style dual-clock gray-code pointer FIFO.
+// Dual-clock image FIFO.
 //
-// -----------------------------------------------------------------------------
-// THE CDC IS LOAD-BEARING. BOTH INSTANCES GENUINELY CROSS DOMAINS.
-// -----------------------------------------------------------------------------
-// This header used to say that chip_top tied the same clock to wr_clk and
-// rd_clk, making the gray pointers and synchronisers structurally correct but
-// functionally inert. THAT IS NO LONGER TRUE, and reading it that way would be
-// dangerous. Once the UART front end moved onto the 130 MHz PLL output, the
-// crossing acquired two genuinely unrelated clocks:
-//
-//   u_img_fifo    (image FIFO, 24-bit) -- the ONLY instance
-//       wr_clk = CLK100MHZ     rom_sequencer, memory domain
-//       rd_clk = pll_clk_out   tx_sequencer, 130 MHz UART domain
-//
-// The gray-coded pointers and the 2-FF synchronisers are therefore the actual
-// mechanism keeping the pointers coherent, not a spec box-tick -- removing or
-// simplifying either would corrupt the flags in hardware.
-//
-// THERE IS NO LONGER A SECOND INSTANCE. This header used to describe a
-// u_cmd_fifo -- a 48-bit command FIFO crossing the other way, pll_clk_out to
-// CLK100MHZ, feeding the write path. It has been deleted. There was no rate
-// mismatch for it to absorb: its producer was UART-limited at roughly one
-// message per 2816 source clocks against a consumer draining one command per
-// clock, so it buffered nothing and only hid a missing back-pressure path,
-// turning "lose the next command" into "lose the seventeenth". Messages now
-// cross on cdc_msg_sync, one at a time and in order, with src_ready
-// propagating all the way back to UART_CTS.
-//
-// The image FIFO remains because it absorbs a REAL rate mismatch: the memory
-// side produces a pixel every few clocks and the UART consumes one roughly
-// every 700.
-//
-// Both clocks happen to derive from the same MMCM, so their phase relationship
-// is fixed for a given placement. That does NOT make the crossing synchronous
-// in any useful sense: the ratio is 100:130, pointers still advance in
-// unrelated cycles, and the fixed phase is an artefact of one particular
-// place-and-route rather than a property the design may rely on.
+// wr_clk = CLK100MHZ, rd_clk = pll_clk_out.
+// Gray pointers and 2-FF synchronizers keep the queue coherent across domains.
 
 `timescale 1ns/1ps
 
 import fifo_pkg::*;
 
 // -----------------------------------------------------------------------------
-// STAGE 2B: data-width parameterisation
-// -----------------------------------------------------------------------------
-// DW is the ONLY thing parameterised, and it defaults to
-// fifo_pkg::FIFO_DATA_WIDTH, so an instantiation with no override is
-// bit-identical to the unparameterised module. The sole remaining instance
-// -- the 24-bit image FIFO in chip_top -- passes no override, deliberately:
-// the default IS its width.
+// DW is the only parameter. The image FIFO uses the default width.
 //
-// The parameter was added for the 48-bit command FIFO, which passed .DW(48)
-// and no longer exists. It is retained rather than removed because the
-// alternative is a module whose width is fixed by a package constant with no
-// way to say so at the instantiation, and because the failure it guarded
-// against is worth keeping documented: a 48-bit payload connected to a
-// 24-bit port keeps only the LOW half and silently discards the rest. That
-// is not an elaboration error, only a width warning, and no LED-level test
-// can see it.
-//
-// DEPTH, ADDR_WIDTH, PTR_WIDTH, AF_THRESHOLD, AE_THRESHOLD, the gray-code
-// helpers, both synchronisers and both flag computations are deliberately
-// NOT parameterised. The reason is bin2gray/gray2bin in fifo_pkg:
-//
-//   function automatic logic [PTR_WIDTH-1:0] bin2gray(input logic [PTR_WIDTH-1:0] bin);
-//
-// PTR_WIDTH is baked into their signatures. A per-instance DEPTH would give a
-// different PTR_WIDTH, and these functions would then silently truncate or
-// zero-extend the pointers -- a subtle CDC corruption that would not show up
-// as an elaboration error. Every instance therefore keeps DEPTH = 64 and the
-// helpers stay valid unchanged.
-//
-// The parameter is named DW rather than DATA_WIDTH to avoid shadowing the
-// wildcard-imported package name above.
+// Pointer geometry stays fixed in fifo_pkg so the gray/bin helpers stay valid.
+// Changing depth per instance would corrupt the CDC logic silently.
 // -----------------------------------------------------------------------------
 
 module async_fifo #(
@@ -121,18 +60,16 @@ logic [DW-1:0] fifo_mem [DEPTH-1:0];
 // ===========================================================
 
 // -----------------------------------------------------------
-// Signal declarations (write-domain native signals first,
-// then the incoming synchronized signal from the read domain)
+// Write-domain pointer state and synchronized read pointer.
 // -----------------------------------------------------------
 logic [PTR_WIDTH-1:0] wr_ptr_bin, wr_ptr_gray;
 
-logic [PTR_WIDTH-1:0] rd_ptr_gray_ff1;   // synchronizer stage 1 (at risk of metastability)
-logic [PTR_WIDTH-1:0] rd_ptr_gray_sync;  // synchronizer stage 2 (settled, safe to use)
+logic [PTR_WIDTH-1:0] rd_ptr_gray_ff1;   // sync stage 1
+logic [PTR_WIDTH-1:0] rd_ptr_gray_sync;  // sync stage 2
 
 // -----------------------------------------------------------
-// Write pointer: binary register + registered gray conversion.
-// Both update together from the same pre-increment value so they
-// never skew relative to each other.
+// Write pointer advances with the same pre-increment value used
+// to generate the gray-coded pointer.
 // -----------------------------------------------------------
 always_ff @(posedge wr_clk or negedge wr_rst_n) begin
     if (!wr_rst_n) begin
@@ -155,9 +92,7 @@ always_ff @(posedge wr_clk) begin
 end
 
 // -----------------------------------------------------------
-// 2-FF synchronizer: rd_ptr_gray (read domain) -> wr_clk domain.
-// Must be declared/driven before full/almost_full reference
-// rd_ptr_gray_sync below.
+// Synchronize the read pointer into the write domain.
 // -----------------------------------------------------------
 always_ff @(posedge wr_clk or negedge wr_rst_n) begin
     if (!wr_rst_n) begin
@@ -170,20 +105,8 @@ always_ff @(posedge wr_clk or negedge wr_rst_n) begin
 end
 
 // -----------------------------------------------------------
-// Third stage: the synchronised pointer converted to binary,
-// REGISTERED.
-//
-// gray2bin is a prefix-XOR chain -- bin[0] is the XOR of all
-// PTR_WIDTH gray bits, two LUT levels on its own. Leaving it in
-// the same cycle as the subtract and the threshold compare put
-// five logic levels behind the synchroniser, and the mirror of
-// this path on the read side was the WNS violation at -0.871 ns.
-//
-// Registering it costs one cycle of staleness on an ADVISORY
-// flag, and staleness is in the conservative direction: a stale
-// read pointer over-estimates occupancy, so almost_full asserts
-// slightly early. full is combinational and exact, and is what
-// actually prevents overflow.
+// Convert the synchronized read pointer back to binary.
+// This is registered to keep the flag path shorter and more stable.
 // -----------------------------------------------------------
 logic [PTR_WIDTH-1:0] rd_bin_sync;
 
@@ -193,17 +116,13 @@ always_ff @(posedge wr_clk or negedge wr_rst_n) begin
 end
 
 // -----------------------------------------------------------
-// full: combinational, gray pointer comparison (top two MSBs
-// inverted relative to the synchronized read pointer).
+// full: direct gray comparison against the synchronized read pointer.
 // -----------------------------------------------------------
 assign full = (wr_ptr_gray == {~rd_ptr_gray_sync[PTR_WIDTH-1:PTR_WIDTH-2],
                                  rd_ptr_gray_sync[PTR_WIDTH-3:0]});
 
 // -----------------------------------------------------------
-// almost_full: registered, to shorten the combinational path.
-// Safe to register because full (above) is combinational and
-// unconditionally prevents overflow on its own - almost_full
-// is advisory backpressure only.
+// almost_full is advisory backpressure; full is the real overflow guard.
 // -----------------------------------------------------------
 always_ff @(posedge wr_clk or negedge wr_rst_n) begin
     if (!wr_rst_n) begin
@@ -224,10 +143,6 @@ end
 // ===========================================================
 // READ DOMAIN (rd_clk, rd_rst_n)
 // ===========================================================
-// - rd_ptr_bin, rd_ptr_gray declared and driven here
-// - synchronized wr_ptr_gray (the *incoming* synchronizer) lives here
-// - empty, almost_empty computed here
-// - memory read happens here
 
 logic [PTR_WIDTH-1:0] rd_ptr_bin, rd_ptr_gray;
 
@@ -235,9 +150,8 @@ logic [PTR_WIDTH-1:0] wr_ptr_gray_ff1;   // synchronizer stage 1 (at risk of met
 logic [PTR_WIDTH-1:0] wr_ptr_gray_sync;  // synchronizer stage 2 (metastability-safe)
 
 // -----------------------------------------------------------
-// Read pointer: binary register + registered gray conversion.
-// Both update together from the same pre-increment value so they
-// never skew relative to each other.
+// Read pointer advances with the same pre-increment value used
+// to generate the gray-coded pointer.
 // -----------------------------------------------------------
 always_ff @(posedge rd_clk or negedge rd_rst_n) begin
     if (!rd_rst_n) begin
@@ -250,25 +164,16 @@ always_ff @(posedge rd_clk or negedge rd_rst_n) begin
 end
 
 // -----------------------------------------------------------
-// Memory read - no reset (BRAM-inferable pattern); only the
-// pointer/control logic needs to reset, not array contents.
-//
-// IMPORTANT: rd_ptr_bin is incremented in the same cycle as rd_en,
-// so we must capture rd_data using the CURRENT (pre-increment) address.
-// We register unconditionally (no rd_en gate) so that rd_data always
-// holds the stable head-of-queue entry whenever the FIFO is not empty -
-// matching the one-cycle read latency tx_sequencer expects:
-//   cycle 0 (POP_FIFO):  rd_en asserted, rd_ptr_bin still at current entry
-//   cycle 1 (WAIT_DATA): rd_data settled with fifo_mem[old_ptr]; tx_sequencer latches it
+// Read data is captured from the current head pointer before the
+// read pointer increments. This gives a one-cycle read latency
+// with the head value stable at the output.
 // -----------------------------------------------------------
 always_ff @(posedge rd_clk) begin
     rd_data <= fifo_mem[rd_ptr_bin[ADDR_WIDTH-1:0]];  // pre-increment address - always register head-of-queue
 end
 
 // -----------------------------------------------------------
-// 2-FF synchronizer: wr_ptr_gray (write domain) -> rd_clk domain
-// Must be declared/driven before empty/almost_empty reference
-// wr_ptr_gray_sync below.
+// Synchronize the write pointer into the read domain.
 // -----------------------------------------------------------
 always_ff @(posedge rd_clk or negedge rd_rst_n) begin
     if (!rd_rst_n) begin
@@ -281,14 +186,8 @@ always_ff @(posedge rd_clk or negedge rd_rst_n) begin
 end
 
 // -----------------------------------------------------------
-// Third stage: synchronised write pointer in binary, REGISTERED.
-// See the rd_bin_sync comment in the write domain -- this is the
-// side that was actually failing.
-//
-// A stale write pointer under-estimates occupancy, so
-// almost_empty asserts slightly early and rom_sequencer resumes
-// filling slightly early. empty is combinational and exact, and
-// is what actually prevents underflow.
+// Convert the synchronized write pointer back to binary.
+// This is used for occupancy checks in the read domain.
 // -----------------------------------------------------------
 logic [PTR_WIDTH-1:0] wr_bin_sync;
 
@@ -298,17 +197,12 @@ always_ff @(posedge rd_clk or negedge rd_rst_n) begin
 end
 
 // -----------------------------------------------------------
-// empty: combinational, gray pointer comparison - direct
-// equality (no bit inversion, unlike full). Pointers fully
-// equal means no wrap-lap difference exists, i.e. genuinely empty.
+// empty is a direct gray-pointer equality check.
 // -----------------------------------------------------------
 assign empty = (rd_ptr_gray == wr_ptr_gray_sync);
 
 // -----------------------------------------------------------
-// almost_empty: registered, to shorten the combinational path.
-// Safe to register because empty (above) is combinational and
-// unconditionally prevents underflow on its own - almost_empty
-// is advisory resume signal only.
+// almost_empty is advisory; empty is the real underflow guard.
 // -----------------------------------------------------------
 always_ff @(posedge rd_clk or negedge rd_rst_n) begin
     if (!rd_rst_n) begin

@@ -1,61 +1,14 @@
+// -----------------------------------------------------------------------------
 // rgf.sv
-// ------
-// Config RGF - Lab 9/10 register file. SIX registers; see rgf_pkg.sv for
-// the full map, addresses and access types.
 //
-// Robustness additions (invalid-address latching, reserved-bit write
-// masking) remain a deliberate follow-up and are not implemented here.
-// An unmapped read returns 0 and an unmapped write is silently dropped;
-// malformed addresses are already refused upstream by the register
-// parsers, so they do not reach this module.
+// Config register file. It exposes the image status and FIFO status registers,
+// accepts writes for IMG_CTRL and CLK_CTRL, updates IMG_TX_MON from the image
+// sequencer, and emits the IMG_CTRL.start pulse and clock-select level.
 //
-// -----------------------------------------------------------------------
-// HOW EACH REGISTER IS WRITTEN -- THREE MECHANISMS, NO ARBITRATION NEEDED
-// -----------------------------------------------------------------------
-// There is no single "write port". Registers are updated by three
-// separate, non-overlapping mechanisms, which is why no arbitration
-// exists anywhere in this file:
-//
-//   1. PC port (pc_wen / pc_addr / pc_wdata)
-//        writes IMG_CTRL and CLK_CTRL -- and nothing else.
-//        Only these two are PC-writable.
-//
-//   2. Status port (status_wen / status_addr / status_wdata)
-//        writes IMG_TX_MON -- and nothing else.
-//        An earlier version of this header also claimed FIFO_STATUS was
-//        written through this bus. It is not, and never was in this
-//        implementation: see mechanism 3.
-//
-//   3. Dedicated hardware inputs, bypassing both buses entirely
-//        IMG_STATUS       <- img_height_in / img_width_in / img_ready_in
-//        FIFO_STATUS      <- fifo_full / empty / almost_full / almost_empty
-//                            (combinational passthrough, no storage at all)
-//        PARITY_FAULT_CNT <- parity_fault_incr (single-bit increment pulse,
-//                            not a value write -- the status_* bus has
-//                            "write this whole value" semantics and cannot
-//                            express "add one")
-//
-// No register is targeted by more than one mechanism. The ONLY place two
-// mechanisms can touch the same register in the same cycle is IMG_TX_MON,
-// where a status write can coincide with a PC read-to-clear -- resolved by
-// explicit priority below.
-//
-// IMG_CTRL interlock (see rgf_pkg.sv header for the full reasoning):
-//   A '1' write to start_img_read is accepted only if, at the moment of
-//   the write, IMG_TX_MON.img_send_complete==0 AND
-//   IMG_TX_MON.img_send_error==0 ("both cleared", per the literal spec
-//   text). A '0' write always succeeds (clearing the bit).
-//
-// IMG_TX_MON read-to-clear:
-//   A PC READ of IMG_TX_MON (pc_addr selects it, pc_wen low) clears
-//   img_send_complete and img_send_error back to 0 on that same edge --
-//   this is what re-arms the interlock above for the next transfer.
-//   row_cnt/col_cnt are untouched by a read; they're live progress
-//   counters, not one-shot event flags.
-//   Priority: if a status-port write and a PC read land on IMG_TX_MON in
-//   the same cycle, the status write wins (a fresh hardware event should
-//   never be silently erased by a same-cycle read; the PC will see it on
-//   its next read instead).
+// The main control rule is the start interlock: a start write is only accepted
+// when both image-complete and image-error bits are clear. The complete/error
+// bits in IMG_TX_MON are read-to-clear on a PC read.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 

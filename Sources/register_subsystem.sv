@@ -1,15 +1,12 @@
 // -----------------------------------------------------------------------------
 // register_subsystem.sv
 //
-// 100 MHz register-file subsystem.
+// 100 MHz register-file bridge. It decodes the synchronized command stream,
+// drives the RGF, and captures the read data for the return path.
 //
-// Contains:
-//   - destination-side RGF command decode
-//   - rgf instance
-//   - IMG_TX_MON status-write decode
-//   - register-read capture
-//
-// CDC instances remain in chip_top.
+// IMG_TX_MON writes are generated from the synchronized image-complete pulse,
+// while read responses are sampled in the same cycle that the RGF sees a read
+// address.
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 

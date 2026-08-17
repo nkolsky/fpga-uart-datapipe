@@ -1,48 +1,14 @@
+// -----------------------------------------------------------------------------
 // mem_write_subsystem.sv
-// ======================
-// The memory-side write path: messages in, SRAM writes out.
 //
-//   msg -> mem_msg_writer -> pixel_word_packer -> rgb_sram x3
+// Write path from the message router to the SRAM banks. The writer decodes
+// incoming memory commands, packs pixels into 32-bit words, and issues masked
+// byte writes to the RGB SRAMs.
 //
-// -----------------------------------------------------------------------
-// WHAT EACH STAGE DOES
-// -----------------------------------------------------------------------
-//   mem_msg_writer     decodes msg_kind. A burst header opens a rectangle;
-//                      burst data feeds it; a single pixel write is a 1x1
-//                      rectangle. Reads and register writes never reach
-//                      here -- mem_msg_router sends them elsewhere.
-//
-//   pixel_word_packer  accumulates pixels into 32-bit words and issues one
-//                      write per word, with a BYTE ENABLE saying which
-//                      lanes it covers. Flushes when a word fills, at the
-//                      end of a rectangle row, and when the rectangle ends.
-//
-// -----------------------------------------------------------------------
-// BYTE ENABLES, NOT READ-MODIFY-WRITE
-// -----------------------------------------------------------------------
-// One 32-bit word holds FOUR pixels of one colour channel, so changing a
-// single pixel means changing one byte of a word. BRAM provides a per-byte
-// write enable in hardware, so that costs ONE WRITE AND NO READ: the lanes
-// whose enable is low are simply not driven and keep their contents.
-//
-// Read-modify-write would be the alternative and is the wrong answer here.
-// It needs a read, so the memory turn-around time gets in the way, it makes
-// the write path contend for the read port that the image and pixel readers
-// already share, and it opens a hazard where two updates to the same word
-// both read the same stale value.
-//
-// -----------------------------------------------------------------------
-// WHY GROUPING BURST PIXELS STILL MATTERS
-// -----------------------------------------------------------------------
-// A BRAM write activates a whole row -- word line drive, bit line
-// precharge, sense amplifiers -- regardless of how many byte lanes are
-// enabled. THE COST IS THE ACCESS, NOT THE MASK.
-//
-// A burst data message carries exactly four pixels, and four pixels are
-// exactly one word per channel. Grouped, a message is THREE writes with the
-// enable all ones. The previous design split each message into four
-// single-pixel commands and wrote one lane at a time: twelve accesses to
-// deliver data that arrived already assembled.
+// The important point is that this path writes only the enabled byte lanes. It
+// does not do a read-modify-write, so it does not contend for the read port or
+// disturb unrelated pixels in the same word.
+// -----------------------------------------------------------------------------
 
 `timescale 1ns/1ps
 

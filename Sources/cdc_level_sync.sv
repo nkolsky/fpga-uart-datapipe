@@ -1,44 +1,23 @@
 // cdc_level_sync.sv
 // -----------------
-// Two-flop level clock-domain crossing.
+// Two-flop synchronizer for a level signal.
 //
-// For LEVELS only -- signals that stay asserted long enough for the
-// destination to sample them. Do NOT use it for pulses: a one-cycle pulse
-// can be narrower than the destination clock period and be missed entirely.
-// cdc_pulse_sync exists for that case, and converts the pulse to a toggle
-// first.
+// Use this for signals that stay asserted long enough to be sampled in the
+// destination domain. Do not use it for one-cycle pulses; use cdc_pulse_sync
+// for those.
 //
 // -----------------------------------------------------------------------
-// WHY TWO FLOPS ARE SUFFICIENT HERE
+// CDC behavior
 // -----------------------------------------------------------------------
-// A single flop sampling an asynchronous input can go metastable. The
-// second flop gives it a full destination clock period to resolve, which is
-// what buys the mean-time-between-failures. Nothing more is needed for a
-// single-bit level, because there is no bus to skew: the destination either
-// sees the old value or the new one, never a mixture.
-//
-// The cost is LATENCY, not correctness. The destination observes a change
-// two to three destination clocks after it happens, and both edges are
-// delayed. A consumer must therefore tolerate seeing the level late -- which
-// is a design question at the point of use, not a property of this module.
+// The first flop may go metastable, but the second flop gives it one full
+// destination clock to resolve. The output is therefore a delayed but stable
+// version of the source level.
 //
 // -----------------------------------------------------------------------
-// ASYNC_REG
+// Timing note
 // -----------------------------------------------------------------------
-// Marks these as synchroniser flops so Vivado places them in the same slice
-// where possible, maximising the settling time between stages, and stops the
-// tool retiming or merging through the chain. Without it the flops can be
-// spread across the die and the MTBF collapses.
-//
-// -----------------------------------------------------------------------
-// TIMING CONSTRAINT
-// -----------------------------------------------------------------------
-// Where the two clocks are RELATED -- as CLK100MHZ and the 130 MHz PLL
-// output are, both from the same MMCM -- Vivado will try to time the
-// src_level -> sync_ff[0] path as an ordinary synchronous path, against a
-// launch/capture relationship of only 0.769 ns for a 13:10 ratio. That is
-// not achievable and the path must be constrained as a CDC path in the XDC.
-// The same note applies to cdc_pulse_sync and cdc_cmd_sync.
+// Even with clocks derived from the same MMCM, this path is still a CDC path
+// and the XDC should treat it as such.
 
 `timescale 1ns/1ps
 
