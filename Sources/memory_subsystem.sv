@@ -45,6 +45,7 @@ module memory_subsystem (
     output logic        rgf_cmd_is_write,
     output logic [7:0]  rgf_cmd_addr,
     output logic [31:0] rgf_cmd_wdata,
+    input  logic        apb_busy,
 
     // Status/diagnostics retained for top-level integration and LEDs.
     output logic        seq_done,
@@ -241,7 +242,8 @@ mem_msg_router u_msg_router (
     .rgf_cmd_valid    (rgf_cmd_valid),
     .rgf_cmd_is_write (rgf_cmd_is_write),
     .rgf_cmd_addr     (rgf_cmd_addr),
-    .rgf_cmd_wdata    (rgf_cmd_wdata)
+    .rgf_cmd_wdata    (rgf_cmd_wdata),
+    .apb_busy         (apb_busy)
 );
 
 mem_write_subsystem u_write_path (

@@ -14,11 +14,17 @@ module register_subsystem (
     input  logic        clk,
     input  logic        rst_n,
 
-    // Already synchronized command from chip_top's forward cdc_cmd_sync.
-    input  logic        cmd_valid,
-    input  logic        cmd_is_write,
-    input  logic [7:0]  cmd_addr,
-    input  logic [31:0] cmd_wdata,
+    // APB slave port. The master and the decoder live at chip_top with the
+    // rest of the interconnect; only the slave sits here, because it
+    // translates to rgf's private pc_* port.
+    input  logic                       psel,
+    input  logic                       penable,
+    input  logic                       pwrite,
+    input  logic [apb_pkg::ADDR_W-1:0] paddr,
+    input  logic [apb_pkg::DATA_W-1:0] pwdata,
+    output logic                       pready,
+    output logic [apb_pkg::DATA_W-1:0] prdata,
+    output logic                       pslverr,
 
     // Already synchronized 100 MHz status/event inputs.
     input  logic        tx_img_done,
@@ -30,9 +36,9 @@ module register_subsystem (
     input  logic        fifo_almost_full,
     input  logic        fifo_almost_empty,
 
-    // Source-side payload for chip_top's return cdc_cmd_sync.
-    output logic        rd_strobe,
-    output logic [31:0] rd_value,
+    // rd_strobe / rd_value are GONE. The read reply originates at apb_master
+    // now -- the only module that knows a transfer completed. This one only
+    // sees strobes. chip_top drives the return cdc_cmd_sync from the master.
 
     // Register-controlled outputs used elsewhere in chip_top.
     output logic        start_img_read,
@@ -43,6 +49,7 @@ import rgf_pkg::*;
 
 logic [7:0]  rgf_pc_addr;
 logic        rgf_pc_wen;
+logic        rgf_pc_ren;
 logic [31:0] rgf_pc_wdata;
 logic [31:0] rgf_pc_rdata;
 
@@ -50,30 +57,27 @@ logic        rgf_status_wen;
 logic [7:0]  rgf_status_addr;
 logic [31:0] rgf_status_wdata;
 
-assign rgf_pc_wen   = cmd_valid && cmd_is_write;
-assign rgf_pc_addr  = cmd_addr;
-assign rgf_pc_wdata = cmd_wdata;
-
-// Capture a read result in the same cycle that the RGF sees the read address.
-//
-// cmd_addr is parked at rgf_pkg::IDLE_ADDR outside cmd_valid. That parking
-// is MEM_MSG_ROUTER's job now -- it used to be done by the forward
-// cdc_cmd_sync, which drove dst_addr to its IDLE_ADDR parameter whenever
-// dst_valid was low, but that crossing was deleted when register commands
-// became messages. It matters because rgf's IMG_TX_MON read-to-clear is a
-// level-sensitive decode with no valid qualifier, so a held address clears
-// img_send_complete/img_send_error on every idle cycle.
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        rd_strobe <= 1'b0;
-        rd_value  <= 32'd0;
-    end
-    else begin
-        rd_strobe <= cmd_valid && !cmd_is_write;
-        if (cmd_valid && !cmd_is_write)
-            rd_value <= rgf_pc_rdata;
-    end
-end
+// APB slave front end. Owns the translation from the bus to rgf's mem-style
+// port, including the pc_ren strobe that retired the IDLE_ADDR parking.
+apb_slave_rgf #(
+    .WAIT_STATES (0)          // rgf's read mux is combinational
+) u_apb_slave (
+    .clk      (clk),
+    .rst_n    (rst_n),
+    .psel     (psel),
+    .penable  (penable),
+    .pwrite   (pwrite),
+    .paddr    (paddr),
+    .pwdata   (pwdata),
+    .pready   (pready),
+    .prdata   (prdata),
+    .pslverr  (pslverr),
+    .pc_addr  (rgf_pc_addr),
+    .pc_wen   (rgf_pc_wen),
+    .pc_ren   (rgf_pc_ren),
+    .pc_wdata (rgf_pc_wdata),
+    .pc_rdata (rgf_pc_rdata)
+);
 
 // Write IMG_TX_MON once when the synchronized image-complete pulse arrives.
 assign rgf_status_wen   = tx_img_done;
@@ -90,6 +94,7 @@ rgf u_rgf (
     .clk                (clk),
     .rst_n              (rst_n),
     .pc_wen             (rgf_pc_wen),
+    .pc_ren             (rgf_pc_ren),
     .pc_addr            (rgf_pc_addr),
     .pc_wdata           (rgf_pc_wdata),
     .pc_rdata           (rgf_pc_rdata),

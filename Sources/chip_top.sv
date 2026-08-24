@@ -29,8 +29,6 @@ logic pll_locked;
 logic clk_sel;              // driven by register_subsystem below
 logic heartbeat;
 
-// clk_130_out / rst_130_n are legacy signal names kept for compatibility;
-// the PLL output is the 256 MHz domain used by the UART and image logic.
 clocking_subsystem u_clocking_subsystem (
     .clk_100_in   (CLK100MHZ),
     .async_reset_n(CPU_RESETN),
@@ -82,7 +80,7 @@ logic        brd_msg_accept_130;
 // FIFO, status and register-reply interconnect
 // -----------------------------------------------------------------------------
 
-// Message crossing, 256 MHz side and 100 MHz side.
+// Message crossing, 130 MHz side and 100 MHz side.
 logic                            rx_msg_valid, rx_msg_ready;
 msg_format_pkg::msg_kind_t       rx_msg_kind;
 msg_format_pkg::msg_payload_t    rx_msg_payload;
@@ -122,7 +120,7 @@ logic        seq_done;          // rom_sequencer → chip_top: one-cycle done pu
 logic        rom_seq_busy;
 
 // -----------------------------------------------------------------------------
-// Image FIFO status CDC (256 MHz -> 100 MHz)
+// Image FIFO status CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 logic almost_empty_100;
 logic fifo_empty_100;
@@ -178,6 +176,7 @@ memory_subsystem u_memory_subsystem (
     .rgf_cmd_is_write      (mem_rgf_cmd_is_write),
     .rgf_cmd_addr          (mem_rgf_cmd_addr),
     .rgf_cmd_wdata         (mem_rgf_cmd_wdata),
+    .apb_busy              (apb_busy),
 
     .seq_done              (seq_done),
     .rom_seq_busy          (rom_seq_busy),
@@ -211,7 +210,7 @@ async_fifo u_img_fifo (
 );
 
 // -----------------------------------------------------------------------------
-// UART transmit subsystem (256 MHz)
+// UART transmit subsystem (130 MHz)
 // -----------------------------------------------------------------------------
 logic        mac_busy;
 logic        tx_img_done;
@@ -272,7 +271,7 @@ uart_tx_subsystem u_uart_tx_subsystem (
 );
 
 // -----------------------------------------------------------------------------
-// RX subsystem interconnect (256 MHz)
+// RX subsystem interconnect (130 MHz)
 // -----------------------------------------------------------------------------
 logic        rx_phy_busy;
 logic        rx_mac_busy;
@@ -286,7 +285,7 @@ logic        rx_classifier_error;
 logic        pix_wr_seen_sticky;
 
 // -----------------------------------------------------------------------------
-// RX subsystem (256 MHz)
+// RX subsystem (130 MHz)
 //
 // This block receives UART data, decodes frames, and emits one message at a
 // time for the memory side.
@@ -312,7 +311,7 @@ rx_subsystem u_rx_subsystem (
 );
 
 // -----------------------------------------------------------------------------
-// MESSAGE CROSSING, 256 MHz -> 100 MHz
+// MESSAGE CROSSING, 130 MHz -> 100 MHz
 //
 // RX messages are handed to the memory side with back-pressure. The source
 // stalls when the destination is busy, so the receiver does not silently drop
@@ -339,7 +338,7 @@ cdc_msg_sync #(
 );
 
 // -----------------------------------------------------------------------------
-// Burst-active CDC (256 MHz -> 100 MHz)
+// Burst-active CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 
 cdc_level_sync u_cdc_burst_active (
@@ -350,13 +349,13 @@ cdc_level_sync u_cdc_burst_active (
 );
 
 // -----------------------------------------------------------------------------
-// Pixel-read request CDC (256 MHz -> 100 MHz)
+// Pixel-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 // Single-pixel reads are carried as messages and ordered with the rest of the
 // request stream.
 
 // -----------------------------------------------------------------------------
-// Pixel-read reply CDC (100 MHz -> 256 MHz)
+// Pixel-read reply CDC (100 MHz -> 130 MHz)
 // -----------------------------------------------------------------------------
 cdc_cmd_sync #(
     .ADDR_W (1),
@@ -386,13 +385,13 @@ cdc_pulse_sync u_cdc_pix_rpy_accept (
 );
 
 // -----------------------------------------------------------------------------
-// Burst-read request CDC (256 MHz -> 100 MHz)
+// Burst-read request CDC (130 MHz -> 100 MHz)
 // -----------------------------------------------------------------------------
 // Burst requests are also sent as messages, then dispatched by the memory-side
 // router.
 
 // -----------------------------------------------------------------------------
-// Burst-read reply CDC (100 MHz -> 256 MHz)
+// Burst-read reply CDC (100 MHz -> 130 MHz)
 // -----------------------------------------------------------------------------
 cdc_cmd_sync #(
     .ADDR_W (1),
@@ -427,7 +426,7 @@ cdc_pulse_sync u_cdc_brd_accept (
 // Register reads/writes arrive as messages and are decoded on the memory side
 // before driving the register subsystem.
 
-// Event CDCs (256 MHz -> 100 MHz)
+// Event CDCs (130 MHz -> 100 MHz)
 logic rx_parity_err_100;
 
 cdc_pulse_sync u_cdc_tx_img_done (
@@ -451,6 +450,32 @@ cdc_pulse_sync u_cdc_parity_err (
 // -----------------------------------------------------------------------------
 // Register subsystem (100 MHz)
 // -----------------------------------------------------------------------------
+// APB fabric nets. The fabric is interconnect, so it lives here with the CDC
+// primitives rather than inside a subsystem.
+logic                           apb_busy;
+logic                           apb_rsp_valid;
+logic                           apb_rsp_is_read;
+logic [apb_pkg::DATA_W-1:0]     apb_rsp_rdata;
+logic                           apb_rsp_error;
+
+logic                           apb_active;
+logic                           apb_penable;
+logic                           apb_pwrite;
+logic [apb_pkg::ADDR_W-1:0]     apb_paddr;
+logic [apb_pkg::DATA_W-1:0]     apb_pwdata;
+logic [apb_pkg::STRB_W-1:0]     apb_pstrb;
+logic                           apb_pready;
+logic [apb_pkg::DATA_W-1:0]     apb_prdata;
+logic                           apb_pslverr;
+
+logic [apb_pkg::NUM_SLAVES-1:0] apb_psel;
+logic [apb_pkg::NUM_SLAVES-1:0] apb_s_pready;
+logic [apb_pkg::NUM_SLAVES-1:0] apb_s_pslverr;
+logic [apb_pkg::DATA_W-1:0]     apb_s_prdata [apb_pkg::NUM_SLAVES];
+logic                           apb_decode_err;
+logic                           apb_decode_err_sticky;
+
+// Driven from apb_master's response now, not from register_subsystem.
 logic        rgf_rd_strobe;
 logic [31:0] rgf_rd_value;
 logic        rgf_start_img_read;
@@ -461,13 +486,16 @@ register_subsystem u_register_subsystem (
     .clk               (CLK100MHZ),
     .rst_n             (sync_rst_n),
 
-    // Routed from the message stream by mem_msg_router, inside
-    // memory_subsystem. These used to come from a dedicated cdc_cmd_sync
-    // that no longer exists.
-    .cmd_valid         (mem_rgf_cmd_valid),
-    .cmd_is_write      (mem_rgf_cmd_is_write),
-    .cmd_addr          (mem_rgf_cmd_addr),
-    .cmd_wdata         (mem_rgf_cmd_wdata),
+    // APB slave port. The command group that used to arrive here is turned
+    // into a bus transfer by apb_master below.
+    .psel              (apb_psel[apb_pkg::SLAVE_RGF]),
+    .penable           (apb_penable),
+    .pwrite            (apb_pwrite),
+    .paddr             (apb_paddr),
+    .pwdata            (apb_pwdata),
+    .pready            (apb_s_pready[apb_pkg::SLAVE_RGF]),
+    .prdata            (apb_s_prdata[apb_pkg::SLAVE_RGF]),
+    .pslverr           (apb_s_pslverr[apb_pkg::SLAVE_RGF]),
 
     .tx_img_done       (tx_img_done_100),
     .tx_row            (tx_row),
@@ -478,13 +506,73 @@ register_subsystem u_register_subsystem (
     .fifo_almost_full  (almost_full),
     .fifo_almost_empty (almost_empty_100),
 
-    .rd_strobe         (rgf_rd_strobe),
-    .rd_value          (rgf_rd_value),
     .start_img_read    (rgf_start_img_read),
     .clk_sel           (clk_sel)
 );
 
-// Register-read reply CDC (100 MHz -> 256 MHz)
+// -----------------------------------------------------------------------------
+// APB fabric (100 MHz)
+// -----------------------------------------------------------------------------
+// Instantiated bare, alongside the CDC primitives above: chip_top is where this
+// design keeps its interconnect, and an APB fabric is interconnect. The slave
+// sits with rgf inside register_subsystem because it translates to rgf's
+// private pc_* port.
+//
+// Entirely within CLK100MHZ -- the bus introduces NO new clock crossing. The
+// register reply still leaves on the same cdc_cmd_sync it always did.
+apb_master u_apb_master (
+    .clk         (CLK100MHZ),
+    .rst_n       (sync_rst_n),
+
+    .req_valid   (mem_rgf_cmd_valid),
+    .req_write   (mem_rgf_cmd_is_write),
+    .req_addr    (apb_pkg::addr_from_msg(mem_rgf_cmd_addr)),
+    .req_wdata   (mem_rgf_cmd_wdata),
+    .busy        (apb_busy),
+
+    .rsp_valid   (apb_rsp_valid),
+    .rsp_is_read (apb_rsp_is_read),
+    .rsp_rdata   (apb_rsp_rdata),
+    .rsp_error   (apb_rsp_error),
+
+    .m_active    (apb_active),
+    .m_penable   (apb_penable),
+    .m_pwrite    (apb_pwrite),
+    .m_paddr     (apb_paddr),
+    .m_pwdata    (apb_pwdata),
+    .m_pstrb     (apb_pstrb),
+    .m_pready    (apb_pready),
+    .m_prdata    (apb_prdata),
+    .m_pslverr   (apb_pslverr)
+);
+
+apb_bar u_apb_bar (
+    .m_active   (apb_active),
+    .m_penable  (apb_penable),
+    .m_paddr    (apb_paddr),
+    .m_pready   (apb_pready),
+    .m_prdata   (apb_prdata),
+    .m_pslverr  (apb_pslverr),
+    .psel       (apb_psel),
+    .s_pready   (apb_s_pready),
+    .s_pslverr  (apb_s_pslverr),
+    .s_prdata   (apb_s_prdata),
+    .decode_err (apb_decode_err)
+);
+
+// Only a READ produces a reply on the wire. A write still completes and still
+// reports PSLVERR, but the host is not waiting for anything.
+assign rgf_rd_strobe = apb_rsp_valid && apb_rsp_is_read;
+assign rgf_rd_value  = apb_rsp_rdata;
+
+// An unmapped aperture would otherwise be invisible. Sticky, so one bad
+// address is still visible on the board afterwards.
+always_ff @(posedge CLK100MHZ or negedge sync_rst_n) begin
+    if (!sync_rst_n)                          apb_decode_err_sticky <= 1'b0;
+    else if (apb_decode_err || apb_rsp_error) apb_decode_err_sticky <= 1'b1;
+end
+
+// Register-read reply CDC (100 MHz -> 130 MHz)
 cdc_cmd_sync #(
     .ADDR_W (1),
     .DATA_W (32)
@@ -518,7 +606,7 @@ assign UART_CTS = (rom_seq_busy || tx_seq_busy || rx_mac_busy ||
 // LEDs
 // -----------------------------------------------------------------------------
 assign LED[14] = tx_done_sticky;
-assign LED[13] = sram_wr_rejected || burst_err_sticky;
+assign LED[13] = sram_wr_rejected || burst_err_sticky || apb_decode_err_sticky;
 assign LED[15] = img_fifo_ovf_sticky;
 assign LED[12] = heartbeat;
 assign LED[11] = clk_sel;
