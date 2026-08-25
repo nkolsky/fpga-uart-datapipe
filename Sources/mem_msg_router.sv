@@ -45,11 +45,14 @@ module mem_msg_router
     input  logic          brd_busy,
 
     // ---- to register_subsystem ----------------------------------------------
-    // Always accepted, so this never stalls the router.
+    // Issued to apb_master, which converts it into one APB transfer. No
+    // longer "always accepted": apb_busy gates dest_ready below.
     output logic          rgf_cmd_valid,
     output logic          rgf_cmd_is_write,
     output logic [7:0]    rgf_cmd_addr,
-    output logic [31:0]   rgf_cmd_wdata
+    output logic [31:0]   rgf_cmd_wdata,
+    // From apb_master. High from acceptance until the transfer completes.
+    input  logic          apb_busy
 );
 
     // -------------------------------------------------------------------
@@ -108,7 +111,15 @@ module mem_msg_router
             to_write : dest_ready = wr_msg_ready;
             to_pix   : dest_ready = !pix_busy;
             to_brd   : dest_ready = !brd_busy;
-            to_rgf   : dest_ready = 1'b1;     // no back-pressure
+            // The register file used to be the one destination assumed
+            // always ready. It sits behind APB now: a transfer occupies the
+            // bus for at least two cycles, so the master's busy has to be
+            // honoured or a second register message would be dropped.
+            //
+            // Free in rate terms -- 20 ns against a 22 us message -- but the
+            // stall makes the path correct by construction rather than
+            // correct by arithmetic.
+            to_rgf   : dest_ready = !apb_busy;
             default  : dest_ready = 1'b1;     // dropped
         endcase
     end : ready_mux
@@ -142,20 +153,26 @@ module mem_msg_router
             brd_req_width    <= '0;
             rgf_cmd_valid    <= 1'b0;
             rgf_cmd_is_write <= 1'b0;
-            // NOT '0 -- see the parking note below. 8'h00 is IMG_STATUS.
-            rgf_cmd_addr     <= rgf_pkg::IDLE_ADDR;
+            // Plain '0 is fine now. This used to be IDLE_ADDR because 8'h00
+            // is IMG_STATUS and a held address was a live decode; pc_ren
+            // qualifies the access in rgf, so the reset value is arbitrary.
+            rgf_cmd_addr     <= '0;
             rgf_cmd_wdata    <= '0;
         end else begin
             pix_req_valid <= 1'b0;
             brd_req_valid <= 1'b0;
             rgf_cmd_valid <= 1'b0;
 
-            // ADDRESS PARKING.
+            // ADDRESS PARKING IS GONE.
             //
-            // The register file decodes some addresses as level-sensitive status
-            // bits. The parked IDLE_ADDR prevents stale data from being decoded as
-            // a live register access when no command is active.
-            rgf_cmd_addr  <= rgf_pkg::IDLE_ADDR;
+            // rgf's IMG_TX_MON read-to-clear used to be a level decode with no
+            // access qualifier, so whoever drove pc_addr had to park it at an
+            // address that decoded to nothing. That obligation had already
+            // moved here from cdc_cmd_sync.
+            //
+            // rgf now takes a real one-cycle pc_ren from apb_slave_rgf, so the
+            // address may sit wherever it likes between transfers. The hazard
+            // is deleted rather than re-homed.
 
             if (fire) begin
                 if (to_pix) begin

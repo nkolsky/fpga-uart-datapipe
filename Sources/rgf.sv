@@ -33,6 +33,13 @@ module rgf (
     // PC-facing port - driven by Sequencer on behalf of parsed PC commands
     // -----------------------------------------------------------------
     input  logic                  pc_wen,
+    // One-cycle read strobe. Qualifies the IMG_TX_MON read-to-clear below,
+    // which used to key off !pc_wen alone -- a level with no access
+    // qualifier, so any idle cycle at IMG_TX_MON_ADDR cleared
+    // img_send_complete/img_send_error and silently disabled the IMG_CTRL
+    // start interlock. Parking pc_addr at IDLE_ADDR was the workaround; this
+    // port replaces it. See apb_slave_rgf.sv.
+    input  logic                  pc_ren,
     input  logic [rgf_pkg::ADDR_WIDTH-1:0] pc_addr,
     input  logic [DATA_WIDTH-1:0] pc_wdata,
     output logic [DATA_WIDTH-1:0] pc_rdata,
@@ -126,10 +133,13 @@ always_ff @(posedge clk or negedge rst_n) begin
         img_tx_mon_reg.col_cnt           <= status_wdata[IMG_TX_MON_col_STOP:IMG_TX_MON_col_START];
         img_tx_mon_reg.img_send_complete <= status_wdata[IMG_TX_MON_complete_START];
         img_tx_mon_reg.img_send_error    <= status_wdata[IMG_TX_MON_error_START];
-    end else if (!pc_wen && pc_sel_img_tx_mon) begin
+    end else if (pc_ren && pc_sel_img_tx_mon) begin
         // PC read: read-to-clear on complete/error only. row_cnt/col_cnt
         // hold their live value -- pc_rdata below still returns the
         // pre-clear value combinationally on this same cycle.
+        //
+        // pc_ren is a genuine one-cycle access strobe, so this no longer
+        // fires on idle cycles that merely happen to leave pc_addr here.
         img_tx_mon_reg.img_send_complete <= 1'b0;
         img_tx_mon_reg.img_send_error    <= 1'b0;
     end
