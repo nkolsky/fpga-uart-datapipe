@@ -8,6 +8,11 @@
 set_property -dict { PACKAGE_PIN E3    IOSTANDARD LVCMOS33 } [get_ports { CLK100MHZ }]; #IO_L12P_T1_MRCC_35 Sch=clk100mhz
 create_clock -name sys_clk_pin -period 10.000 -waveform {0.000 5.000} [get_ports CLK100MHZ];
 
+## ONE primary clock, on the PORT, and only here. The Clocking Wizard defines
+## a second 10 ns clock on its internal clk_in1 pin when CLK_IN1 or
+## EXT_RESET_IN are associated with board interfaces; both are set to Custom
+## to avoid that (it caused TIMING-4 and TIMING-27).
+##
 ## PLL clock: the Clocking Wizard IP supplies its own generated-clock and
 ## jitter constraints. The three template lines that were here referenced
 ## clk_in1 / *adv* -- an internal IP input and cell, not top-level objects --
@@ -15,33 +20,27 @@ create_clock -name sys_clk_pin -period 10.000 -waveform {0.000 5.000} [get_ports
 
 ## ---------------------------------------------------------------------------
 ## Clock domain crossings (Lab 10)
-## The 100 MHz board clock (sys_clk_pin) and the 130 MHz PLL output are
+## The 100 MHz board clock (sys_clk_pin) and the 256 MHz PLL output are
 ## asynchronous for timing purposes. The only paths between them are (a) the
 ## async FIFO CDC, protected by gray-code pointers + 2-FF synchronizers, and
 ## (b) the heartbeat counter on the glitchless mux output, whose sole load is
 ## an LED pin. Both are false/safe, so waive them.
 ##
-## The PLL clock is resolved off the clk_wiz WRAPPER OUTPUT pin
-## (u_clocking_subsystem/u_clk_wiz_0/clk_out1), NOT the internal MMCM pin. The wrapper output name
-## is stable across Clocking Wizard netlists, whereas the internal
-## mmcm_adv_inst/CLKOUT0 pin name varies and did not match here (it produced
-## an empty second group -> "No valid object(s) found for -group"). The
-## instance is u_clk_wiz_0 in this design (note the _0 suffix).
+## Resolved off the clk_wiz WRAPPER OUTPUT pin. Two alternatives do not work:
+## get_clocks clk_out1_clk_wiz_0 finds nothing (the clock is derived later,
+## from the IP's own XDC, so it does not exist when this file is parsed), and
+## the internal mmcm_adv_inst/CLKOUT0 pin name varies between netlists. Note
+## the _0 suffix on the instance.
 ##
-## All lookups are -quiet so an empty result degrades to a harmless no-op
-## rather than a 12-4739 critical warning (an .xdc file cannot use a Tcl 'if'
-## to guard it -- Designutils 20-1307).
+## No -quiet: a failed lookup would empty the group SILENTLY and put every
+## crossing back to being timed. Better to see 12-4739.
 ##
-## VERIFY IT APPLIED after synthesis: in the timing/clock-interaction report,
-## sys_clk_pin and the PLL clock should show as an asynchronous group (or the
-## old sys_clk_pin -> clk_out1_clk_wiz_0 inter-clock paths should be gone).
-## Because the lookups are -quiet, a wrong pin match applies nothing silently,
-## so this check matters.
+##   sys_clk_pin          10.000 ns  100 MHz  memory / register domain
+##   clk_out1_clk_wiz_0    3.906 ns  256 MHz  UART domain, auto-derived by the IP
 ## ---------------------------------------------------------------------------
 set_clock_groups -asynchronous \
-  -group [get_clocks -quiet sys_clk_pin] \
-  -group [get_clocks -quiet -of_objects [get_pins -quiet u_clocking_subsystem/u_clk_wiz_0/clk_out1]]
-
+  -group [get_clocks sys_clk_pin] \
+  -group [get_clocks -of_objects [get_pins u_clocking_subsystem/u_clk_wiz_0/clk_out1]]
 ##Switches
 #set_property -dict { PACKAGE_PIN J15   IOSTANDARD LVCMOS33 } [get_ports { SW[0] }]; #IO_L24N_T3_RS0_15 Sch=sw[0]
 #set_property -dict { PACKAGE_PIN L16   IOSTANDARD LVCMOS33 } [get_ports { SW[1] }]; #IO_L3N_T0_DQS_EMCCLK_14 Sch=sw[1]
@@ -245,3 +244,15 @@ set_property -dict { PACKAGE_PIN E5    IOSTANDARD LVCMOS33 } [get_ports { UART_R
 #set_property -dict { PACKAGE_PIN L14   IOSTANDARD LVCMOS33 } [get_ports { QSPI_DQ[2] }]; #IO_L2P_T0_D02_14 Sch=qspi_dq[2]
 #set_property -dict { PACKAGE_PIN M14   IOSTANDARD LVCMOS33 } [get_ports { QSPI_DQ[3] }]; #IO_L2N_T0_D03_14 Sch=qspi_dq[3]
 #set_property -dict { PACKAGE_PIN L13   IOSTANDARD LVCMOS33 } [get_ports { QSPI_CSN }]; #IO_L6P_T0_FCS_B_14 Sch=qspi_csn
+
+## ---------------------------------------------------------------------------
+## I/O timing -- deliberately unconstrained
+## ---------------------------------------------------------------------------
+## Nothing here has a source clock to constrain against: the UART lines are
+## asynchronous serial (rx_phy oversamples at 16x and recovers bit centres
+## itself), CTS/RTS are sampled by the host at its own rate, LEDs have no
+## timing requirement, and CPU_RESETN is a push-button synchronised on-chip.
+## Stating it turns TIMING-18 from an omission into a decision. Analysis only
+## -- no effect on the implemented hardware.
+set_false_path -from [get_ports {UART_TXD_IN CPU_RESETN UART_RTS}]
+set_false_path -to   [get_ports {UART_RXD_OUT UART_CTS LED[*]}]
