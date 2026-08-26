@@ -4,7 +4,10 @@ module reset_synch (
     output logic sync_rst_n
 );
 
-logic rst_n_ff1, rst_n_ff2;
+// ASYNC_REG: reset DE-assertion is the asynchronous edge here, and it is
+// exactly the case this chain exists to make safe. Keeping the two flops
+// adjacent is what makes the second stage's output trustworthy.
+(* ASYNC_REG = "TRUE" *) logic rst_n_ff1, rst_n_ff2;
 
 // Synchronize the asynchronous reset signal to the clock domain
 always_ff @(posedge clk or negedge async_rst_n) begin
