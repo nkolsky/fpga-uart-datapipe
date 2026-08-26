@@ -54,7 +54,9 @@ module cdc_msg_sync #(
     // -------------------------------------------------------------------
     logic             req_tgl;
     logic [WIDTH-1:0] data_reg;
-    logic [SYNC_STAGES-1:0] ack_sync;
+    // ASYNC_REG: same reasoning as cdc_pulse_sync. Keeps the chain packed so
+    // the first stage gets a full cycle to settle.
+    (* ASYNC_REG = "TRUE" *) logic [SYNC_STAGES-1:0] ack_sync;
 
     logic src_accept;
     assign src_ready  = (req_tgl == ack_sync[SYNC_STAGES-1]);
@@ -76,7 +78,7 @@ module cdc_msg_sync #(
     // -------------------------------------------------------------------
     // Destination domain
     // -------------------------------------------------------------------
-    logic [SYNC_STAGES-1:0] req_sync;
+    (* ASYNC_REG = "TRUE" *) logic [SYNC_STAGES-1:0] req_sync;
     logic                   req_seen;      // last toggle value acted on
     logic                   ack_tgl;
 

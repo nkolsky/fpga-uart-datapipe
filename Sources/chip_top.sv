@@ -124,6 +124,9 @@ logic        rom_seq_busy;
 // -----------------------------------------------------------------------------
 logic almost_empty_100;
 logic fifo_empty_100;
+// Registered copy of fifo_empty, from the FIFO's read domain. Only the
+// crossing uses it -- see the note on async_fifo's empty_cdc port.
+logic fifo_empty_cdc;
 
 cdc_level_sync u_cdc_almost_empty (
     .src_level (almost_empty),      // pll_clk_out domain
@@ -133,7 +136,7 @@ cdc_level_sync u_cdc_almost_empty (
 );
 
 cdc_level_sync u_cdc_fifo_empty (
-    .src_level (fifo_empty),        // pll_clk_out domain
+    .src_level (fifo_empty_cdc),    // pll_clk_out domain, REGISTERED
     .dst_clk   (CLK100MHZ),
     .dst_rst_n (sync_rst_n),
     .dst_level (fifo_empty_100)
@@ -206,7 +209,8 @@ async_fifo u_img_fifo (
     .rd_en       (fifo_rd_en),
     .rd_data     (fifo_rd_data),
     .empty       (fifo_empty),
-    .almost_empty(almost_empty)
+    .almost_empty(almost_empty),
+    .empty_cdc   (fifo_empty_cdc)
 );
 
 // -----------------------------------------------------------------------------
@@ -232,7 +236,10 @@ logic        rr_reply_overrun;
 //
 // Reset value is 1 = deasserted = hold off, so the transmitter never starts
 // before the real level has been observed.
-logic cts_meta, cts_sync;
+// ASYNC_REG marks these as synchroniser stages: keeps them in adjacent slices
+// so the first has the full clock period to settle, and stops synthesis
+// retiming or merging them. The chain itself is unchanged.
+(* ASYNC_REG = "TRUE" *) logic cts_meta, cts_sync;
 always_ff @(posedge pll_clk_out or negedge sync_pll_rst_n) begin
     if (!sync_pll_rst_n) {cts_sync, cts_meta} <= 2'b11;
     else                 {cts_sync, cts_meta} <= {cts_meta, UART_RTS};

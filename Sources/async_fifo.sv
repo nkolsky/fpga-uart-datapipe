@@ -45,7 +45,24 @@ module async_fifo #(
 
     output logic [DW-1:0]         rd_data,      // payload output
     output logic                  empty,        // hard empty flag - never read when high
-    output logic                  almost_empty  // soft flag - rom_sequencer resume signal
+    output logic                  almost_empty, // soft flag - rom_sequencer resume signal
+
+    // Registered copy of empty, for CROSSING TO ANOTHER CLOCK DOMAIN ONLY.
+    //
+    // empty above is a combinational gray-pointer comparison. Feeding a
+    // comparator straight into a synchroniser is unsafe: the comparator can
+    // glitch while its inputs settle, and a two-flop synchroniser resolves
+    // metastability but propagates whatever value it captured -- glitch
+    // included. Vivado reports that as CDC-10, "combinational logic detected
+    // before a synchronizer".
+    //
+    // This output is one read-clock behind empty. DO NOT use it as the
+    // underflow guard; uart_tx_subsystem must keep using empty, which is
+    // correct in the read domain on the cycle it matters.
+    //
+    // almost_empty below was already registered, which is why CDC-10 fired on
+    // empty alone.
+    output logic                  empty_cdc
 );
 
 // ===========================================================
@@ -64,8 +81,12 @@ logic [DW-1:0] fifo_mem [DEPTH-1:0];
 // -----------------------------------------------------------
 logic [PTR_WIDTH-1:0] wr_ptr_bin, wr_ptr_gray;
 
-logic [PTR_WIDTH-1:0] rd_ptr_gray_ff1;   // sync stage 1
-logic [PTR_WIDTH-1:0] rd_ptr_gray_sync;  // sync stage 2
+// ASYNC_REG keeps the two stages in adjacent slices and stops the placer
+// separating them. Without it, settling time for a metastable first stage is
+// whatever routing happens to give, so MTBF becomes a placement lottery --
+// works today, may not after an unrelated change moves things.
+(* ASYNC_REG = "TRUE" *) logic [PTR_WIDTH-1:0] rd_ptr_gray_ff1;   // sync stage 1
+(* ASYNC_REG = "TRUE" *) logic [PTR_WIDTH-1:0] rd_ptr_gray_sync;  // sync stage 2
 
 // -----------------------------------------------------------
 // Write pointer advances with the same pre-increment value used
@@ -146,8 +167,8 @@ end
 
 logic [PTR_WIDTH-1:0] rd_ptr_bin, rd_ptr_gray;
 
-logic [PTR_WIDTH-1:0] wr_ptr_gray_ff1;   // synchronizer stage 1 (at risk of metastability)
-logic [PTR_WIDTH-1:0] wr_ptr_gray_sync;  // synchronizer stage 2 (metastability-safe)
+(* ASYNC_REG = "TRUE" *) logic [PTR_WIDTH-1:0] wr_ptr_gray_ff1;   // stage 1 (may go metastable)
+(* ASYNC_REG = "TRUE" *) logic [PTR_WIDTH-1:0] wr_ptr_gray_sync;  // stage 2 (settled)
 
 // -----------------------------------------------------------
 // Read pointer advances with the same pre-increment value used
@@ -200,6 +221,14 @@ end
 // empty is a direct gray-pointer equality check.
 // -----------------------------------------------------------
 assign empty = (rd_ptr_gray == wr_ptr_gray_sync);
+
+// Registered copy for the clock crossing. One flop in the read domain, so the
+// synchroniser downstream sees a flop output rather than combinational logic.
+// Functional use of empty is untouched.
+always_ff @(posedge rd_clk or negedge rd_rst_n) begin
+    if (!rd_rst_n) empty_cdc <= 1'b1;      // empty at reset, same sense as empty
+    else           empty_cdc <= empty;
+end
 
 // -----------------------------------------------------------
 // almost_empty is advisory; empty is the real underflow guard.
