@@ -109,13 +109,24 @@ logic [31:0]           rx_rd_reply_data;
 // Image FIFO interconnect
 // -----------------------------------------------------------------------------
 logic        fifo_wr_en;        // rom_sequencer -> image FIFO write enable
-logic [23:0] fifo_wr_data;      // rom_sequencer -> image FIFO pixel data
+// One 32-bit SRAM word per channel. Three FIFOs now, one per colour.
+logic [31:0] fifo_wr_data_r;
+logic [31:0] fifo_wr_data_g;
+logic [31:0] fifo_wr_data_b;
 logic        almost_full;       // image FIFO -> rom_sequencer backpressure
 logic        almost_empty;      // image FIFO -> rom_sequencer resume signal
 logic        fifo_rd_en;        // tx_sequencer -> image FIFO read enable
-logic [23:0] fifo_rd_data;      // image FIFO -> tx_sequencer pixel data (24-bit RGB)
+logic [31:0] fifo_rd_data_r;
+logic [31:0] fifo_rd_data_g;
+logic [31:0] fifo_rd_data_b;
 logic        fifo_empty;        // image FIFO -> tx_sequencer empty flag
 logic        fifo_full;         // image FIFO full flag (monitored, not used for control)
+// G and B mirror R exactly at this step -- see the lockstep assertions.
+logic        fifo_full_g,      fifo_full_b;
+logic        fifo_empty_g,     fifo_empty_b;
+logic        almost_full_g,    almost_full_b;
+logic        almost_empty_g,   almost_empty_b;
+logic        fifo_empty_cdc_g, fifo_empty_cdc_b;
 logic        seq_done;          // rom_sequencer → chip_top: one-cycle done pulse
 logic        rom_seq_busy;
 
@@ -160,7 +171,9 @@ memory_subsystem u_memory_subsystem (
     .img_fifo_almost_empty (almost_empty_100),
     .img_fifo_full         (fifo_full),
     .img_fifo_wr_en        (fifo_wr_en),
-    .img_fifo_wr_data      (fifo_wr_data),
+    .img_fifo_wr_data_r    (fifo_wr_data_r),
+    .img_fifo_wr_data_g    (fifo_wr_data_g),
+    .img_fifo_wr_data_b    (fifo_wr_data_b),
 
     .msg_valid             (mem_msg_valid),
     .msg_ready             (mem_msg_ready),
@@ -195,23 +208,80 @@ memory_subsystem u_memory_subsystem (
 // -----------------------------------------------------------------------------
 // Asynchronous FIFO
 // -----------------------------------------------------------------------------
-async_fifo u_img_fifo (
-    // Write domain (rom_sequencer side)
+// THREE FIFOS, ONE PER COLOUR CHANNEL.
+//
+// This was a single 24-bit FIFO carrying packed pixels. It is three 32-bit
+// FIFOs carrying whole SRAM words because, at step 6b, a per-channel INCR4
+// burst delivers four words of R, then four of G, then four of B -- so the
+// channels arrive at different times and each needs its own buffer.
+//
+// At THIS step the SRAM reads are still parallel, so all three are written
+// and popped in the same cycle and hold identical occupancy. Only R's flags
+// drive control; the assertions below check the other two agree, which is
+// precisely what stops being true once bursts arrive per channel.
+//
+// Same total storage as the single FIFO: 3 x 16 x 32 = 1536 bits, 64 pixels.
+async_fifo u_fifo_r (
     .wr_clk      (CLK100MHZ),
     .wr_rst_n    (sync_rst_n),
     .wr_en       (fifo_wr_en),
-    .wr_data     (fifo_wr_data),
+    .wr_data     (fifo_wr_data_r),
     .full        (fifo_full),
     .almost_full (almost_full),
-    // Read domain (tx_sequencer side)
     .rd_clk      (pll_clk_out),
     .rd_rst_n    (sync_pll_rst_n),
     .rd_en       (fifo_rd_en),
-    .rd_data     (fifo_rd_data),
+    .rd_data     (fifo_rd_data_r),
     .empty       (fifo_empty),
     .almost_empty(almost_empty),
     .empty_cdc   (fifo_empty_cdc)
 );
+
+async_fifo u_fifo_g (
+    .wr_clk      (CLK100MHZ),
+    .wr_rst_n    (sync_rst_n),
+    .wr_en       (fifo_wr_en),
+    .wr_data     (fifo_wr_data_g),
+    .full        (fifo_full_g),
+    .almost_full (almost_full_g),
+    .rd_clk      (pll_clk_out),
+    .rd_rst_n    (sync_pll_rst_n),
+    .rd_en       (fifo_rd_en),
+    .rd_data     (fifo_rd_data_g),
+    .empty       (fifo_empty_g),
+    .almost_empty(almost_empty_g),
+    .empty_cdc   (fifo_empty_cdc_g)
+);
+
+async_fifo u_fifo_b (
+    .wr_clk      (CLK100MHZ),
+    .wr_rst_n    (sync_rst_n),
+    .wr_en       (fifo_wr_en),
+    .wr_data     (fifo_wr_data_b),
+    .full        (fifo_full_b),
+    .almost_full (almost_full_b),
+    .rd_clk      (pll_clk_out),
+    .rd_rst_n    (sync_pll_rst_n),
+    .rd_en       (fifo_rd_en),
+    .rd_data     (fifo_rd_data_b),
+    .empty       (fifo_empty_b),
+    .almost_empty(almost_empty_b),
+    .empty_cdc   (fifo_empty_cdc_b)
+);
+
+`ifndef SYNTHESIS
+// Lockstep. Written and popped together at this step, so a divergence means
+// a channel's write enable or pop has come loose.
+a_fifo_lockstep_empty: assert property (
+    @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
+    (fifo_empty == fifo_empty_g) && (fifo_empty_g == fifo_empty_b)
+) else $error("chip_top: channel FIFOs diverged -- empty flags disagree");
+
+a_fifo_lockstep_full: assert property (
+    @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+    (fifo_full == fifo_full_g) && (fifo_full_g == fifo_full_b)
+) else $error("chip_top: channel FIFOs diverged -- full flags disagree");
+`endif
 
 // -----------------------------------------------------------------------------
 // UART transmit subsystem (130 MHz)
@@ -250,7 +320,9 @@ uart_tx_subsystem u_uart_tx_subsystem (
     .rst_n              (sync_pll_rst_n),
 
     .fifo_empty         (fifo_empty),
-    .fifo_rd_data       (fifo_rd_data),
+    .fifo_rd_data_r     (fifo_rd_data_r),
+    .fifo_rd_data_g     (fifo_rd_data_g),
+    .fifo_rd_data_b     (fifo_rd_data_b),
     .fifo_rd_en         (fifo_rd_en),
     .cts                (cts_sync),
 

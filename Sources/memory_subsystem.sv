@@ -21,7 +21,12 @@ module memory_subsystem (
     input  logic        img_fifo_almost_empty,
     input  logic        img_fifo_full,
     output logic        img_fifo_wr_en,
-    output logic [23:0] img_fifo_wr_data,
+    // One 32-bit SRAM word per channel, written to three FIFOs in the same
+    // cycle. This was a single 24-bit packed pixel; the unpacking moved to
+    // tx_sequencer, where pixels are consumed one per message.
+    output logic [31:0] img_fifo_wr_data_r,
+    output logic [31:0] img_fifo_wr_data_g,
+    output logic [31:0] img_fifo_wr_data_b,
 
     // Message input. Messages arrive here in order and are dispatched by the
     // router. Back-pressure is carried back to the source.
@@ -195,7 +200,9 @@ rom_sequencer #(
     .rom_addr     (rom_addr),
     .rom_rd_en    (rom_rd_en),
     .wr_en        (img_fifo_wr_en),
-    .wr_data      (img_fifo_wr_data),
+    .wr_data_r    (img_fifo_wr_data_r),
+    .wr_data_g    (img_fifo_wr_data_g),
+    .wr_data_b    (img_fifo_wr_data_b),
     .seq_done     (seq_done),
     .busy         (rom_seq_busy)
 );

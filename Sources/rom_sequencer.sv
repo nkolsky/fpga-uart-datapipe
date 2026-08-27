@@ -43,8 +43,21 @@ module rom_sequencer #(
     output logic rom_rd_en, // Signal to enable reading from ROM
 
     //ouput values and signals to FIFO
-    output logic wr_en, // Write enable signal for FIFO
-    output logic [23:0] wr_data,
+    // ONE ENTRY PER CHANNEL FIFO, written together.
+    //
+    // This used to emit one 24-bit packed pixel at a time, four per word
+    // read. The three channel FIFOs each take a whole 32-bit SRAM word
+    // instead, so a read produces exactly one entry in each and the
+    // pixel-by-pixel unpacking moves to tx_sequencer -- which is where the
+    // pixels are actually consumed, one per message.
+    //
+    // wr_en is shared: the three channels are written in the same cycle, so
+    // they hold identical occupancy. That changes at step 6b, when
+    // per-channel INCR4 bursts start filling them at different times.
+    output logic wr_en,
+    output logic [ROM_DATA_WIDTH-1:0] wr_data_r,
+    output logic [ROM_DATA_WIDTH-1:0] wr_data_g,
+    output logic [ROM_DATA_WIDTH-1:0] wr_data_b,
 
     //output signal to RGF to let know if the reading from ROM is done
     output logic seq_done,
@@ -60,11 +73,8 @@ state_t current_state, next_state;
 //internal address counter to keep track of which ROM address to read from
 logic [ADDR_WIDTH-1:0] addr_counter; // Counter to keep track of which ROM address is being accessed (0 to 16,383 for 16,384 words in ROM)
 
-//internal push counter to keep track of which pixel within the ROM word is being processed
-logic [$clog2(PIXELS_PER_WORD)-1:0] push_ctr; 
-
-//internal register to hold the latched pixel data from ROM
-logic [23:0] pixels [PIXELS_PER_WORD-1:0]; // Array to hold the 4 pixels (24 bits each) latched from ROM
+//internal registers holding the three channel words latched from memory
+logic [ROM_DATA_WIDTH-1:0] word_r, word_g, word_b;
 
 //internal counter to track ROM latency cycles
 logic [$clog2(ROM_LATENCY+1):0] latency_counter; 
@@ -75,9 +85,10 @@ always_ff @(posedge clk or negedge rst_n) begin
 
         current_state <= IDLE;
         addr_counter <= '0;
-        push_ctr <= '0;
         latency_counter <= '0;
-        pixels <= '{default: '0}; // Clear pixel registers on reset
+        word_r <= '0;
+        word_g <= '0;
+        word_b <= '0;
 
     end else begin
 
@@ -93,37 +104,27 @@ always_ff @(posedge clk or negedge rst_n) begin
             end
         end
         LATCH: begin
-            // Latch the pixel data from memory into internal registers.
+            // Latch the three channel words whole. No unpacking here any
+            // more -- each goes into its channel's FIFO as one entry.
             //
-            // BYTE-LANE ORIENTATION -- the MSB lane is the LEFTMOST pixel.
-            // Each 32-bit channel word packs four CONSECUTIVE pixels of one
-            // colour channel, lowest pixel index in the most significant
-            // byte (see memory_pkg.sv). pixels[] is pushed to the FIFO in
-            // index order 0,1,2,3, so pixels[0] must be the leftmost pixel
-            // of the word, which is bits [31:24].
-            //
-            // These comments previously read "Pixel 3" against [31:24] and
-            // "Pixel 0" against [7:0] -- i.e. exactly backwards. The RTL was
-            // always right; only the labels were wrong, which is why the
-            // captured image never looked scrambled. Corrected here because
-            // sram_wr_ctrl.sv derives its byte enable from this same
-            // orientation, and a reader who trusted the old labels would
-            // build the write path mirrored within every word.
+            // BYTE-LANE ORIENTATION is unchanged and still matters: within a
+            // word the MSB lane is the LEFTMOST pixel, so [31:24] is pixel 0
+            // (see memory_pkg.sv). tx_sequencer now relies on that when it
+            // selects a lane, and pixel_word_packer derives its byte enables
+            // from the same convention on the write side.
             //
             // Confirmed by measurement: red word 4392 = 0x3D0000FF, and the
             // captured PNG at row 68, cols 160..163 reads 61, 0, 0, 255 --
             // [31:24] first.
-            pixels[0] <= {red_data[31:24], green_data[31:24], blue_data[31:24]}; // pixel 0 of word - LEFTMOST
-            pixels[1] <= {red_data[23:16], green_data[23:16], blue_data[23:16]}; // pixel 1 of word
-            pixels[2] <= {red_data[15:8], green_data[15:8], blue_data[15:8]}; // pixel 2 of word
-            pixels[3] <= {red_data[7:0], green_data[7:0], blue_data[7:0]}; // pixel 3 of word - RIGHTMOST
-
+            word_r <= red_data;
+            word_g <= green_data;
+            word_b <= blue_data;
         end
+        // PUSH is ONE cycle now: one entry into each of the three FIFOs.
+        // It used to loop four times, once per pixel in the word.
         PUSH: begin
-            push_ctr <= push_ctr + 1; // Increment push counter to move to the next pixel in the current ROM word
         end
         NEXT_ADDR: begin
-            push_ctr <= 0; // Reset push counter to start pushing from the first pixel
             addr_counter <= addr_counter + 1; // Increment address counter to move to the next ROM word
         end
         default: ; // For other states, no sequential updates needed
@@ -160,11 +161,9 @@ always_comb begin : next_state_logic
             next_state = PUSH; // After latching pixel data, move to push state to write pixels to FIFO
         end
         PUSH: begin
-            if(push_ctr == ($bits(push_ctr))'(PIXELS_PER_WORD - 1)) begin
-                next_state = NEXT_ADDR; // After pushing all pixels from the current ROM word, move to next address state
-            end else begin
-                next_state = PUSH; // Keep pushing pixels until all pixels from the current ROM word have been processed
-            end
+            // One cycle now: one entry into each channel FIFO. This used to
+            // loop four times, once per pixel in the word.
+            next_state = NEXT_ADDR;
         end
         NEXT_ADDR: begin 
             /* verilator lint_off WIDTHEXPAND */
@@ -200,7 +199,9 @@ always_ff @(posedge clk or negedge rst_n) begin : output_logic
         rom_rd_en <= 1'b0;
         rom_addr  <= '0;
         wr_en     <= 1'b0;
-        wr_data   <= '0;
+        wr_data_r <= '0;
+        wr_data_g <= '0;
+        wr_data_b <= '0;
         seq_done  <= 1'b0;
     end else begin
         
@@ -208,7 +209,9 @@ always_ff @(posedge clk or negedge rst_n) begin : output_logic
         rom_rd_en <= 1'b0;
         rom_addr  <= '0;
         wr_en     <= 1'b0;
-        wr_data   <= '0;
+        wr_data_r <= '0;
+        wr_data_g <= '0;
+        wr_data_b <= '0;
         seq_done  <= 1'b0;
 
         case(current_state)
@@ -217,8 +220,11 @@ always_ff @(posedge clk or negedge rst_n) begin : output_logic
                 rom_addr <= addr_counter; // Set ROM address to current value of address counter
             end
             PUSH: begin
-                wr_en <= 1; // Enable writing to FIFO
-                wr_data <= pixels[push_ctr]; // Write the current pixel data to FIFO
+                // All three channels written in the same cycle.
+                wr_en     <= 1;
+                wr_data_r <= word_r;
+                wr_data_g <= word_g;
+                wr_data_b <= word_b;
             end
             SEQ_DONE: begin
                 seq_done <= 1; // Signal that the sequence is done
