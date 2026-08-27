@@ -17,16 +17,19 @@ module memory_subsystem (
     input  logic        burst_active,
 
     // Image FIFO write side. The FIFO itself remains in chip_top.
-    input  logic        img_fifo_almost_full,
+    // PER CHANNEL now. A burst fills one channel at a time, so a channel
+    // whose FIFO is backing up drops out of the arbitration while the others
+    // carry on -- it no longer halts the whole drain.
+    input  logic [2:0]  img_fifo_almost_full,
     input  logic        img_fifo_almost_empty,
-    input  logic        img_fifo_full,
-    output logic        img_fifo_wr_en,
+    input  logic [2:0]  img_fifo_full,
+    output logic [2:0]  img_fifo_wr_en,
     // One 32-bit SRAM word per channel, written to three FIFOs in the same
     // cycle. This was a single 24-bit packed pixel; the unpacking moved to
     // tx_sequencer, where pixels are consumed one per message.
-    output logic [31:0] img_fifo_wr_data_r,
-    output logic [31:0] img_fifo_wr_data_g,
-    output logic [31:0] img_fifo_wr_data_b,
+    // One shared data bus: a returned beat belongs to exactly one channel,
+    // and img_fifo_wr_en says which.
+    output logic [31:0] img_fifo_wr_data,
 
     // Message input. Messages arrive here in order and are dispatched by the
     // router. Back-pressure is carried back to the source.
@@ -64,8 +67,6 @@ module memory_subsystem (
     output logic        img_fifo_ovf_sticky
 );
 
-logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] rom_addr;
-logic        rom_rd_en;
 logic [31:0] red_data;
 logic [31:0] green_data;
 logic [31:0] blue_data;
@@ -128,12 +129,30 @@ logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_rd_addr_mux;
 
 // The write path is NOT a read client: byte enables mean a partial-word
 // update needs no read.
+// pix_rd_owner already means "the pixel/burst readers own the port, not the
+// full-image path". That is unchanged. What changed is what drives the port
+// on the OTHER side: the three AHB slaves, one per channel, instead of one
+// broadcast address from rom_sequencer.
+//
+// So each SRAM now needs its own read pins. Under the direct path all three
+// still see the same address -- a single-pixel read wants R, G and B of one
+// pixel, which is exactly why that path did not move to AHB.
 assign sram_rd_en_mux   = pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_en   : pix_sram_rd_en)
-                        : rom_rd_en;
+                        : 1'b0;
 assign sram_rd_addr_mux = pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_addr : pix_sram_rd_addr)
-                        : rom_addr;
+                        : '0;
+
+logic [2:0]                             sram_rd_en_ch;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_rd_addr_ch [3];
+
+for (genvar ch = 0; ch < 3; ch++) begin : g_rd_mux
+    assign sram_rd_en_ch[ch]   = pix_rd_owner ? sram_rd_en_mux
+                                              : ahb_sram_rd_en[ch];
+    assign sram_rd_addr_ch[ch] = pix_rd_owner ? sram_rd_addr_mux
+                                              : ahb_sram_rd_addr[ch];
+end : g_rd_mux
 
 rgb_sram #(
     .DATA_WIDTH (memory_pkg::SRAM_DATA_WIDTH),
@@ -141,8 +160,8 @@ rgb_sram #(
     .INIT_FILE  (memory_pkg::SRAM_INIT_R)
 ) u_sram_red (
     .clk     (clk),
-    .rd_en   (sram_rd_en_mux),
-    .rd_addr (sram_rd_addr_mux),
+    .rd_en   (sram_rd_en_ch[0]),
+    .rd_addr (sram_rd_addr_ch[0]),
     .rd_data (red_data),
     .wr_en   (sram_wr_en),
     .wr_be   (sram_wr_be),
@@ -156,8 +175,8 @@ rgb_sram #(
     .INIT_FILE  (memory_pkg::SRAM_INIT_G)
 ) u_sram_green (
     .clk     (clk),
-    .rd_en   (sram_rd_en_mux),
-    .rd_addr (sram_rd_addr_mux),
+    .rd_en   (sram_rd_en_ch[1]),
+    .rd_addr (sram_rd_addr_ch[1]),
     .rd_data (green_data),
     .wr_en   (sram_wr_en),
     .wr_be   (sram_wr_be),
@@ -171,8 +190,8 @@ rgb_sram #(
     .INIT_FILE  (memory_pkg::SRAM_INIT_B)
 ) u_sram_blue (
     .clk     (clk),
-    .rd_en   (sram_rd_en_mux),
-    .rd_addr (sram_rd_addr_mux),
+    .rd_en   (sram_rd_en_ch[2]),
+    .rd_addr (sram_rd_addr_ch[2]),
     .rd_data (blue_data),
     .wr_en   (sram_wr_en),
     .wr_be   (sram_wr_be),
@@ -184,28 +203,116 @@ rgb_sram #(
 // parameters with 256x256 defaults. They were never overridden, so ROM_DEPTH
 // and ADDR_WIDTH were pinned at 16384 / 14 regardless of memory_pkg -- the
 // module looked parameterised but was not connected to anything. Bind them.
-rom_sequencer #(
+// -----------------------------------------------------------------------------
+// Full-image read path: AHB-Lite INCR4 bursts
+// -----------------------------------------------------------------------------
+// rom_sequencer read all three SRAMs in parallel at one address. A
+// single-manager bus cannot: accesses serialise. img_burst_reader asks the
+// arbiter for a channel, issues an INCR4 covering four words of that channel,
+// and pushes the four beats into that channel's FIFO. rom_sequencer.sv is
+// left in the tree unreferenced -- swapping this instantiation back is the
+// whole revert if the burst path misbehaves.
+logic [2:0]  arb_req, arb_gnt;
+logic        ahb_req_valid, ahb_req_write, ahb_req_burst;
+logic [1:0]  ahb_req_channel;
+logic [13:0] ahb_req_word;
+logic        ahb_busy, ahb_rd_valid;
+logic [31:0] ahb_rd_data;
+logic [1:0]  ahb_rd_beat;
+logic        ahb_err_sticky;
+
+img_burst_reader #(
     .IMG_WIDTH       (memory_pkg::IMG_WIDTH),
     .IMG_HEIGHT      (memory_pkg::IMG_HEIGHT),
     .PIXELS_PER_WORD (memory_pkg::PIXELS_PER_WORD)
-) u_rom_sequencer (
-    .clk          (clk),
-    .rst_n        (rst_n),
-    .start        (read_go),
-    .almost_full  (img_fifo_almost_full),
-    .almost_empty (img_fifo_almost_empty),
-    .red_data     (red_data),
-    .green_data   (green_data),
-    .blue_data    (blue_data),
-    .rom_addr     (rom_addr),
-    .rom_rd_en    (rom_rd_en),
-    .wr_en        (img_fifo_wr_en),
-    .wr_data_r    (img_fifo_wr_data_r),
-    .wr_data_g    (img_fifo_wr_data_g),
-    .wr_data_b    (img_fifo_wr_data_b),
-    .seq_done     (seq_done),
-    .busy         (rom_seq_busy)
+) u_burst_reader (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .start            (read_go),
+    .seq_done         (seq_done),
+    .busy             (rom_seq_busy),
+    .fifo_almost_full (img_fifo_almost_full),
+    .fifo_wr_en       (img_fifo_wr_en),
+    .fifo_wr_data     (img_fifo_wr_data),
+    .req_valid        (ahb_req_valid),
+    .req_write        (ahb_req_write),
+    .req_burst        (ahb_req_burst),
+    .req_channel      (ahb_req_channel),
+    .req_word         (ahb_req_word),
+    .ahb_busy         (ahb_busy),
+    .rd_valid         (ahb_rd_valid),
+    .rd_data          (ahb_rd_data),
+    .arb_req          (arb_req),
+    .arb_gnt          (arb_gnt)
 );
+
+// Round-robin with lock. A channel requests only when its FIFO can take a
+// whole burst; the lock holds the grant so a burst is never cut in half.
+round_robin_arbiter #(.N(3)) u_ch_arbiter (
+    .clk   (clk),
+    .rst_n (rst_n),
+    .req   (arb_req),
+    .gnt   (arb_gnt)
+);
+
+// -----------------------------------------------------------------------------
+// AHB-Lite fabric
+// -----------------------------------------------------------------------------
+logic [31:0] ahb_haddr, ahb_hwdata, ahb_hrdata;
+logic        ahb_hwrite, ahb_hready, ahb_hresp;
+logic [2:0]  ahb_hsize, ahb_hburst;
+logic [1:0]  ahb_htrans;
+logic [2:0]  ahb_hsel, ahb_s_hreadyout, ahb_s_hresp;
+logic [31:0] ahb_s_hrdata [3];
+logic        ahb_decode_err;
+
+ahb_master u_ahb_master (
+    .hclk(clk), .hresetn(rst_n),
+    .req_valid(ahb_req_valid), .req_write(ahb_req_write),
+    .req_burst(ahb_req_burst), .req_channel(ahb_req_channel),
+    .req_word(ahb_req_word), .busy(ahb_busy),
+    .rd_valid(ahb_rd_valid), .rd_data(ahb_rd_data), .rd_beat(ahb_rd_beat),
+    .wr_data(32'h0), .wr_ack(), .wr_beat(),
+    .haddr(ahb_haddr), .hwrite(ahb_hwrite), .hsize(ahb_hsize),
+    .hburst(ahb_hburst), .htrans(ahb_htrans), .hwdata(ahb_hwdata),
+    .hready(ahb_hready), .hrdata(ahb_hrdata), .hresp(ahb_hresp),
+    .err_sticky(ahb_err_sticky)
+);
+
+ahb_decoder u_ahb_decoder (
+    .hclk(clk), .hresetn(rst_n),
+    .haddr(ahb_haddr), .htrans(ahb_htrans),
+    .m_hready(ahb_hready), .m_hrdata(ahb_hrdata), .m_hresp(ahb_hresp),
+    .hsel(ahb_hsel),
+    .s_hreadyout(ahb_s_hreadyout), .s_hresp(ahb_s_hresp),
+    .s_hrdata(ahb_s_hrdata),
+    .decode_err(ahb_decode_err)
+);
+
+// One slave per channel. Read-only here: the write path keeps the direct
+// port, because AHB-Lite has no byte strobes and a single-pixel write needs
+// an arbitrary lane mask.
+logic [2:0]                              ahb_sram_rd_en;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0]  ahb_sram_rd_addr [3];
+logic [31:0]                             ahb_sram_rd_data [3];
+
+for (genvar ch = 0; ch < 3; ch++) begin : g_ahb_slave
+    ahb_slave_sram #(
+        .SRAM_ADDR_W (memory_pkg::SRAM_ADDR_WIDTH)
+    ) u_slave (
+        .hclk(clk), .hresetn(rst_n),
+        .hsel(ahb_hsel[ch]),
+        .hready(ahb_hready),                 // AGGREGATED segment ready
+        .haddr(ahb_haddr), .hwrite(ahb_hwrite), .hsize(ahb_hsize),
+        .hburst(ahb_hburst), .htrans(ahb_htrans), .hwdata(ahb_hwdata),
+        .hreadyout(ahb_s_hreadyout[ch]), .hrdata(ahb_s_hrdata[ch]),
+        .hresp(ahb_s_hresp[ch]),
+        .sram_rd_en(ahb_sram_rd_en[ch]),
+        .sram_rd_addr(ahb_sram_rd_addr[ch]),
+        .sram_rd_data(ahb_sram_rd_data[ch]),
+        .sram_wr_en(), .sram_wr_be(), .sram_wr_addr(), .sram_wr_data()
+    );
+end : g_ahb_slave
 
 // -----------------------------------------------------------------------
 // WRITE PATH
@@ -390,14 +497,23 @@ assign brd_msg_payload = brd_msg_pixels;
 
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)                              img_fifo_ovf_sticky <= 1'b0;
-    else if (img_fifo_wr_en && img_fifo_full) img_fifo_ovf_sticky <= 1'b1;
+    else if (|(img_fifo_wr_en & img_fifo_full)) img_fifo_ovf_sticky <= 1'b1;
 end
 
 `ifndef SYNTHESIS
+    // The AHB slaves and the direct readers must never drive a read port in
+    // the same cycle. pix_rd_owner selects between them, so this catches an
+    // ownership handoff that let both through.
     a_read_client_exclusive: assert property (
         @(posedge clk) disable iff (!rst_n)
-        !(rom_rd_en && pix_sram_rd_en)
+        !((|ahb_sram_rd_en) && pix_sram_rd_en)
     ) else $error("memory_subsystem: image and pixel readers drove SRAM together");
+
+    // The burst path may only reach the SRAMs when it owns the port.
+    a_ahb_owns_port: assert property (
+        @(posedge clk) disable iff (!rst_n)
+        (|ahb_sram_rd_en) |-> !pix_rd_owner
+    ) else $error("memory_subsystem: AHB read while the pixel readers owned the port");
 
     a_pix_rd_owns: assert property (
         @(posedge clk) disable iff (!rst_n)

@@ -108,11 +108,12 @@ logic [31:0]           rx_rd_reply_data;
 // -----------------------------------------------------------------------------
 // Image FIFO interconnect
 // -----------------------------------------------------------------------------
-logic        fifo_wr_en;        // rom_sequencer -> image FIFO write enable
-// One 32-bit SRAM word per channel. Three FIFOs now, one per colour.
-logic [31:0] fifo_wr_data_r;
-logic [31:0] fifo_wr_data_g;
-logic [31:0] fifo_wr_data_b;
+// PER CHANNEL. A burst fills one channel at a time, so exactly one of these
+// is high on any beat.
+logic [2:0]  fifo_wr_en;
+// One shared write-data bus: a returned beat belongs to exactly one channel,
+// and fifo_wr_en says which.
+logic [31:0] fifo_wr_data;
 logic        almost_full;       // image FIFO -> rom_sequencer backpressure
 logic        almost_empty;      // image FIFO -> rom_sequencer resume signal
 logic        fifo_rd_en;        // tx_sequencer -> image FIFO read enable
@@ -167,13 +168,11 @@ memory_subsystem u_memory_subsystem (
     .img_done              (tx_img_done_100),
     .burst_active          (burst_active_100),
 
-    .img_fifo_almost_full  (almost_full),
+    .img_fifo_almost_full  ({almost_full_b, almost_full_g, almost_full}),
     .img_fifo_almost_empty (almost_empty_100),
-    .img_fifo_full         (fifo_full),
+    .img_fifo_full         ({fifo_full_b, fifo_full_g, fifo_full}),
     .img_fifo_wr_en        (fifo_wr_en),
-    .img_fifo_wr_data_r    (fifo_wr_data_r),
-    .img_fifo_wr_data_g    (fifo_wr_data_g),
-    .img_fifo_wr_data_b    (fifo_wr_data_b),
+    .img_fifo_wr_data      (fifo_wr_data),
 
     .msg_valid             (mem_msg_valid),
     .msg_ready             (mem_msg_ready),
@@ -224,8 +223,8 @@ memory_subsystem u_memory_subsystem (
 async_fifo u_fifo_r (
     .wr_clk      (CLK100MHZ),
     .wr_rst_n    (sync_rst_n),
-    .wr_en       (fifo_wr_en),
-    .wr_data     (fifo_wr_data_r),
+    .wr_en       (fifo_wr_en[0]),
+    .wr_data     (fifo_wr_data),
     .full        (fifo_full),
     .almost_full (almost_full),
     .rd_clk      (pll_clk_out),
@@ -240,8 +239,8 @@ async_fifo u_fifo_r (
 async_fifo u_fifo_g (
     .wr_clk      (CLK100MHZ),
     .wr_rst_n    (sync_rst_n),
-    .wr_en       (fifo_wr_en),
-    .wr_data     (fifo_wr_data_g),
+    .wr_en       (fifo_wr_en[1]),
+    .wr_data     (fifo_wr_data),
     .full        (fifo_full_g),
     .almost_full (almost_full_g),
     .rd_clk      (pll_clk_out),
@@ -256,8 +255,8 @@ async_fifo u_fifo_g (
 async_fifo u_fifo_b (
     .wr_clk      (CLK100MHZ),
     .wr_rst_n    (sync_rst_n),
-    .wr_en       (fifo_wr_en),
-    .wr_data     (fifo_wr_data_b),
+    .wr_en       (fifo_wr_en[2]),
+    .wr_data     (fifo_wr_data),
     .full        (fifo_full_b),
     .almost_full (almost_full_b),
     .rd_clk      (pll_clk_out),
@@ -270,17 +269,24 @@ async_fifo u_fifo_b (
 );
 
 `ifndef SYNTHESIS
-// Lockstep. Written and popped together at this step, so a divergence means
-// a channel's write enable or pop has come loose.
-a_fifo_lockstep_empty: assert property (
-    @(posedge pll_clk_out) disable iff (!sync_pll_rst_n)
-    (fifo_empty == fifo_empty_g) && (fifo_empty_g == fifo_empty_b)
-) else $error("chip_top: channel FIFOs diverged -- empty flags disagree");
-
-a_fifo_lockstep_full: assert property (
+// THE CHANNELS ARE EXPECTED TO DIVERGE NOW.
+//
+// Under the parallel read all three FIFOs were written in the same cycle and
+// held identical occupancy -- there were lockstep assertions here saying so.
+// A per-channel INCR4 burst fills one channel at a time, so red runs up to
+// two bursts ahead of blue. Checking for lockstep would now fire constantly.
+//
+// What still must hold is that exactly one channel is written per beat, and
+// that no channel is written while full.
+a_fifo_wr_onehot: assert property (
     @(posedge CLK100MHZ) disable iff (!sync_rst_n)
-    (fifo_full == fifo_full_g) && (fifo_full_g == fifo_full_b)
-) else $error("chip_top: channel FIFOs diverged -- full flags disagree");
+    $onehot0(fifo_wr_en)
+) else $error("chip_top: more than one channel FIFO written in a cycle");
+
+a_fifo_no_overflow: assert property (
+    @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+    !(|(fifo_wr_en & {fifo_full_b, fifo_full_g, fifo_full}))
+) else $error("chip_top: a channel FIFO was written while full");
 `endif
 
 // -----------------------------------------------------------------------------
