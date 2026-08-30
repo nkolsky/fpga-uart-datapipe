@@ -144,6 +144,42 @@ assign sram_rd_addr_mux = pix_rd_owner
                         ? (arb_brd_owns ? brd_sram_rd_addr : pix_sram_rd_addr)
                         : '0;
 
+// AHB-side nets the muxes below need. Declared HERE, ahead of first use --
+// Vivado raises Synth 8-6901 for use-before-declaration even though it
+// resolves them, and a wall of those warnings hides real ones.
+logic                                    wr_burst_active;
+logic [2:0]                              ahb_sram_rd_en;
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0]  ahb_sram_rd_addr [3];
+logic [31:0]                             ahb_sram_rd_data [3];
+
+// Read data back from the SRAMs into the AHB slaves. The SRAM outputs are
+// named per colour; the slaves index by channel. Without this the slaves
+// return an undriven bus and every AHB read yields nothing -- which is what
+// Synth 8-3848 was reporting.
+assign ahb_sram_rd_data[0] = red_data;
+assign ahb_sram_rd_data[1] = green_data;
+assign ahb_sram_rd_data[2] = blue_data;
+logic [2:0]                              ahb_sram_wr_en;
+logic [3:0]                              ahb_sram_wr_be   [3];
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0]  ahb_sram_wr_addr [3];
+logic [31:0]                             ahb_sram_wr_data [3];
+
+// WRITE MUX, per SRAM. The direct path keeps its byte enables for single
+// pixels and partial rectangles; the AHB slaves take over only for a
+// full-image write. wr_burst_active is high for the whole of one.
+logic [2:0]                             sram_wr_en_ch;
+logic [3:0]                             sram_wr_be_ch   [3];
+logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_wr_addr_ch [3];
+
+for (genvar ch = 0; ch < 3; ch++) begin : g_wr_mux
+    assign sram_wr_en_ch[ch]   = wr_burst_active ? ahb_sram_wr_en[ch]
+                                                 : sram_wr_en;
+    assign sram_wr_be_ch[ch]   = wr_burst_active ? ahb_sram_wr_be[ch]
+                                                 : sram_wr_be;
+    assign sram_wr_addr_ch[ch] = wr_burst_active ? ahb_sram_wr_addr[ch]
+                                                 : sram_wr_addr;
+end : g_wr_mux
+
 logic [2:0]                             sram_rd_en_ch;
 logic [memory_pkg::SRAM_ADDR_WIDTH-1:0] sram_rd_addr_ch [3];
 
@@ -163,10 +199,10 @@ rgb_sram #(
     .rd_en   (sram_rd_en_ch[0]),
     .rd_addr (sram_rd_addr_ch[0]),
     .rd_data (red_data),
-    .wr_en   (sram_wr_en),
-    .wr_be   (sram_wr_be),
-    .wr_addr (sram_wr_addr),
-    .wr_data (sram_wr_data_r)
+    .wr_en   (sram_wr_en_ch[0]),
+    .wr_be   (sram_wr_be_ch[0]),
+    .wr_addr (sram_wr_addr_ch[0]),
+    .wr_data ((wr_burst_active ? ahb_sram_wr_data[0] : sram_wr_data_r))
 );
 
 rgb_sram #(
@@ -178,10 +214,10 @@ rgb_sram #(
     .rd_en   (sram_rd_en_ch[1]),
     .rd_addr (sram_rd_addr_ch[1]),
     .rd_data (green_data),
-    .wr_en   (sram_wr_en),
-    .wr_be   (sram_wr_be),
-    .wr_addr (sram_wr_addr),
-    .wr_data (sram_wr_data_g)
+    .wr_en   (sram_wr_en_ch[1]),
+    .wr_be   (sram_wr_be_ch[1]),
+    .wr_addr (sram_wr_addr_ch[1]),
+    .wr_data ((wr_burst_active ? ahb_sram_wr_data[1] : sram_wr_data_g))
 );
 
 rgb_sram #(
@@ -193,10 +229,10 @@ rgb_sram #(
     .rd_en   (sram_rd_en_ch[2]),
     .rd_addr (sram_rd_addr_ch[2]),
     .rd_data (blue_data),
-    .wr_en   (sram_wr_en),
-    .wr_be   (sram_wr_be),
-    .wr_addr (sram_wr_addr),
-    .wr_data (sram_wr_data_b)
+    .wr_en   (sram_wr_en_ch[2]),
+    .wr_be   (sram_wr_be_ch[2]),
+    .wr_addr (sram_wr_addr_ch[2]),
+    .wr_data ((wr_burst_active ? ahb_sram_wr_data[2] : sram_wr_data_b))
 );
 
 // rom_sequencer declares its OWN IMG_WIDTH / IMG_HEIGHT / PIXELS_PER_WORD
@@ -216,6 +252,19 @@ logic [2:0]  arb_req, arb_gnt;
 logic        ahb_req_valid, ahb_req_write, ahb_req_burst;
 logic [1:0]  ahb_req_channel;
 logic [13:0] ahb_req_word;
+// Writer-side request, from the gather inside mem_write_subsystem.
+// Reader-side request. The writer has its own set; the mux below picks
+// between them for the shared master.
+logic        rdr_req_valid, rdr_req_write, rdr_req_burst;
+logic [1:0]  rdr_req_channel;
+logic [13:0] rdr_req_word;
+logic        wtr_req_valid, wtr_req_write, wtr_req_burst;
+logic [1:0]  wtr_req_channel;
+logic [13:0] wtr_req_word;
+logic [31:0] wtr_ahb_wr_data;
+logic        ahb_wr_ack;
+logic [1:0]  ahb_wr_beat;
+
 logic        ahb_busy, ahb_rd_valid;
 logic [31:0] ahb_rd_data;
 logic [1:0]  ahb_rd_beat;
@@ -234,11 +283,11 @@ img_burst_reader #(
     .fifo_almost_full (img_fifo_almost_full),
     .fifo_wr_en       (img_fifo_wr_en),
     .fifo_wr_data     (img_fifo_wr_data),
-    .req_valid        (ahb_req_valid),
-    .req_write        (ahb_req_write),
-    .req_burst        (ahb_req_burst),
-    .req_channel      (ahb_req_channel),
-    .req_word         (ahb_req_word),
+    .req_valid        (rdr_req_valid),
+    .req_write        (rdr_req_write),
+    .req_burst        (rdr_req_burst),
+    .req_channel      (rdr_req_channel),
+    .req_word         (rdr_req_word),
     .ahb_busy         (ahb_busy),
     .rd_valid         (ahb_rd_valid),
     .rd_data          (ahb_rd_data),
@@ -266,13 +315,33 @@ logic [2:0]  ahb_hsel, ahb_s_hreadyout, ahb_s_hresp;
 logic [31:0] ahb_s_hrdata [3];
 logic        ahb_decode_err;
 
+// -----------------------------------------------------------------------------
+// The read and write burst engines share one AHB master
+// -----------------------------------------------------------------------------
+// Safe without a second arbiter because mem_interlock already makes reads and
+// writes mutually exclusive, in BOTH directions:
+//
+//   wr_port_grant = !read_active && !pix_rd_active
+//   read_go       = start_pending && !wr_pending && ...
+//
+// so only one engine can ever be running. wr_burst_active is high for the
+// whole of a full-image write.
+assign ahb_req_valid   = wr_burst_active ? wtr_req_valid   : rdr_req_valid;
+assign ahb_req_write   = wr_burst_active ? wtr_req_write   : rdr_req_write;
+assign ahb_req_burst   = wr_burst_active ? wtr_req_burst   : rdr_req_burst;
+assign ahb_req_channel = wr_burst_active ? wtr_req_channel : rdr_req_channel;
+assign ahb_req_word    = wr_burst_active ? wtr_req_word    : rdr_req_word;
+
 ahb_master u_ahb_master (
     .hclk(clk), .hresetn(rst_n),
     .req_valid(ahb_req_valid), .req_write(ahb_req_write),
     .req_burst(ahb_req_burst), .req_channel(ahb_req_channel),
     .req_word(ahb_req_word), .busy(ahb_busy),
     .rd_valid(ahb_rd_valid), .rd_data(ahb_rd_data), .rd_beat(ahb_rd_beat),
-    .wr_data(32'h0), .wr_ack(), .wr_beat(),
+    // Write data from the gather; read data to the burst reader. Only one is
+    // ever active. Leaving these tied off is what Synth 8-3848 caught --
+    // ahb_wr_beat had no driver and the gather's data mux indexed with X.
+    .wr_data(wtr_ahb_wr_data), .wr_ack(ahb_wr_ack), .wr_beat(ahb_wr_beat),
     .haddr(ahb_haddr), .hwrite(ahb_hwrite), .hsize(ahb_hsize),
     .hburst(ahb_hburst), .htrans(ahb_htrans), .hwdata(ahb_hwdata),
     .hready(ahb_hready), .hrdata(ahb_hrdata), .hresp(ahb_hresp),
@@ -292,9 +361,7 @@ ahb_decoder u_ahb_decoder (
 // One slave per channel. Read-only here: the write path keeps the direct
 // port, because AHB-Lite has no byte strobes and a single-pixel write needs
 // an arbitrary lane mask.
-logic [2:0]                              ahb_sram_rd_en;
-logic [memory_pkg::SRAM_ADDR_WIDTH-1:0]  ahb_sram_rd_addr [3];
-logic [31:0]                             ahb_sram_rd_data [3];
+
 
 for (genvar ch = 0; ch < 3; ch++) begin : g_ahb_slave
     ahb_slave_sram #(
@@ -310,7 +377,13 @@ for (genvar ch = 0; ch < 3; ch++) begin : g_ahb_slave
         .sram_rd_en(ahb_sram_rd_en[ch]),
         .sram_rd_addr(ahb_sram_rd_addr[ch]),
         .sram_rd_data(ahb_sram_rd_data[ch]),
-        .sram_wr_en(), .sram_wr_be(), .sram_wr_addr(), .sram_wr_data()
+        // The write side goes live here for the first time. It was tied off
+        // through step 6b, so the slaves' wr_pending / wr_addr_q registers
+        // were optimised away entirely -- expect the flop count to rise.
+        .sram_wr_en   (ahb_sram_wr_en[ch]),
+        .sram_wr_be   (ahb_sram_wr_be[ch]),
+        .sram_wr_addr (ahb_sram_wr_addr[ch]),
+        .sram_wr_data (ahb_sram_wr_data[ch])
     );
 end : g_ahb_slave
 
@@ -374,6 +447,16 @@ mem_write_subsystem u_write_path (
     .wr_addr      (sram_wr_addr),
     .wr_data_r    (sram_wr_data_r),
     .wr_data_g    (sram_wr_data_g),
+    .burst_active    (wr_burst_active),
+    .ahb_req_valid   (wtr_req_valid),
+    .ahb_req_write   (wtr_req_write),
+    .ahb_req_burst   (wtr_req_burst),
+    .ahb_req_channel (wtr_req_channel),
+    .ahb_req_word    (wtr_req_word),
+    .ahb_busy        (ahb_busy),
+    .ahb_wr_beat     (ahb_wr_beat),
+    .ahb_wr_ack      (ahb_wr_ack),
+    .ahb_wr_data     (wtr_ahb_wr_data),
     .wr_data_b    (sram_wr_data_b),
 
     .wr_allowed   (wr_port_grant),
