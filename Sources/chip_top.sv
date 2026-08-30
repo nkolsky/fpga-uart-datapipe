@@ -121,6 +121,7 @@ logic [31:0] fifo_rd_data_r;
 logic [31:0] fifo_rd_data_g;
 logic [31:0] fifo_rd_data_b;
 logic        fifo_empty;        // image FIFO -> tx_sequencer empty flag
+logic        apb_busy;          // APB master busy -> mem_msg_router back-pressure
 logic        fifo_full;         // image FIFO full flag (monitored, not used for control)
 // G and B mirror R exactly at this step -- see the lockstep assertions.
 logic        fifo_full_g,      fifo_full_b;
@@ -536,8 +537,10 @@ cdc_pulse_sync u_cdc_parity_err (
 // Register subsystem (100 MHz)
 // -----------------------------------------------------------------------------
 // APB fabric nets. The fabric is interconnect, so it lives here with the CDC
-// primitives rather than inside a subsystem.
-logic                           apb_busy;
+// primitives rather than inside a subsystem. apb_busy is declared with the
+// other signal declarations near the top, ahead of memory_subsystem's port
+// map -- Vivado raises Synth 8-6901 otherwise.
+
 logic                           apb_rsp_valid;
 logic                           apb_rsp_is_read;
 logic [apb_pkg::DATA_W-1:0]     apb_rsp_rdata;

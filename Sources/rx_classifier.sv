@@ -111,6 +111,10 @@ module rx_classifier
     output logic         classifier_error
 );
 
+    // Declared ahead of first use -- Vivado Synth 8-6901 otherwise.
+    logic br_extent_row_ok, br_extent_col_ok;
+    logic sem_ok, sem_unknown, sem_pre, needs_extent;
+
     localparam int TOTAL_PIXELS = IMG_HEIGHT * IMG_WIDTH;
 
     // rgf_pkg is referenced only for this check, so the width used in the
@@ -338,7 +342,6 @@ module rx_classifier
     // Each verdict now gets its own flop and they are ANDed a stage later,
     // inside accept, where there is room for the extra input at no depth
     // cost. br_extent_ok survives only as the reference for the assertions.
-    logic br_extent_row_ok, br_extent_col_ok;
     assign br_extent_row_ok =
         ((EXT_W'(br_base_row_full) + EXT_W'(s1_f1)) <= EXT_W'(IMG_HEIGHT));
     assign br_extent_col_ok =
@@ -384,7 +387,6 @@ module rx_classifier
     //
     // The verdict is unchanged for every kind -- see a_burst_read_verdict.
     // -----------------------------------------------------------------
-    logic sem_ok, sem_unknown, sem_pre, needs_extent;
 
     always_comb begin : verdict
         sem_pre      = 1'b0;
