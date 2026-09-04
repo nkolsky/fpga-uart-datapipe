@@ -65,6 +65,9 @@ module async_fifo #(
     output logic                  empty_cdc
 );
 
+// Declared ahead of first use -- Vivado Synth 8-6901 otherwise.
+logic [PTR_WIDTH-1:0] rd_ptr_bin, rd_ptr_gray;
+
 // ===========================================================
 // Shared: dual-port memory array
 // (lives in neither domain exclusively - written by wr_clk,
@@ -165,7 +168,6 @@ end
 // READ DOMAIN (rd_clk, rd_rst_n)
 // ===========================================================
 
-logic [PTR_WIDTH-1:0] rd_ptr_bin, rd_ptr_gray;
 
 (* ASYNC_REG = "TRUE" *) logic [PTR_WIDTH-1:0] wr_ptr_gray_ff1;   // stage 1 (may go metastable)
 (* ASYNC_REG = "TRUE" *) logic [PTR_WIDTH-1:0] wr_ptr_gray_sync;  // stage 2 (settled)

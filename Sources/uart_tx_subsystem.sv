@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 // uart_tx_subsystem.sv
 //
-// Pure hierarchy extraction of the complete 256 MHz UART transmit datapath.
+// Pure hierarchy extraction of the complete 130 MHz UART transmit datapath.
 //
 // Contains:
 //   - tx_sequencer
@@ -23,22 +23,27 @@ module uart_tx_subsystem (
 
     // Full-image FIFO read side. The async FIFO remains in chip_top.
     input  logic         fifo_empty,
-    input  logic [23:0]  fifo_rd_data,
+    // One entry from each channel FIFO: a 32-bit SRAM word holding four
+    // pixel values of that channel. tx_sequencer assembles a pixel by taking
+    // the same byte lane from all three.
+    input  logic [31:0]  fifo_rd_data_r,
+    input  logic [31:0]  fifo_rd_data_g,
+    input  logic [31:0]  fifo_rd_data_b,
     output logic         fifo_rd_en,
 
     // Host-side flow control.
     input  logic         cts,
 
-    // Register-read reply, already delivered into the 256 MHz domain.
+    // Register-read reply, already delivered into the 130 MHz domain.
     input  logic         rd_reply_valid,
     input  logic [31:0]  rd_reply_data,
 
-    // Atomic pixel-reply transaction from the 100 MHz -> 256 MHz CDC.
+    // Atomic pixel-reply transaction from the 100->130 MHz CDC.
     input  logic         pix_reply_valid,
     input  logic [43:0]  pix_reply_data,
     output logic         pix_reply_accept,
 
-    // Atomic burst-reply transaction from the 100 MHz -> 256 MHz CDC.
+    // Atomic burst-reply transaction from the 100->130 MHz CDC.
     input  logic         burst_reply_valid,
     input  logic [95:0]  burst_reply_data,
     output logic         burst_reply_accept,
@@ -101,7 +106,9 @@ tx_sequencer #(
     .fifo_empty   (fifo_empty),
     .cts          (cts),
     .mac_busy     (mac_busy),
-    .fifo_rd_data (fifo_rd_data),
+    .fifo_rd_data_r (fifo_rd_data_r),
+    .fifo_rd_data_g (fifo_rd_data_g),
+    .fifo_rd_data_b (fifo_rd_data_b),
     .msg_valid    (image_msg_valid),
     .fifo_pop     (fifo_rd_en),
     .tx_img_done  (tx_img_done),

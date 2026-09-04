@@ -108,14 +108,27 @@ logic [31:0]           rx_rd_reply_data;
 // -----------------------------------------------------------------------------
 // Image FIFO interconnect
 // -----------------------------------------------------------------------------
-logic        fifo_wr_en;        // rom_sequencer -> image FIFO write enable
-logic [23:0] fifo_wr_data;      // rom_sequencer -> image FIFO pixel data
+// PER CHANNEL. A burst fills one channel at a time, so exactly one of these
+// is high on any beat.
+logic [2:0]  fifo_wr_en;
+// One shared write-data bus: a returned beat belongs to exactly one channel,
+// and fifo_wr_en says which.
+logic [31:0] fifo_wr_data;
 logic        almost_full;       // image FIFO -> rom_sequencer backpressure
 logic        almost_empty;      // image FIFO -> rom_sequencer resume signal
 logic        fifo_rd_en;        // tx_sequencer -> image FIFO read enable
-logic [23:0] fifo_rd_data;      // image FIFO -> tx_sequencer pixel data (24-bit RGB)
+logic [31:0] fifo_rd_data_r;
+logic [31:0] fifo_rd_data_g;
+logic [31:0] fifo_rd_data_b;
 logic        fifo_empty;        // image FIFO -> tx_sequencer empty flag
+logic        apb_busy;          // APB master busy -> mem_msg_router back-pressure
 logic        fifo_full;         // image FIFO full flag (monitored, not used for control)
+// G and B mirror R exactly at this step -- see the lockstep assertions.
+logic        fifo_full_g,      fifo_full_b;
+logic        fifo_empty_g,     fifo_empty_b;
+logic        almost_full_g,    almost_full_b;
+logic        almost_empty_g,   almost_empty_b;
+logic        fifo_empty_cdc_g, fifo_empty_cdc_b;
 logic        seq_done;          // rom_sequencer → chip_top: one-cycle done pulse
 logic        rom_seq_busy;
 
@@ -156,9 +169,9 @@ memory_subsystem u_memory_subsystem (
     .img_done              (tx_img_done_100),
     .burst_active          (burst_active_100),
 
-    .img_fifo_almost_full  (almost_full),
+    .img_fifo_almost_full  ({almost_full_b, almost_full_g, almost_full}),
     .img_fifo_almost_empty (almost_empty_100),
-    .img_fifo_full         (fifo_full),
+    .img_fifo_full         ({fifo_full_b, fifo_full_g, fifo_full}),
     .img_fifo_wr_en        (fifo_wr_en),
     .img_fifo_wr_data      (fifo_wr_data),
 
@@ -195,23 +208,87 @@ memory_subsystem u_memory_subsystem (
 // -----------------------------------------------------------------------------
 // Asynchronous FIFO
 // -----------------------------------------------------------------------------
-async_fifo u_img_fifo (
-    // Write domain (rom_sequencer side)
+// THREE FIFOS, ONE PER COLOUR CHANNEL.
+//
+// This was a single 24-bit FIFO carrying packed pixels. It is three 32-bit
+// FIFOs carrying whole SRAM words because, at step 6b, a per-channel INCR4
+// burst delivers four words of R, then four of G, then four of B -- so the
+// channels arrive at different times and each needs its own buffer.
+//
+// At THIS step the SRAM reads are still parallel, so all three are written
+// and popped in the same cycle and hold identical occupancy. Only R's flags
+// drive control; the assertions below check the other two agree, which is
+// precisely what stops being true once bursts arrive per channel.
+//
+// Same total storage as the single FIFO: 3 x 16 x 32 = 1536 bits, 64 pixels.
+async_fifo u_fifo_r (
     .wr_clk      (CLK100MHZ),
     .wr_rst_n    (sync_rst_n),
-    .wr_en       (fifo_wr_en),
+    .wr_en       (fifo_wr_en[0]),
     .wr_data     (fifo_wr_data),
     .full        (fifo_full),
     .almost_full (almost_full),
-    // Read domain (tx_sequencer side)
     .rd_clk      (pll_clk_out),
     .rd_rst_n    (sync_pll_rst_n),
     .rd_en       (fifo_rd_en),
-    .rd_data     (fifo_rd_data),
+    .rd_data     (fifo_rd_data_r),
     .empty       (fifo_empty),
     .almost_empty(almost_empty),
     .empty_cdc   (fifo_empty_cdc)
 );
+
+async_fifo u_fifo_g (
+    .wr_clk      (CLK100MHZ),
+    .wr_rst_n    (sync_rst_n),
+    .wr_en       (fifo_wr_en[1]),
+    .wr_data     (fifo_wr_data),
+    .full        (fifo_full_g),
+    .almost_full (almost_full_g),
+    .rd_clk      (pll_clk_out),
+    .rd_rst_n    (sync_pll_rst_n),
+    .rd_en       (fifo_rd_en),
+    .rd_data     (fifo_rd_data_g),
+    .empty       (fifo_empty_g),
+    .almost_empty(almost_empty_g),
+    .empty_cdc   (fifo_empty_cdc_g)
+);
+
+async_fifo u_fifo_b (
+    .wr_clk      (CLK100MHZ),
+    .wr_rst_n    (sync_rst_n),
+    .wr_en       (fifo_wr_en[2]),
+    .wr_data     (fifo_wr_data),
+    .full        (fifo_full_b),
+    .almost_full (almost_full_b),
+    .rd_clk      (pll_clk_out),
+    .rd_rst_n    (sync_pll_rst_n),
+    .rd_en       (fifo_rd_en),
+    .rd_data     (fifo_rd_data_b),
+    .empty       (fifo_empty_b),
+    .almost_empty(almost_empty_b),
+    .empty_cdc   (fifo_empty_cdc_b)
+);
+
+`ifndef SYNTHESIS
+// THE CHANNELS ARE EXPECTED TO DIVERGE NOW.
+//
+// Under the parallel read all three FIFOs were written in the same cycle and
+// held identical occupancy -- there were lockstep assertions here saying so.
+// A per-channel INCR4 burst fills one channel at a time, so red runs up to
+// two bursts ahead of blue. Checking for lockstep would now fire constantly.
+//
+// What still must hold is that exactly one channel is written per beat, and
+// that no channel is written while full.
+a_fifo_wr_onehot: assert property (
+    @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+    $onehot0(fifo_wr_en)
+) else $error("chip_top: more than one channel FIFO written in a cycle");
+
+a_fifo_no_overflow: assert property (
+    @(posedge CLK100MHZ) disable iff (!sync_rst_n)
+    !(|(fifo_wr_en & {fifo_full_b, fifo_full_g, fifo_full}))
+) else $error("chip_top: a channel FIFO was written while full");
+`endif
 
 // -----------------------------------------------------------------------------
 // UART transmit subsystem (130 MHz)
@@ -250,7 +327,9 @@ uart_tx_subsystem u_uart_tx_subsystem (
     .rst_n              (sync_pll_rst_n),
 
     .fifo_empty         (fifo_empty),
-    .fifo_rd_data       (fifo_rd_data),
+    .fifo_rd_data_r     (fifo_rd_data_r),
+    .fifo_rd_data_g     (fifo_rd_data_g),
+    .fifo_rd_data_b     (fifo_rd_data_b),
     .fifo_rd_en         (fifo_rd_en),
     .cts                (cts_sync),
 
@@ -458,8 +537,10 @@ cdc_pulse_sync u_cdc_parity_err (
 // Register subsystem (100 MHz)
 // -----------------------------------------------------------------------------
 // APB fabric nets. The fabric is interconnect, so it lives here with the CDC
-// primitives rather than inside a subsystem.
-logic                           apb_busy;
+// primitives rather than inside a subsystem. apb_busy is declared with the
+// other signal declarations near the top, ahead of memory_subsystem's port
+// map -- Vivado raises Synth 8-6901 otherwise.
+
 logic                           apb_rsp_valid;
 logic                           apb_rsp_is_read;
 logic [apb_pkg::DATA_W-1:0]     apb_rsp_rdata;

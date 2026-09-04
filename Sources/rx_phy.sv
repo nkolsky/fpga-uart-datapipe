@@ -75,10 +75,21 @@ module rx_phy (
     output logic       rx_busy
 );
 
+// Declared ahead of first use -- Vivado Synth 8-6901 otherwise.
+rx_phy_state_t curr_st, next_st;
+logic [3:0] tick_q;
+logic [2:0] start_window;
+logic [3:0] bit_cnt;
+logic       parity_valid;
+
 // -------------------------------------------------------------------------
 // CDC Synchronizer & Falling Edge Detector
 // -------------------------------------------------------------------------
-logic [2:0] rx_sync_r;
+// ASYNC_REG on all three stages. rx_in comes straight from the pin and is
+// asynchronous to this clock by definition -- the host has its own crystal.
+// The attribute does not change the chain, it stops the placer separating the
+// flops and stops synthesis optimising them away.
+(* ASYNC_REG = "TRUE" *) logic [2:0] rx_sync_r;
 logic       rx_sync;
 logic       fall_edge;
 
@@ -125,7 +136,6 @@ end
 // -------------------------------------------------------------------------
 // FSM State Registers
 // -------------------------------------------------------------------------
-rx_phy_state_t curr_st, next_st;
 
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) curr_st <= RX_IDLE;
@@ -194,7 +204,6 @@ end : next_state_logic
 // -------------------------------------------------------------------------
 // tick_q: oversampling tick counter within current bit period (0-15).
 // -------------------------------------------------------------------------
-logic [3:0] tick_q;
 
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -210,7 +219,6 @@ end
 // -------------------------------------------------------------------------
 // Majority-vote windows for start/stop validation.
 // -------------------------------------------------------------------------
-logic [2:0] start_window;
 logic [2:0] stop_window;
 
 always_ff @(posedge clk or negedge rst_n) begin
@@ -236,7 +244,6 @@ end
 // -------------------------------------------------------------------------
 // Bit counter: counts bits sampled in RX_DATA (target: 8).
 // -------------------------------------------------------------------------
-logic [3:0] bit_cnt;
 
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
@@ -279,7 +286,6 @@ end
 
 // Logic signal for parity check. Taken out of ports b/c everything is
 // being driven off the pulse, so no need for parity_valid to be out facing
-logic       parity_valid;
 
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) parity_err_pulse <= 1'b0;

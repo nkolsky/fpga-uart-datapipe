@@ -12,12 +12,33 @@ package fifo_pkg;
     // -----------------------------------------------------------------
     // FIFO sizing parameters
     // -----------------------------------------------------------------
-    localparam int FIFO_DATA_WIDTH = 24;            // R0,G0,B0 packed pixel
-    localparam int DEPTH      = 64;            // number of entries
-    localparam int ADDR_WIDTH = $clog2(DEPTH); // 6 bits for depth=64
+    // ONE 32-BIT CHANNEL WORD PER ENTRY, not one packed pixel.
+    //
+    // There are three of these now, one per colour channel. An entry is a
+    // whole SRAM word -- four consecutive pixel values of ONE channel -- so a
+    // pixel is assembled on the READ side by taking the same byte lane from
+    // all three FIFOs. That is the shape a per-channel INCR4 burst delivers:
+    // four beats of R, then four of G, then four of B, so the channels arrive
+    // at different times and each needs its own buffer.
+    localparam int FIFO_DATA_WIDTH = 32;            // one SRAM word, 4 px of one channel
+    // 16 entries x 4 pixels = 64 pixels buffered per channel -- the same
+    // depth of image the single 24-bit FIFO held, at a quarter the entries.
+    //
+    // Sized for bursts, not for rate. An INCR4 is 4 entries, so 16 gives four
+    // bursts of headroom; the thresholds below leave room for one burst
+    // already in flight when almost_full asserts, since a burst cannot be
+    // stopped part way. Rate is irrelevant here -- the UART consumes a pixel
+    // every 22 us against a producer that makes one every few clocks.
+    localparam int DEPTH      = 16;            // number of entries
+    localparam int ADDR_WIDTH = $clog2(DEPTH); // 4 bits for depth=16
 
-    localparam int AF_THRESHOLD = 52;          // assert almost_full at this occupancy
-    localparam int AE_THRESHOLD = 8;           // assert almost_empty at this occupancy
+    // 12 of 16: leaves 4 slots, exactly one INCR4, for a burst that is
+    // already running when almost_full asserts.
+    localparam int AF_THRESHOLD = 12;          // assert almost_full at this occupancy
+    // 4 of 16: resume once a burst's worth has drained. The resume signal
+    // crosses back through cdc_level_sync, which the reader's 22 us pixel
+    // period dwarfs.
+    localparam int AE_THRESHOLD = 4;           // assert almost_empty at this occupancy
 
     // Pointer width: one extra bit beyond ADDR_WIDTH for wrap disambiguation
     localparam int PTR_WIDTH = ADDR_WIDTH + 1;

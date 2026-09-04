@@ -11,7 +11,16 @@ module tx_sequencer #(
     input  logic        fifo_empty,
     input  logic        cts,            // active-low: 0 = clear to send
     input  logic        mac_busy,
-    input  logic [23:0] fifo_rd_data,   // pixel data from FIFO
+    // ONE ENTRY FROM EACH CHANNEL FIFO -- a 32-bit SRAM word holding four
+    // consecutive pixel values of that channel. A pixel is assembled by
+    // taking the SAME byte lane from all three.
+    //
+    // rom_sequencer used to do this unpacking and push finished pixels. It
+    // moved here because the three channels now arrive in separate FIFOs,
+    // and because this is where pixels are consumed -- one per message.
+    input  logic [31:0] fifo_rd_data_r,
+    input  logic [31:0] fifo_rd_data_g,
+    input  logic [31:0] fifo_rd_data_b,
 
     // control outputs
     output logic        msg_valid,
@@ -35,6 +44,11 @@ import tx_seq_pkg::*;
 // Internal signals
 // -------------------------------------------------------------------------
 state_t current_state, next_state;
+
+// The three channel words of the current group, and which pixel of the four
+// is being sent.
+logic [31:0] word_r, word_g, word_b;
+logic [1:0]  pix_idx;
 
 /* verilator lint_off ASCRANGE */
 logic [$clog2(IMG_WIDTH)-1:0]  col_cnt;
@@ -120,11 +134,13 @@ always_comb begin : next_state_logic
                 next_state = WAIT_DONE;
         end
 
+        // Three of every four pixels come from the group already popped, so
+        // NEXT returns to LATCH rather than to IDLE. Only the fourth pixel
+        // ends the group and triggers another pop.
         NEXT: begin
-            if (last_pixel)
-                next_state = DONE;
-            else
-                next_state = IDLE;
+            if (pix_idx != 2'd3)   next_state = LATCH;   // same group
+            else if (last_pixel)   next_state = DONE;
+            else                   next_state = IDLE;    // pop a new group
         end
 
         DONE:    next_state = IDLE;
@@ -158,13 +174,46 @@ end
 // -------------------------------------------------------------------------
 // Datapath: latch pixel and row/col in LATCH state
 // -------------------------------------------------------------------------
+// WAIT_DATA captures the three channel words; LATCH selects one pixel out of
+// them. LATCH is re-entered for each of the four pixels, so a single pop
+// feeds four messages.
+//
+// BYTE-LANE ORIENTATION: within a word the MSB lane is the LEFTMOST pixel,
+// so lane 0 is bits [31:24]. Same convention as rom_sequencer's read side and
+// pixel_word_packer's write side -- reading it the other way round would
+// mirror every group of four pixels.
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        word_r <= '0;
+        word_g <= '0;
+        word_b <= '0;
+    end else if (current_state == WAIT_DATA) begin
+        word_r <= fifo_rd_data_r;
+        word_g <= fifo_rd_data_g;
+        word_b <= fifo_rd_data_b;
+    end
+end
+
+// Which pixel of the current word group is being sent. Cleared when a new
+// group is popped, advanced in NEXT.
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)                              pix_idx <= 2'd0;
+    else if (current_state == WAIT_DATA)     pix_idx <= 2'd0;
+    else if (current_state == NEXT)          pix_idx <= pix_idx + 2'd1;
+end
+
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         pixel_latch <= '0;
         row_latch   <= '0;
         col_latch   <= '0;
-    end else if (current_state == WAIT_DATA) begin
-        pixel_latch <= fifo_rd_data;
+    end else if (current_state == LATCH) begin
+        unique case (pix_idx)
+            2'd0: pixel_latch <= {word_r[31:24], word_g[31:24], word_b[31:24]};
+            2'd1: pixel_latch <= {word_r[23:16], word_g[23:16], word_b[23:16]};
+            2'd2: pixel_latch <= {word_r[15:8],  word_g[15:8],  word_b[15:8]};
+            2'd3: pixel_latch <= {word_r[7:0],   word_g[7:0],   word_b[7:0]};
+        endcase
         row_latch   <= row_cnt;
         col_latch   <= col_cnt;
     end

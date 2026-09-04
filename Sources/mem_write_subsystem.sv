@@ -30,12 +30,28 @@ module mem_write_subsystem
     input  msg_payload_t      msg_payload,
 
     // ---- SRAM write port --------------------------------------------------
+    // DIRECT write port. Idle while a full-image write is bursting.
     output logic              wr_en,
     output logic [NLANE-1:0]  wr_be,
     output logic [ADDR_W-1:0] wr_addr,
     output logic [DATA_W-1:0] wr_data_r,
     output logic [DATA_W-1:0] wr_data_g,
     output logic [DATA_W-1:0] wr_data_b,
+
+    // ---- AHB burst write path (full image only) --------------------------
+    // High for the whole of a full-image write, from pack_start until the
+    // gather finishes. memory_subsystem uses it to switch each SRAM's write
+    // port from the direct path to the AHB slaves.
+    output logic              burst_active,
+    output logic              ahb_req_valid,
+    output logic              ahb_req_write,
+    output logic              ahb_req_burst,
+    output logic [1:0]        ahb_req_channel,
+    output logic [13:0]       ahb_req_word,
+    input  logic              ahb_busy,
+    input  logic [1:0]        ahb_wr_beat,
+    input  logic              ahb_wr_ack,
+    output logic [DATA_W-1:0] ahb_wr_data,
 
     // ---- arbitration, from mem_interlock ---------------------------------
     // Writes stand off while either reader owns the memory. They do not need
@@ -82,6 +98,7 @@ module mem_write_subsystem
     // router, the crossing and the RX side to the PC.
     logic pack_wr_valid;
     logic pack_done;
+    logic pack_wr_ready;
 
     pixel_word_packer u_packer (
         .clk         (clk),
@@ -96,7 +113,10 @@ module mem_write_subsystem
         .pixel_g     (pixel_g),
         .pixel_b     (pixel_b),
         .wr_valid    (pack_wr_valid),
-        .wr_ready    (wr_allowed),
+        // wr_allowed is the interlock's permission; bw_wr_ready is the
+        // gather holding the packer off while three bursts drain. Both must
+        // be high for a word to move.
+        .wr_ready    (pack_wr_ready),
         .wr_addr     (wr_addr),
         .wr_be       (wr_be),
         .wr_data_r   (wr_data_r),
@@ -106,7 +126,59 @@ module mem_write_subsystem
         .done        (pack_done)
     );
 
-    assign wr_en = pack_wr_valid && wr_allowed;
+// FULL IMAGE ONLY, decided once from the burst header geometry before the
+// rectangle starts. Everything else -- single pixels (1x1), offset or short
+// rectangles -- keeps the direct port and its byte enables untouched.
+//
+// The restriction is not arbitrary. AHB-Lite has no byte strobes, so a
+// partial word cannot be expressed; and pixel_word_packer emits partial words
+// at the end of every row of a narrow rectangle, because the linear address
+// jumps by IMG_WIDTH between rows. Only a full-width rectangle produces
+// complete words at consecutive addresses.
+logic full_image;
+assign full_image = (pack_base_addr == 24'd0) &&
+                    (pack_height    == 10'(memory_pkg::IMG_HEIGHT)) &&
+                    (pack_width     == 10'(memory_pkg::IMG_WIDTH));
+
+logic burst_mode;
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)            burst_mode <= 1'b0;
+    else if (pack_start)   burst_mode <= full_image;
+end
+
+logic bw_wr_ready, bw_busy;
+
+img_burst_writer #(.ADDR_W_IN(ADDR_W)) u_burst_writer (
+    .clk(clk), .rst_n(rst_n),
+    .burst_mode   (burst_mode),
+    .pack_busy    (rect_busy),
+    .pack_done    (pack_done),
+    .wr_valid     (pack_wr_valid),
+    .wr_ready     (bw_wr_ready),
+    .wr_addr      (wr_addr),
+    .wr_be        (wr_be),
+    .wr_data_r    (wr_data_r),
+    .wr_data_g    (wr_data_g),
+    .wr_data_b    (wr_data_b),
+    .req_valid    (ahb_req_valid),
+    .req_write    (ahb_req_write),
+    .req_burst    (ahb_req_burst),
+    .req_channel  (ahb_req_channel),
+    .req_word     (ahb_req_word),
+    .ahb_busy     (ahb_busy),
+    .ahb_wr_beat  (ahb_wr_beat),
+    .ahb_wr_ack   (ahb_wr_ack),
+    .ahb_wr_data  (ahb_wr_data),
+    .busy         (bw_busy)
+);
+
+assign burst_active = burst_mode && (rect_busy || bw_busy);
+
+// The DIRECT port stays silent through a burst write -- the AHB slaves drive
+// the SRAMs instead.
+assign pack_wr_ready = wr_allowed && (burst_mode ? bw_wr_ready : 1'b1);
+
+assign wr_en = pack_wr_valid && pack_wr_ready && !burst_mode;
 
 `ifndef SYNTHESIS
     // A write is never issued with no lanes enabled.
