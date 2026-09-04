@@ -214,8 +214,9 @@ rather than passed.
 |---|---|
 | Device | xc7a100t-csg324-1 |
 | WNS | 0.022 ns |
-| WHS | 0.037 ns |
+| WHS | 0.024 ns |
 | Failed routes | 0 |
+| Total power | 0.274 W |
 | Critical path | `rx_classifier` burst-extent compare, 256 MHz domain |
 
 Two critical warnings remain, both from the Clocking Wizard's in-context XDC
