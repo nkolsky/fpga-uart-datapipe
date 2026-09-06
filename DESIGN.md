@@ -311,16 +311,31 @@ Recorded because they generalise:
 - A path that is never stressed is never tested. A mutation ignoring
   back-pressure escaped until the consumer model stalled long enough for
   `almost_full` to actually assert.
+- **Working flow control can deadlock a test that ignores it.** `final_test`'s
+  flood appeared to hang; it was blocking in `write()` because the board had
+  correctly deasserted CTS after ~90 requests and nothing was draining. The two
+  directions need opposite strategies: interleave send and drain when flow
+  control is on, and deliberately do not drain when it is off, because there
+  the overrun *is* the test.
 
 ### Hardware
 
 | Test | Covers |
 |---|---|
+| `final_test` | all nine stages in one run, 26 checks |
 | `board_test` | protocol, memory contents against `.mem` |
 | `flowtest` | RTS/CTS under stall, with a negative control |
 | `image_tool snapshot` / `load` | full read and write paths |
 | `image_tool rect 61 61 10 6` | partial-word writes via the direct port |
 | `rgf_parking_test` | register path and the `IMG_TX_MON` interlock |
+
+`final_test` captures the framebuffer before writing anything and restores it
+afterwards, verifying every pixel. Without that, each run leaves the board
+dirty and the next `.mem` comparison fails for a reason that has nothing to do
+with the design.
+
+Measured contrast in its stage 7: **0 of 8000 replies lost with flow control,
+7488 of 8000 lost without.**
 
 `flowtest`'s negative control repeats the same workload with flow control
 disabled and is *expected* to lose data. If it loses nothing, the workload

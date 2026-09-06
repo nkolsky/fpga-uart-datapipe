@@ -157,6 +157,20 @@ def same(a, b):
     return list(a) == list(b)
 
 
+def window_of(got, img_w, img_h, x0, y0, w, h):
+    """Return just the requested window.
+
+    read_image_pixels reads only the window but returns a FULL-FRAME list,
+    with everything outside it left unset. Comparing the whole list against
+    an expected colour therefore counts every untouched pixel as wrong --
+    which is how stage 4 came to report '65476 of 60 wrong'.
+    """
+    if len(got) == img_w * img_h:
+        return [got[(y0 + r) * img_w + (x0 + c)]
+                for r in range(h) for c in range(w)]
+    return got                      # already just the window
+
+
 # ---------------------------------------------------------------- stage 0
 def stage0(board, rep, args):
     stage(0, "is the board there?")
@@ -247,9 +261,11 @@ def stage4(board, rep, args):
                                         RECT_COL, RECT_ROW, RECT_W, RECT_H)
     if not rep.check(4, "rectangle read back", missing == 0, "%d missing" % missing):
         return
-    wrong = sum(1 for p in got if not same(p, RECT_VAL))
+    win = window_of(got, args.width, args.height,
+                    RECT_COL, RECT_ROW, RECT_W, RECT_H)
+    wrong = sum(1 for p in win if p is None or not same(p, RECT_VAL))
     rep.check(4, "every pixel in the rectangle is correct", wrong == 0,
-              "%d of %d wrong" % (wrong, RECT_W * RECT_H))
+              "%d of %d wrong" % (wrong, len(win)))
     # And the pixels immediately outside it, which a missing flush corrupts.
     edge_ok = True
     for r in (RECT_ROW, RECT_ROW + RECT_H - 1):
@@ -278,9 +294,11 @@ def stage5(board, rep, args):
     if not rep.check(5, "both reads complete", ma == 0 and mb == 0,
                      "burst missing %d, per-pixel missing %d" % (ma, mb)):
         return
-    diff = sum(1 for p, q in zip(a, b) if not same(p, q))
+    wa = window_of(a, args.width, args.height, x0, y0, w, h)
+    wb = window_of(b, args.width, args.height, x0, y0, w, h)
+    diff = sum(1 for p, q in zip(wa, wb) if not same(p, q))
     rep.check(5, "burst placement matches per-pixel ground truth", diff == 0,
-              "%d of %d pixels differ" % (diff, w * h))
+              "%d of %d pixels differ" % (diff, len(wa)))
 
 
 # ---------------------------------------------------------------- stage 6
@@ -342,8 +360,30 @@ def stage7(rep, args):
                 break
         rep.check(7, "data arrives once RTS is reasserted", len(buf2) > 0,
                   "%d bytes" % len(buf2))
+
+        # Drain to quiet BEFORE closing. The burst read above may still be
+        # streaming, and closing a port with a transfer in flight drops RTS
+        # mid-message -- the board then stalls part way through and the close
+        # itself can block. Read until the line has been silent for a while.
+        tail = bytearray()
+        quiet_since = time.time()
+        t0 = time.time()
+        while time.time() - t0 < 6.0:
+            got = link.drain_for(0.1, tail)
+            if got:
+                quiet_since = time.time()
+            elif time.time() - quiet_since > 0.5:
+                break
+        if tail:
+            print("   drained %d trailing bytes before closing" % len(tail),
+                  flush=True)
     finally:
-        link.close()
+        print("   closing the hold-off link ...", flush=True)
+        try:
+            link.close()
+        except Exception as e:
+            print("   close raised: %s" % e, flush=True)
+        print("   closed", flush=True)
 
     # (b) CONTRAST. The same workload with flow control on and off. If the
     #     lossless run is not lossless the handshake is not working; if the
@@ -352,34 +392,76 @@ def stage7(rep, args):
     n = args.flood
 
     def flood(rtscts):
+        """Send n pixel reads and count the clean replies.
+
+        The two directions need OPPOSITE strategies, which is the whole point
+        of the contrast:
+
+        rtscts=True   Interleave sending and draining. The board holds a small
+                      reply FIFO and deasserts its RTS once it fills -- about
+                      90 requests in, measured by flowtest. Pushing all n
+                      before reading any makes write() block on CTS forever;
+                      write_timeout is not honoured for hardware flow control
+                      on Windows. Draining as we go keeps the FIFO moving, and
+                      nothing should be lost.
+
+        rtscts=False  Do NOT drain. The overrun is the test. write() cannot
+                      block here because flow control is off, so there is no
+                      deadlock to avoid -- and draining would prevent the very
+                      loss the negative control needs to demonstrate. This is
+                      what flowtest's test 6 does.
+        """
         lk = FT.Link(args.port, args.baud, args.timeout, rtscts=rtscts,
                      write_timeout=5.0)
         try:
             if not rtscts:
                 lk.allow_send(True)
             lk.discard_input()
-            for i in range(n):
-                lk.send(IT.msg_pixel_read((i // args.width) % args.height,
-                                          i % args.width))
-            lk.flush()
             buf = bytearray()
+            CHUNK = 32
+            sent = 0
             t0 = time.time()
-            while time.time() - t0 < 20.0:
+
+            while sent < n and time.time() - t0 < 60.0:
+                # Belt and braces: never write into a deasserted CTS.
+                if rtscts and hasattr(lk, "board_ready") and not lk.board_ready():
+                    lk.drain_for(0.05, buf)
+                    continue
+                block_n = min(CHUNK, n - sent)
+                try:
+                    for k in range(block_n):
+                        lin = sent + k
+                        lk.send(IT.msg_pixel_read((lin // args.width) % args.height,
+                                                  lin % args.width))
+                    lk.flush()
+                except Exception:
+                    break                      # CTS went low mid-write
+                sent += block_n
+                if rtscts:
+                    lk.drain_for(0.02, buf)    # keep the board's FIFO moving
+
+            t1 = time.time()
+            while time.time() - t1 < 10.0:
                 if lk.drain_for(0.05, buf) == 0 and len(buf) >= n * 16:
                     break
                 if len(buf) >= n * 16:
                     break
+
             good = 0
-            for j in range(0, min(len(buf), n * 16) - 15, 16):
+            for j in range(0, len(buf) - 15, 16):
                 if IT.parse_pixel_reply(bytes(buf[j:j + 16])) is not None:
                     good += 1
-            return good
+            return min(good, n)
         finally:
             lk.close()
 
+    print("   flooding %d requests WITH flow control ..." % n, flush=True)
     with_fc = flood(True)
+    print("   ... %d replies returned" % with_fc, flush=True)
     time.sleep(0.3)
+    print("   flooding %d requests WITHOUT flow control ..." % n, flush=True)
     without_fc = flood(False)
+    print("   ... %d replies returned" % without_fc, flush=True)
     lost_with = n - with_fc
     lost_without = n - without_fc
 
@@ -391,6 +473,60 @@ def stage7(rep, args):
         print("   INCONCLUSIVE: nothing was lost even with flow control off,")
         print("   so this workload did not stress the link and the result")
         print("   above is unproven by contrast. Raise --flood.")
+
+    # RECOVERY. The lossy flood is a deliberate overrun, and it can leave
+    # rx_msg_parser part way through a message, waiting on bytes that were
+    # dropped. Nothing downstream will work until the board is reset --
+    # reopening the serial port does not help, the state is on the FPGA.
+    # flowtest.py does the same thing at the same point and for the same
+    # reason.
+    recover7(rep, args)
+
+
+def recover7(rep, args):
+    """Bring the link back after the deliberate overrun in stage 7."""
+    # Drain whatever is still arriving so it cannot be mistaken for a reply.
+    try:
+        lk = FT.Link(args.port, args.baud, 0.2, rtscts=True, write_timeout=5.0)
+        try:
+            junk = bytearray()
+            lk.drain_for(1.0, junk)
+            if junk:
+                print("   drained %d bytes still in flight" % len(junk))
+        finally:
+            lk.close()
+    except Exception:
+        pass
+
+    if args.no_reset_prompt:
+        print("   --no-reset-prompt given; skipping the reset. If stage 8")
+        print("   fails, press RESET and run again without that flag.")
+    else:
+        print()
+        print("   >>> The overrun above may have left rx_msg_parser waiting on")
+        print("   >>> bytes that never came. Press the board's RESET button,")
+        print("   >>> then press Enter here.")
+        try:
+            input("   >>> ")
+        except EOFError:
+            print("   (no console -- continuing without a reset)")
+
+    # The link must answer before stage 8 tries to restore the image.
+    ok = False
+    for _ in range(3):
+        try:
+            b = IT.Board(args.port, args.baud, args.timeout)
+            try:
+                if reg_read(b, IMG_STATUS) is not None:
+                    ok = True
+                    break
+            finally:
+                b.close()
+        except Exception:
+            pass
+        time.sleep(0.3)
+    rep.check(7, "link alive after the overrun", ok,
+              "" if ok else "no register reply -- press RESET and re-run")
 
 
 # ---------------------------------------------------------------- stage 8
@@ -421,7 +557,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="One run that exercises every pipeline on the board.")
     ap.add_argument("--port", required=True)
-    ap.add_argument("--baud", type=int, default=8125000)
+    ap.add_argument("--baud", type=int, default=8000000)
     ap.add_argument("--timeout", type=float, default=0.5)
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--height", type=int, default=256)
@@ -435,7 +571,9 @@ def main():
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--holdoff", type=float, default=2.0,
                     help="stage 7: seconds of silence required")
-    ap.add_argument("--flood", type=int, default=2000,
+    ap.add_argument("--no-reset-prompt", action="store_true",
+                    help="skip the reset prompt after stage 7's overrun")
+    ap.add_argument("--flood", type=int, default=8000,
                     help="stage 7: pixel reads per contrast run")
     ap.add_argument("--skip-flow", action="store_true")
     args = ap.parse_args()

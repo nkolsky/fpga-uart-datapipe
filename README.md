@@ -165,10 +165,30 @@ full 256-pixel row between rectangle rows.
 
 ## Hardware workflow
 
-**Memory contents come from the bitstream, not from reset.** `INIT_FILE` values
-are loaded at configuration; `CPU_RESETN` resets logic only. Any test that
-compares against the `.mem` files must run before anything that writes, or
+**Memory contents come from the bitstream, not from reset.** `INIT_FILE`
+values are loaded at configuration; `CPU_RESETN` resets logic only. Any test
+that compares against the `.mem` files must run before anything that writes, or
 after reprogramming.
+
+### One command
+
+```powershell
+cd Scripts
+python final_test.py --port COM5
+```
+
+Nine stages covering every pipeline, and it **restores the image it started
+with** — stage 1 captures the framebuffer before writing anything and stage 8
+loads it back, verifying every pixel. That makes it safe to run repeatedly
+without reprogramming.
+
+It pauses once, in stage 7: the negative control deliberately overruns the
+receive path, so the board needs a reset before the restore. Press RESET, then
+Enter.
+
+Expect **26 checks, 0 failed**.
+
+### Or stage by stage
 
 1. Program the FPGA
 2. Press reset
@@ -184,6 +204,7 @@ after reprogramming.
 All scripts need the baud rate passed explicitly:
 
 ```bash
+python final_test.py       --port COM5
 python board_test.py       --port COM5 --baud 8000000 --width 256 \
                            --init-red red_hex.mem --init-green green_hex.mem \
                            --init-blue blue_hex.mem
@@ -198,10 +219,14 @@ python rgf_parking_test.py --port COM5 --baud 8000000 --width 256 --height 256
 
 | Script | Purpose |
 |---|---|
+| `final_test.py` | all nine stages in one run, restores the image afterwards |
 | `image_tool.py` | snapshot, load, single pixel, rectangle |
 | `board_test.py` | protocol and memory regression |
 | `flowtest.py` | RTS/CTS under stall, with a negative control |
 | `rgf_parking_test.py` | register path and the `IMG_TX_MON` interlock |
+
+`final_test.py` imports `flowtest.py` as a module, so both must sit in the same
+directory. Run it from `Scripts/`.
 
 `flowtest` test 6 is a **negative control**: it repeats the same workload with
 flow control disabled and is expected to lose data. If it loses nothing, the
