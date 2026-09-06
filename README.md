@@ -28,61 +28,30 @@
 divide 3.75. At 256 MHz with a divide-by-32 bit period that gives exactly
 **8 Mbaud**.
 
-Every clock crossing is instantiated at `chip_top` rather than inside a
-subsystem, because a crossing is interconnect between two subsystems:
-
-| Crossing | Carries |
-|---|---|
-| `cdc_msg_sync` | whole messages, 256 → 100, two-phase req/ack |
-| `async_fifo` ×3 | image words back, 100 → 256, one FIFO per colour |
-| `cdc_cmd_sync` ×3 | pixel, burst and register replies |
-| `cdc_level_sync` ×3 | FIFO flags, `burst_active` |
-| `cdc_pulse_sync` ×4 | accepts, `tx_img_done`, parity fault |
+Every clock crossing is instantiated at `chip_top`, not inside a subsystem.
+[DESIGN.md](DESIGN.md) lists them and explains why.
 
 ## Buses
 
 Two independent buses with separate address spaces. A message reaches one or
 the other, chosen by kind, so the two never collide.
 
-**APB — register file.** `apb_master` and `apb_bar` sit at `chip_top` with the
-other interconnect; `apb_slave_rgf` lives inside `register_subsystem` because
-it translates to `rgf`'s private port.
+**APB — register file.**
 
 ```
 PADDR[15:8]  aperture      RGF at 0x00
 PADDR[7:0]   register offset
 ```
 
-**AHB-Lite — image memory.** The whole fabric is inside `memory_subsystem`,
-where all its clients are.
+**AHB-Lite — image memory.**
 
 ```
 HADDR[17:16]  channel   R 0x0_0000   G 0x1_0000   B 0x2_0000
 HADDR[15:2]   word index, 16384 per channel
 ```
 
-Unmapped apertures are answered by a default responder with `HRESP = ERROR`.
-Without one, nothing drives `HREADY` and a single bad address would hang the
-bus permanently.
-
-## Why three channel FIFOs
-
-A single-manager bus cannot read three SRAMs at once. An INCR4 covers four
-words of **one** channel — R0–R15, then G, then B — so red runs up to two
-bursts ahead of blue and each colour needs its own buffer. An earlier design
-read all three in parallel and needed only one FIFO.
-
-## Why full-image writes only over AHB
-
-One burst message carries 4 pixels, which de-interleave into exactly **one
-word per channel**. An INCR4 needs four consecutive words of one channel, so
-four messages are gathered first.
-
-AHB-Lite has no byte strobes, and `pixel_word_packer` emits partial words at
-the end of every row of a narrower rectangle — the linear address jumps by
-`IMG_WIDTH` between rows. Only a full-width rectangle produces complete words
-at consecutive addresses. Everything else keeps the direct write port and its
-byte enables.
+Unmapped addresses are answered by a default responder rather than left to
+hang. [DESIGN.md](DESIGN.md) covers where each fabric is instantiated and why.
 
 ## Architecture
 
@@ -238,19 +207,32 @@ rather than passed.
 | | |
 |---|---|
 | Device | xc7a100t-csg324-1 |
-| WNS | 0.022 ns |
-| WHS | 0.024 ns |
+| WNS | 0.131 ns |
+| WHS | 0.022 ns |
 | Failed routes | 0 |
-| Total power | 0.274 W |
+| Total power | 0.275 W |
 | Critical path | `rx_classifier` burst-extent compare, 256 MHz domain |
+
+### Implementation directives are required
+
+The design does **not** close timing with Vivado's defaults. The same RTL gives
+WNS −0.064 ns with default directives and +0.131 ns with these:
+
+```tcl
+set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE ExtraTimingOpt [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
+```
+
+The critical path is `rx_classifier`'s burst-extent compare;
+[DESIGN.md](DESIGN.md) has the analysis. These settings live in the `.xpr`, not in this repository, so recreating the
+project loses them.
 
 Two critical warnings remain, both from the Clocking Wizard's in-context XDC
 defining a clock on its own input pin. The design's `sys_clk_pin` overrides it;
 both describe the same 100 MHz net at the same period.
 
-`SYNTH-15` (byte-wide write enable not inferred) is informational: Vivado
-declines the dedicated byte-write pins because the address width of 14 exceeds
-its threshold of 12, and falls back to one write enable per RAM. Byte lanes
+`SYNTH-15` (byte-wide write enable not inferred) is informational — byte lanes
 remain independently writable, which the unaligned-rectangle test confirms.
 
 ## Current limitations
