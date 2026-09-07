@@ -227,16 +227,38 @@ single 64-deep FIFO had used.
 
 | | |
 |---|---|
-| WNS | 0.022 ns |
-| WHS | 0.024 ns |
+| WNS | 0.131 ns |
+| WHS | 0.022 ns |
 | Failed routes | 0 |
-| Total power | 0.274 W |
+| Total power | 0.275 W |
 | Critical path | `rx_classifier` burst-extent compare, 256 MHz |
+
+### The margin is directive-dependent
+
+The same RTL closes at **−0.064 ns** with Vivado's default directives and
+**+0.131 ns** with `ExtraTimingOpt` placement and `AggressiveExplore`
+post-route phys-opt. A 195 ps swing on a 3.906 ns period, from implementation
+effort alone.
+
+That was discovered by accident: recreating the Vivado project reset the
+directives to defaults and the build failed timing with no RTL change at all.
+Worth knowing, because it means the margin is not really 131 ps of design
+headroom — it is 131 ps that the tool has to work for.
 
 The critical path has been in `rx_classifier` throughout — a wide comparison
 computed combinationally in one stage, five logic levels with two carry chains.
-Splitting it across another pipeline stage is the fix, and it is also what
-stands between this design and 280 MHz.
+Splitting it across another pipeline stage is the fix.
+
+280 MHz was attempted, using the integer MMCM configuration M = 42, D = 5,
+CLKOUT0 divide 3. It closed at **WNS −0.227 ns, TNS −0.435 ns, three failing
+endpoints of 10 182** — all three in `rx_classifier`, all stage 1 into a stage
+2 comparison. The 100 MHz domain was unaffected at +0.428 ns.
+
+Two results worth recording. The integer divide bought almost nothing: discrete
+jitter is 205 ps at 280 MHz against 221 ps for the fractional divide at 256, so
+the jitter is dominated by the MMCM rather than by the fractional divider. And
+pipelining `rx_classifier` alone would not be sufficient — the next three paths
+are in `rx_mac` at +0.030 ns, which would become the limit almost immediately.
 
 ### A measured trade-off worth recording
 
@@ -355,8 +377,11 @@ passed.
 
 ## 11. Future work
 
-- Another pipeline stage in `rx_classifier`, which buys timing margin and is
-  the prerequisite for 280 MHz
+- Another pipeline stage in `rx_classifier`, then `rx_mac`. 280 MHz was
+  attempted and measured at WNS −0.227 ns with three failing paths, all in
+  `rx_classifier`'s stage 1 to stage 2 comparisons. Pipelining it is the fix,
+  but the next three paths are in `rx_mac` at +0.030 ns, so one change alone
+  would not be enough
 - Configurable geometry
 - Burst recovery and timeout
 - A shared host-side config module, so the baud rate is not passed by hand
