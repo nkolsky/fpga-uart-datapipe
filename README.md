@@ -8,6 +8,19 @@
 > [PROTOCOL.md](PROTOCOL.md) documents the wire format;
 > [DESIGN.md](DESIGN.md) explains the design decisions.
 
+## Project history
+
+Built across a two-semester digital design course. The commit history starts
+partway through, at the APB and AHB-Lite work — version control was introduced
+later in the course, so everything before that point was developed without it.
+
+What predates the first commit: the UART physical and MAC layers, the message
+protocol and its classifier, both clock-domain crossings, the SRAM write path
+with byte enables, the framebuffer readback, and the register file. What the
+history covers: the register path moving to APB, image memory moving to
+AHB-Lite with INCR4 bursts, the three-FIFO restructure that followed from it,
+and the documentation and diagrams.
+
 ## Features
 
 - 256×256 RGB framebuffer, one SRAM per colour channel

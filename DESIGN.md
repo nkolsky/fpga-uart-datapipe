@@ -4,6 +4,10 @@ Why this design looks the way it does. The wire protocol is in
 [PROTOCOL.md](PROTOCOL.md); the module inventory is in [README.md](README.md).
 This file is the reasoning.
 
+It covers the whole design, including the parts built before the repository
+existed — version control was introduced partway through the course, so the
+commit history begins at the bus work rather than at the start.
+
 ---
 
 ## 1. Two clock domains
