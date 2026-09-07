@@ -4,6 +4,9 @@
 > exchanged with a host over UART with end-to-end flow control. Register access
 > runs over **APB**; image memory runs over **AHB-Lite** with INCR4 bursts.
 > Verified by unit tests, mutation testing, and hardware validation.
+>
+> [PROTOCOL.md](PROTOCOL.md) documents the wire format;
+> [DESIGN.md](DESIGN.md) explains the design decisions.
 
 ## Features
 
@@ -46,8 +49,8 @@ PADDR[7:0]   register offset
 **AHB-Lite — image memory.**
 
 ```
-HADDR[17:16]  channel   R 0x0_0000   G 0x1_0000   B 0x2_0000
-HADDR[15:2]   word index, 16384 per channel
+HADDR[17:16]  channel      R 0x00000   G 0x10000   B 0x20000
+HADDR[15:2]   word index   16384 per channel
 ```
 
 Unmapped addresses are answered by a default responder rather than left to
@@ -103,7 +106,8 @@ data_pipe_flow.drawio   how data moves, and where it crosses clocks
 data_pipe_flow.png      exported, embedded in this README
 chip_top.bit
 README.md
-DESIGN.md
+DESIGN.md               why the design is shaped the way it is
+PROTOCOL.md             the wire format, message by message
 ```
 
 The `.drawio` files are the editable sources; the `.png` files beside them are
@@ -132,6 +136,8 @@ mutation-tested: a deliberate bug is injected and the suite must fail.
 switches to an 8×8 image under that define, and without it the packer strides a
 full 256-pixel row between rectangle rows.
 
+A UVM environment is planned.
+
 ## Hardware workflow
 
 **Memory contents come from the bitstream, not from reset.** `INIT_FILE`
@@ -143,7 +149,7 @@ after reprogramming.
 
 ```powershell
 cd Scripts
-python final_test.py --port COM5
+python final_test.py --port COM5 --image photo.png
 ```
 
 Nine stages covering every pipeline, and it **restores the image it started
@@ -151,11 +157,14 @@ with** — stage 1 captures the framebuffer before writing anything and stage 8
 loads it back, verifying every pixel. That makes it safe to run repeatedly
 without reprogramming.
 
+Pass `--image` to exercise stage 6, the full-image write. Without it that stage
+is skipped, and the AHB INCR4 burst write path is not covered — stage 3 tests
+single pixels and stage 4 tests partial words, both of which use the direct
+port. Any 256 × 256 PNG will do.
+
 It pauses once, in stage 7: the negative control deliberately overruns the
 receive path, so the board needs a reset before the restore. Press RESET, then
 Enter.
-
-Expect **26 checks, 0 failed**.
 
 ### Or stage by stage
 
@@ -168,12 +177,15 @@ Expect **26 checks, 0 failed**.
 7. `image_tool rect` — partial-word writes via the direct port
 8. `rgf_parking_test` — register path
 
+Steps 3–8 are what `final_test` runs in one pass.
+
 ## Python utilities
 
-All scripts need the baud rate passed explicitly:
+`final_test.py` defaults to the correct baud rate; every other script needs it
+passed explicitly.
 
 ```bash
-python final_test.py       --port COM5
+python final_test.py       --port COM5 --image photo.png
 python board_test.py       --port COM5 --baud 8000000 --width 256 \
                            --init-red red_hex.mem --init-green green_hex.mem \
                            --init-blue blue_hex.mem
@@ -188,7 +200,7 @@ python rgf_parking_test.py --port COM5 --baud 8000000 --width 256 --height 256
 
 | Script | Purpose |
 |---|---|
-| `final_test.py` | all nine stages in one run, restores the image afterwards |
+| `final_test.py` | all nine stages in one run, restores the image afterwards; needs `--image` for stage 6 |
 | `image_tool.py` | snapshot, load, single pixel, rectangle |
 | `board_test.py` | protocol and memory regression |
 | `flowtest.py` | RTS/CTS under stall, with a negative control |
@@ -225,8 +237,8 @@ set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [
 ```
 
 The critical path is `rx_classifier`'s burst-extent compare;
-[DESIGN.md](DESIGN.md) has the analysis. These settings live in the `.xpr`, not in this repository, so recreating the
-project loses them.
+[DESIGN.md](DESIGN.md) has the analysis. These settings live in the `.xpr`
+rather than in this repository, so recreating the project loses them.
 
 Two critical warnings remain, both from the Clocking Wizard's in-context XDC
 defining a clock on its own input pin. The design's `sys_clk_pin` overrides it;
@@ -248,6 +260,7 @@ remain independently writable, which the unaligned-rectangle test confirms.
 
 - Configurable framebuffer geometry
 - Burst recovery and timeout
-- 280 MHz UART domain — reachable with an integer MMCM divide (M=42, D=5,
-  CLKOUT0 divide 3), but needs another pipeline stage in `rx_classifier` first
+- 280 MHz UART domain — attempted and measured: WNS −0.227 ns, three failing
+  paths, all in `rx_classifier`. Pipelining it is the fix, but `rx_mac` sits
+  only 30 ps behind and would need the same treatment
 - A shared `board_config.py` so the baud rate is not passed by hand
