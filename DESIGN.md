@@ -310,9 +310,14 @@ primitive exists to accept an asynchronous select and switch break-before-make.
 
 ## 9. Verification
 
-Ten self-checking testbenches, **187 checks**. Key paths are mutation-tested: a
-deliberate bug is injected and the suite must fail. A test that passes against
-a mutant is not testing what it claims to.
+Sixteen self-checking testbenches, **361 checks**. Key paths are
+mutation-tested: a deliberate bug is injected and the suite must fail. A test
+that passes against a mutant is not testing what it claims to.
+
+The count is produced by `Scripts/run_all_tb.py`, which builds and runs every
+testbench against the current source tree and totals the result. That exists
+because the figure was wrong the first time it was quoted: it had been counted
+by hand, and included a testbench that was never committed.
 
 Two mutation results worth keeping:
 
@@ -343,6 +348,22 @@ Recorded because they generalise:
   directions need opposite strategies: interleave send and drain when flow
   control is on, and deliberately do not drain when it is off, because there
   the overrun *is* the test.
+
+### Coverage is layered, not partial
+
+Every module is exercised by the hardware regression on every run. Twelve have
+directed unit-level testbenches as well; six more are covered at path level,
+driven through the chain they belong to rather than in isolation.
+
+A path-level test catches what a unit test cannot: a handshake connected the
+wrong way round, an ordering assumption that only breaks under back-pressure, a
+threshold that is correct in isolation and wrong for the rate it sees.
+`tb_burst_read_path` measures a 4-entry skew between the three channel FIFOs —
+a property of the whole read path, invisible to any single module.
+
+The hardware regression runs millions of cycles at real timing, which is where
+a marginal crossing would show. `flowtest`'s negative control demonstrates the
+workload stresses the link rather than passing by luck.
 
 ### Hardware
 

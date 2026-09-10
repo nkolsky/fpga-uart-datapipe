@@ -1,4 +1,4 @@
-# Full-Duplex RGB Image Data Pipe over UART
+# FPGA RGB Framebuffer over UART
 
 > SystemVerilog implementation of a 256×256 RGB framebuffer on a Nexys A7-100T,
 > exchanged with a host over UART with end-to-end flow control. Register access
@@ -112,7 +112,7 @@ workaround is gone.
 Constraints/            Nexys-A7-100T-Master.xdc
 Scripts/                Python host tools
 Sources/                SystemVerilog RTL
-testbenches/            simulation only
+testbenches/            sixteen that build and pass; legacy/ holds earlier ones
 block_diagram.drawio    module hierarchy, by clock domain
 block_diagram.png       exported, embedded in this README
 data_pipe_flow.drawio   how data moves, and where it crosses clocks
@@ -129,27 +129,62 @@ the README will quietly go stale.
 
 ## Simulation
 
-Ten self-checking testbenches, **187 checks**, all passing. Key paths are
+Sixteen self-checking testbenches, **361 checks**, all passing. Key paths are
 mutation-tested: a deliberate bug is injected and the suite must fail.
 
-| Testbench | Covers |
-|---|---|
-| `tb_apb_slave_rgf` | APB slave, `pc_ren` strobe |
-| `tb_apb_master` | APB FSM, SETUP/ACCESS phases |
-| `tb_apb_bar` | decode, default responder, deadlock guard |
-| `tb_apb_integration` | router → master → BAR → slave → rgf |
-| `tb_ahb_slave_sram` | two-phase write capture, BUSY handling |
-| `tb_ahb_master` | INCR4 sequencing, wait states, HRESP |
-| `tb_ahb_decoder` | data-phase response mux, two-cycle error |
-| `tb_round_robin_arbiter` | fairness at N=3, lock, no preemption |
-| `tb_burst_read_path` | full read path, back-pressure, channel skew |
-| `tb_burst_write_path` | full write path, gather, equivalence |
+| Testbench | Checks | Covers |
+|---|---:|---|
+| `tb_apb_slave_rgf` | 18 | APB slave, `pc_ren` strobe |
+| `tb_apb_master` | 21 | APB FSM, SETUP/ACCESS phases |
+| `tb_apb_bar` | 28 | decode, default responder, deadlock guard |
+| `tb_apb_integration` | 17 | router → master → BAR → slave → rgf |
+| `tb_ahb_slave_sram` | 16 | two-phase write capture, BUSY handling |
+| `tb_ahb_master` | 25 | INCR4 sequencing, wait states, HRESP |
+| `tb_ahb_decoder` | 24 | data-phase response mux, two-cycle error |
+| `tb_round_robin_arbiter` | 16 | fairness at N=3, lock, no preemption |
+| `tb_burst_read_path` | 13 | full read path, back-pressure, channel skew |
+| `tb_burst_write_path` | 9 | full write path, gather, equivalence |
+| `tb_mem_write_path` | 44 | write subsystem, byte enables, rectangles |
+| `tb_rx_mac` | 42 | frame assembly, byte indexing, recovery |
+| `tb_pixel_word_packer` | 33 | 4 px → 1 word, partial-word flush |
+| `tb_mem_msg_writer` | 28 | message → packer geometry |
+| `tb_mem_interlock` | 21 | read/write exclusion, request/grant |
+| `tb_cdc_msg_sync` | 6 | 256 → 100 message crossing |
 
 `tb_burst_write_path` must be built with **`-DSIMULATION`** — `memory_pkg`
 switches to an 8×8 image under that define, and without it the packer strides a
 full 256-pixel row between rectangle rows.
 
-A UVM environment is planned.
+### testbenches/legacy
+
+Fourteen earlier testbenches sit in `testbenches/legacy/`. They were written
+against interfaces that have since changed — the message types and
+`rx_msg_parser`'s port list were reworked when the RX path was restructured, so
+they no longer compile. Reviving them would mean rewriting against the current
+types rather than patching, so they are kept for reference, not as regression.
+
+### What is covered how
+
+Every module is exercised by the hardware regression on every run. Coverage
+differs in kind, not in whether it exists:
+
+| Level | Modules |
+|---|---|
+| **Unit**, directed simulation | both bus fabrics, the arbiter, `mem_interlock`, `mem_msg_writer`, `pixel_word_packer`, `rx_mac`, `cdc_msg_sync` |
+| **Path**, simulation | `async_fifo` ×3, both burst engines, `mem_write_subsystem`, `mem_msg_router`, `rgb_sram` |
+| **System**, hardware | the whole design — RX and TX chains, direct read controllers, all ten remaining CDC primitives |
+
+Blocks are driven through the chain they belong to rather than in isolation.
+`tb_burst_read_path` runs all three channel FIFOs across the clock crossing
+under back-pressure and measures the 4-entry skew between them — a property of
+the read path as a whole, which no single-module test would see.
+
+The hardware regression runs millions of cycles at real timing. `flowtest`'s
+negative control confirms the workload stresses the link: 7,488 of 8,000
+replies lost with flow control disabled.
+
+The next step is a UVM environment, adding functional coverage and
+constrained-random stimulus on top of the directed tests here.
 
 ## Hardware workflow
 
