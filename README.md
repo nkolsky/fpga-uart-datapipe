@@ -1,4 +1,4 @@
-# Full-Duplex RGB Image Data Pipe over UART
+# FPGA RGB Framebuffer over UART
 
 > SystemVerilog implementation of a 256×256 RGB framebuffer on a Nexys A7-100T,
 > exchanged with a host over UART with end-to-end flow control. Register access
@@ -112,7 +112,7 @@ workaround is gone.
 Constraints/            Nexys-A7-100T-Master.xdc
 Scripts/                Python host tools
 Sources/                SystemVerilog RTL
-testbenches/            simulation only
+testbenches/            ten that build and pass; legacy/ holds earlier ones
 block_diagram.drawio    module hierarchy, by clock domain
 block_diagram.png       exported, embedded in this README
 data_pipe_flow.drawio   how data moves, and where it crosses clocks
@@ -149,7 +149,24 @@ mutation-tested: a deliberate bug is injected and the suite must fail.
 switches to an 8×8 image under that define, and without it the packer strides a
 full 256-pixel row between rectangle rows.
 
-A UVM environment is planned.
+### testbenches/legacy
+
+Fifteen earlier testbenches sit in `testbenches/legacy/`. They were written
+against interfaces that have since changed — the message types and
+`rx_msg_parser`'s port list were reworked when the RX path was restructured, so
+they no longer compile. Reviving them would mean rewriting against the current
+types rather than patching, so they are kept for reference, not as regression.
+
+Coverage today is split. The ten above cover both bus fabrics, the arbiter, and
+the full burst read and write paths at unit and integration level. The RX chain,
+`mem_interlock` and `pixel_rd_ctrl` are covered by the hardware regression in
+the next section, which exercises them end to end on every run — `final_test`
+alone runs nine stages over the whole design and restores the framebuffer
+afterwards.
+
+The next step is a UVM environment, rebuilding unit-level coverage for those
+blocks with functional coverage and constrained-random stimulus rather than the
+directed tests here.
 
 ## Hardware workflow
 
