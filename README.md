@@ -1,4 +1,4 @@
-# # Full-Duplex RGB Image Data Pipe over UART
+# Full-Duplex RGB Image Data Pipe over UART
 
 > SystemVerilog implementation of a 256×256 RGB framebuffer on a Nexys A7-100T,
 > exchanged with a host over UART with end-to-end flow control. Register access
